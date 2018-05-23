@@ -1,0 +1,19 @@
+{
+	"version": 3,
+	"file": "kalebr-frontend.css",
+	"sourceRoot": "/home/mukesh/Project/kalebr-app/kalebr-frontend/app/styles",
+	"sources": [
+		"../../sass_compiler-input_base_path-kZzSYoeQ.tmp/app/styles/app.scss",
+		"../../sass_compiler-input_base_path-kZzSYoeQ.tmp/app/styles/_global.scss",
+		"../../sass_compiler-input_base_path-kZzSYoeQ.tmp/app/styles/_login.scss",
+		"../../sass_compiler-input_base_path-kZzSYoeQ.tmp/app/styles/_variables.scss"
+	],
+	"sourcesContent": [
+		"@import \"global\";\n@import \"login\";\n\n@import \"variables\";\n",
+		"html {\n  height: 100%;\n}\n\n#wrapper {\n  font-family: \"Helvetica Neue Light\", \"HelveticaNeue-Light\", \"Helvetica Neue\", Calibri, Helvetica, Arial, sans-serif;\n\n}\n// Color Codes\n$primary-app-color: lightcoral;\n\n.application-header {\n  text-align: center;\n  background: $primary-app-color;\n  padding: 2rem;\n  font-size: 20px;\n}\n\n.application-container {\n  margin:0 20% ;\n  background: #fafafa;\n}\n\n.input-wrapper {\n  padding: 1rem 0;\n  .input-label {\n    margin: 5px 0;\n  }\n  input {\n    width: 15rem;\n    padding: 10px;\n    border-radius: 5px;\n  }\n}\n\n.pad1rem {\n  padding: 1rem;\n}\n\n.button {\n  width: 15rem;\n  padding: 10px;\n  border-radius: 5px;\n  background: $primary-app-color;\n  color: white;\n}\n",
+		".login {\n  text-align: center;\n  .button {\n    margin: 0 auto;\n  }\n}\n",
+		"// Color Codes\n$primary-app-color: lightcoral;\n\n\n"
+	],
+	"names": [],
+	"mappings": "ACAA,AAAA,IAAI,CAAC;EACH,MAAM,EAAE,IAAI,GACb;;AAED,AAAA,QAAQ,CAAC;EACP,WAAW,EAAE,sGAAsG,GAEpH;;AAID,AAAA,mBAAmB,CAAC;EAClB,UAAU,EAAE,MAAM;EAClB,UAAU,EAJQ,UAAU;EAK5B,OAAO,EAAE,IAAI;EACb,SAAS,EAAE,IAAI,GAChB;;AAED,AAAA,sBAAsB,CAAC;EACrB,MAAM,EAAC,KAAM;EACb,UAAU,EAAE,OAAO,GACpB;;AAED,AAAA,cAAc,CAAC;EACb,OAAO,EAAE,MAAM,GAShB;EAVD,AAEE,cAFY,CAEZ,YAAY,CAAC;IACX,MAAM,EAAE,KAAK,GACd;EAJH,AAKE,cALY,CAKZ,KAAK,CAAC;IACJ,KAAK,EAAE,KAAK;IACZ,OAAO,EAAE,IAAI;IACb,aAAa,EAAE,GAAG,GACnB;;AAGH,AAAA,QAAQ,CAAC;EACP,OAAO,EAAE,IAAI,GACd;;AAED,AAAA,OAAO,CAAC;EACN,KAAK,EAAE,KAAK;EACZ,OAAO,EAAE,IAAI;EACb,aAAa,EAAE,GAAG;EAClB,UAAU,EAlCQ,UAAU;EAmC5B,KAAK,EAAE,KAAK,GACb;;AC7CD,AAAA,MAAM,CAAC;EACL,UAAU,EAAE,MAAM,GAInB;EALD,AAEE,MAFI,CAEJ,OAAO,CAAC;IACN,MAAM,EAAE,MAAM,GACf"
+}

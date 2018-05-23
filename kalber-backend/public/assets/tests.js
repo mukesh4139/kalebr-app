@@ -123,6 +123,16 @@ define('kalebr-frontend/tests/unit/models/user-test', ['exports', 'ember-qunit']
     return assert.ok(!!model);
   });
 });
+define('kalebr-frontend/tests/unit/routes/login-test', ['exports', 'ember-qunit'], function (exports, _emberQunit) {
+
+  (0, _emberQunit.moduleFor)('route:login', 'Unit | Route | login', {});
+
+  (0, _emberQunit.test)('it exists', function (assert) {
+    var route;
+    route = this.subject();
+    return assert.ok(route);
+  });
+});
 define('kalebr-frontend/tests/unit/routes/users-test', ['exports', 'ember-qunit'], function (exports, _emberQunit) {
 
   (0, _emberQunit.moduleFor)('route:users', 'Unit | Route | users', {});

@@ -1,0 +1,41 @@
+html {
+  height: 100%; }
+
+#wrapper {
+  font-family: "Helvetica Neue Light", "HelveticaNeue-Light", "Helvetica Neue", Calibri, Helvetica, Arial, sans-serif; }
+
+.application-header {
+  text-align: center;
+  background: lightcoral;
+  padding: 2rem;
+  font-size: 20px; }
+
+.application-container {
+  margin: 0 20%;
+  background: #fafafa; }
+
+.input-wrapper {
+  padding: 1rem 0; }
+  .input-wrapper .input-label {
+    margin: 5px 0; }
+  .input-wrapper input {
+    width: 15rem;
+    padding: 10px;
+    border-radius: 5px; }
+
+.pad1rem {
+  padding: 1rem; }
+
+.button {
+  width: 15rem;
+  padding: 10px;
+  border-radius: 5px;
+  background: lightcoral;
+  color: white; }
+
+.login {
+  text-align: center; }
+  .login .button {
+    margin: 0 auto; }
+
+/*# sourceMappingURL=kalebr-frontend.css.map */
