@@ -1,6 +1,6 @@
 Rails.application.routes.draw do
   root 'home#index'
-  devise_for :users
+  post 'user_sign_in' => 'authentication#user_sign_in'
   namespace :api do
     namespace :v1 do
       resources :users
