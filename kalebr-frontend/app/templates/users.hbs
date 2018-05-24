@@ -1,2 +1,14 @@
-{{outlet}}
-<h1>Apple</h1>
+<div class="users pad1rem">
+    <div class="flex flex-right">
+        {{#link-to 'users/new'}}
+            <div class="button" id="apple">
+                Add New
+            </div>
+        {{/link-to}}
+    </div>
+    {{#each model as |user|}}
+      <div class="">
+        {{user.firstname}} {{user.lastname}}
+      </div>
+    {{/each}}
+</div>

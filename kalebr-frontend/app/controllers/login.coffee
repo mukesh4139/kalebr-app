@@ -17,6 +17,7 @@ login = Ember.Controller.extend
 
   actions:
     login: ->
+      self = @
       if @get('validLogin')
         user = {}
         user.email = @get('email')
@@ -25,12 +26,14 @@ login = Ember.Controller.extend
           type: 'POST'
           url: constants.USER_SIGN_IN_URL
           data: user
-        )
-        success: (data) ->
-          debugger
+          success: (data) ->
+            if data.user and data.auth_token
+              window.localStorage.setItem('auth_token', data.auth_token)
+              self.transitionToRoute('users')
 
-        error: ()->
-          debugger
+          error: (msg)->
+            alert msg.responseJSON.errors[0]
+        )
 
       else
         unless @get('emailIsValid')

@@ -1,8 +1,11 @@
 <div id="wrapper">
     <div class="app-container">
-        <div class="application-header">
-            Kalebr App
-        </div>
+        <ul class="navigation">
+            <li><a href="#">Home</a></li>
+            <li>{{#link-to 'users'}} Users {{/link-to}}</li>
+            <li>{{#link-to 'questions'}} Questions {{/link-to}}</li>
+            <li><a href="#">Sign Out</a></li>
+        </ul>
         <div class="application-container">
           {{outlet}}
         </div>
