@@ -1,19 +1,10 @@
 html {
   height: 100%;
-}
-
-#wrapper {
   font-family: "Helvetica Neue Light", "HelveticaNeue-Light", "Helvetica Neue", Calibri, Helvetica, Arial, sans-serif;
-
 }
-// Color Codes
-$primary-app-color: lightcoral;
 
-.application-header {
-  text-align: center;
-  background: $primary-app-color;
-  padding: 2rem;
-  font-size: 20px;
+body {
+  margin: 0;
 }
 
 .application-container {
@@ -30,6 +21,19 @@ $primary-app-color: lightcoral;
     width: 15rem;
     padding: 10px;
     border-radius: 5px;
+    background-color: #fff;
+    border: .5px solid rgba(216,216,216,.5);
+    border-radius: 6px;
+    color: #000;
+  }
+
+  textarea {
+    width: 25rem;
+    padding: 10px;
+    border-radius: 5px;
+    background-color: #fff;
+    border: .5px solid rgba(216,216,216,.5);
+    border-radius: 6px;
   }
 }
 
@@ -37,10 +41,25 @@ $primary-app-color: lightcoral;
   padding: 1rem;
 }
 
-.button {
+.width15rem {
   width: 15rem;
+}
+
+.button {
   padding: 10px;
   border-radius: 5px;
-  background: $primary-app-color;
+  background: deepskyblue;
   color: white;
+}
+
+.flex {
+  display: flex;
+}
+
+.flex-right {
+  flex-direction: row-reverse;
+}
+
+a {
+  text-decoration: none;
 }

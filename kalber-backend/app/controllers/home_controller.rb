@@ -1,3 +1,5 @@
 class HomeController < ApplicationController
-  render 'layouts/frontend_app'
+  def index
+    render 'layouts/frontend_app'
+  end
 end

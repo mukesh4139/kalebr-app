@@ -4,7 +4,11 @@
 Router = Ember.Router.extend(location: config.locationType, rootURL: config.rootURL)
 
 Router.map ->
-  @route 'users'#, path: '/'
-  @route 'login', path: '/'
+  @route 'users'
+  @route 'login', path: '/login'
+
+  @route 'users/new'
+  @route 'questions'
+  @route 'questions/new'
 
 `export default Router`

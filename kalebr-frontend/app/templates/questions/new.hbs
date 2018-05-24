@@ -1,0 +1,17 @@
+<div class="new-question pad1rem">
+    <div class="input-wrapper">
+        <div class="input-label"> Statement </div>
+      {{textarea  value=model.statement}}
+    </div>
+
+    {{#each model.options as |option index|}}
+        <div class="input-wrapper">
+            <div class="input-label"> Option {{adder index 1}}</div>
+          {{input  value=option.statement}}
+        </div>
+    {{/each}}
+
+    <div class="button width15rem" {{action 'createNewQuestion'}}>
+        Create
+    </div>
+</div>

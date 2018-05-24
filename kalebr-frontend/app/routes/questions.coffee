@@ -1,11 +1,11 @@
 `import Ember from 'ember'`
 
-usersRoute = Ember.Route.extend(
+questionsRoute = Ember.Route.extend(
   model: ->
-    @get('store').findAll('user')
+    @get('store').findAll('question')
 
   setupController: (controller, model) ->
     controller.set 'model', model
 )
 
-`export default usersRoute`
+`export default questionsRoute`

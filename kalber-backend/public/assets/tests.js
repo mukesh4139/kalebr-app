@@ -111,6 +111,16 @@ define('kalebr-frontend/tests/test-helper.jshint', ['exports'], function (export
     assert.ok(true, 'test-helper.js should pass jshint.');
   });
 });
+define('kalebr-frontend/tests/unit/helpers/adder-test', ['exports', 'kalebr-frontend/helpers/adder', 'qunit'], function (exports, _kalebrFrontendHelpersAdder, _qunit) {
+
+  (0, _qunit.module)('Unit | Helper | adder');
+
+  (0, _qunit.test)('it works', function (assert) {
+    var result;
+    result = (0, _kalebrFrontendHelpersAdder.adder)(42);
+    return assert.ok(result);
+  });
+});
 define('kalebr-frontend/tests/unit/models/user-test', ['exports', 'ember-qunit'], function (exports, _emberQunit) {
 
   (0, _emberQunit.moduleForModel)('user', 'Unit | Model | user', {
@@ -123,9 +133,39 @@ define('kalebr-frontend/tests/unit/models/user-test', ['exports', 'ember-qunit']
     return assert.ok(!!model);
   });
 });
+define('kalebr-frontend/tests/unit/routes/application-test', ['exports', 'ember-qunit'], function (exports, _emberQunit) {
+
+  (0, _emberQunit.moduleFor)('route:application', 'Unit | Route | application', {});
+
+  (0, _emberQunit.test)('it exists', function (assert) {
+    var route;
+    route = this.subject();
+    return assert.ok(route);
+  });
+});
 define('kalebr-frontend/tests/unit/routes/login-test', ['exports', 'ember-qunit'], function (exports, _emberQunit) {
 
   (0, _emberQunit.moduleFor)('route:login', 'Unit | Route | login', {});
+
+  (0, _emberQunit.test)('it exists', function (assert) {
+    var route;
+    route = this.subject();
+    return assert.ok(route);
+  });
+});
+define('kalebr-frontend/tests/unit/routes/questions-test', ['exports', 'ember-qunit'], function (exports, _emberQunit) {
+
+  (0, _emberQunit.moduleFor)('route:questions', 'Unit | Route | questions', {});
+
+  (0, _emberQunit.test)('it exists', function (assert) {
+    var route;
+    route = this.subject();
+    return assert.ok(route);
+  });
+});
+define('kalebr-frontend/tests/unit/routes/questions/new-test', ['exports', 'ember-qunit'], function (exports, _emberQunit) {
+
+  (0, _emberQunit.moduleFor)('route:questions/new', 'Unit | Route | questions/new', {});
 
   (0, _emberQunit.test)('it exists', function (assert) {
     var route;
@@ -141,6 +181,29 @@ define('kalebr-frontend/tests/unit/routes/users-test', ['exports', 'ember-qunit'
     var route;
     route = this.subject();
     return assert.ok(route);
+  });
+});
+define('kalebr-frontend/tests/unit/routes/users/new-test', ['exports', 'ember-qunit'], function (exports, _emberQunit) {
+
+  (0, _emberQunit.moduleFor)('route:users/new', 'Unit | Route | users/new', {});
+
+  (0, _emberQunit.test)('it exists', function (assert) {
+    var route;
+    route = this.subject();
+    return assert.ok(route);
+  });
+});
+define('kalebr-frontend/tests/unit/serializers/application-test', ['exports', 'ember-qunit'], function (exports, _emberQunit) {
+
+  (0, _emberQunit.moduleForModel)('application', 'Unit | Serializer | application', {
+    needs: ['serializer:application']
+  });
+
+  (0, _emberQunit.test)('it serializes records', function (assert) {
+    var record, serializedRecord;
+    record = this.subject();
+    serializedRecord = record.serialize();
+    return assert.ok(serializedRecord);
   });
 });
 /* jshint ignore:start */

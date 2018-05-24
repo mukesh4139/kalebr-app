@@ -1,0 +1,18 @@
+<div class="questions pad1rem">
+    <div class="flex flex-right">
+        {{#link-to 'questions/new'}}
+            <div class="button" id="apple">
+                Add New
+            </div>
+        {{/link-to}}
+    </div>
+  {{#each model as |question|}}
+      <div class="">
+        {{question.statement}}
+      </div>
+      Options
+      {{#each question.options as |option|}}
+        {{option.statement}}
+      {{/each}}
+  {{/each}}
+</div>
