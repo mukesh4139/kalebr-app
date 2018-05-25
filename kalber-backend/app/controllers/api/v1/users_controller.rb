@@ -1,5 +1,6 @@
 class Api::V1::UsersController < ApplicationController
-  before_action :set_user, only: [:show, :update]
+  before_action :set_user, only: [:show, :update, :destroy]
+  before_action :authenticate_request!, only: [:create, :update, :destroy]
 
   def index
     @users = User.all
@@ -23,7 +24,15 @@ class Api::V1::UsersController < ApplicationController
     if @user.update(user_params)
       render json: @user
     else
-      render json: {message: "Question could not be updated due to #{@user.errors.full_messages}"}, status: 422
+      render json: {message: "User could not be updated due to #{@user.errors.full_messages}"}, status: 422
+    end
+  end
+
+  def destroy
+    if @user.destroy
+      render json: {message: "User deleted successfully"}, status: :ok
+    else
+      render json: {message: "User could not be deleted"}, status: 422
     end
   end
 

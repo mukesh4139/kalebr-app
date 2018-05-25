@@ -60,6 +60,27 @@ body {
 .width15rem {
   width: 15rem; }
 
+.width5rem {
+  width: 5rem; }
+
+.width10pc {
+  width: 10pc; }
+
+.width15pc {
+  width: 15pc; }
+
+.width20pc {
+  width: 20pc; }
+
+.width30pc {
+  width: 30pc; }
+
+.width50pc {
+  width: 50pc; }
+
+.width65pc {
+  width: 65pc; }
+
 .button {
   padding: 10px;
   border-radius: 5px;
@@ -67,17 +88,59 @@ body {
   color: white; }
 
 .flex {
+  display: -webkit-box;
+  display: -moz-box;
+  display: -ms-flexbox;
+  display: -moz-flex;
+  display: -webkit-flex;
   display: flex; }
+
+.wrap {
+  -webkit-flex-wrap: wrap;
+  flex-wrap: wrap; }
 
 .flex-right {
   flex-direction: row-reverse; }
 
+.flex-justify-content-space-around {
+  justify-content: space-around; }
+
 a {
   text-decoration: none; }
+
+.thick-border {
+  height: 8px;
+  background: white; }
+
+.show {
+  display: block; }
+
+.hide {
+  display: none; }
+
+.errors {
+  color: red;
+  text-transform: capitalize;
+  font-size: 12px; }
 
 .login {
   text-align: center; }
   .login .button {
     margin: 0 auto; }
+
+.users-list {
+  margin: 10px 0; }
+
+.single-user-row {
+  padding: 10px; }
+
+.single-user-row:nth-child(even) {
+  background: #dfdfdf; }
+
+.single-user-row:nth-child(odd) {
+  background: white; }
+
+.single-option {
+  flex-basis: 25%; }
 
 /*# sourceMappingURL=kalebr-frontend.css.map */

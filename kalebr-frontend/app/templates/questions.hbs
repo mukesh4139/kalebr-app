@@ -14,7 +14,7 @@
           <div class="width10pc">
             {{#link-to 'questions/edit' question.id}} Edit{{/link-to}}
           </div>
-          <div class="width10pc">Delete</div>
+          <div class="width10pc" {{action 'deleteRecord' question}}>Destroy</div>
           <div class="width15pc" {{action 'toggleOptions' question}}>
               Options {{#if question.showOptions}}&#9650; {{else}}&#9660; {{/if}}
           </div>

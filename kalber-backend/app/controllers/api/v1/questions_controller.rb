@@ -1,7 +1,6 @@
 class Api::V1::QuestionsController < ApplicationController
-  rescue_from ActiveRecord::RecordNotFound, :with => :record_not_found
-  before_action :set_question, only: [:show, :update]
-  before_action :authenticate_request!, only: [:create]
+  before_action :set_question, only: [:show, :update, :destroy]
+  before_action :authenticate_request!, only: [:create, :update, :destroy]
 
   def index
     @questions = Question.all.order(:id)
@@ -29,6 +28,14 @@ class Api::V1::QuestionsController < ApplicationController
     end
   end
 
+  def destroy
+    if @question.destroy
+      render json: {message: "Question deleted successfully"}, status: :ok
+    else
+      render json: {message: "Question could not be deleted"}, status: 422
+    end
+  end
+
   private
 
   def set_question
@@ -38,9 +45,5 @@ class Api::V1::QuestionsController < ApplicationController
   def question_params
     params[:question][:options_attributes] = params[:question][:options]
     params.require(:question).permit(:statement, :options_attributes => [:id, :statement, :_destroy])
-  end
-
-  def record_not_found
-    render json: {message: "This requested record is either deleted or does not exist"}, :status => 422
   end
 end

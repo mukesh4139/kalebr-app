@@ -13,7 +13,7 @@
               <div class="width30pc">{{user.firstname}} {{user.lastname}}</div>
               <div class="width30pc">{{user.email}}</div>
               <div class="width10pc">{{#link-to 'users/edit' user.id}}Edit{{/link-to}}</div>
-              <div class="width10pc">Destroy</div>
+              <div class="width10pc" {{action 'deleteRecord' user}}>Destroy</div>
           </div>
       {{/each}}
     </div>
