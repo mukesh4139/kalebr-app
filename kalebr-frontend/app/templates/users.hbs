@@ -6,9 +6,15 @@
             </div>
         {{/link-to}}
     </div>
-    {{#each model as |user|}}
-      <div class="">
-        {{user.firstname}} {{user.lastname}}
-      </div>
-    {{/each}}
+    <div class="users-list">
+      {{#each model as |user|}}
+          <div class="single-user-row flex">
+              <div class="width10pc">{{user.id}}</div>
+              <div class="width30pc">{{user.firstname}} {{user.lastname}}</div>
+              <div class="width30pc">{{user.email}}</div>
+              <div class="width10pc">{{#link-to 'users/edit' user.id}}Edit{{/link-to}}</div>
+              <div class="width10pc">Destroy</div>
+          </div>
+      {{/each}}
+    </div>
 </div>

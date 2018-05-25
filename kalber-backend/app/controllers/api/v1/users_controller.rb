@@ -1,5 +1,5 @@
 class Api::V1::UsersController < ApplicationController
-  before_action :set_user, only: [:show]
+  before_action :set_user, only: [:show, :update]
 
   def index
     @users = User.all
@@ -19,6 +19,14 @@ class Api::V1::UsersController < ApplicationController
     end
   end
 
+  def update
+    if @user.update(user_params)
+      render json: @user
+    else
+      render json: {message: "Question could not be updated due to #{@user.errors.full_messages}"}, status: 422
+    end
+  end
+
   private
 
   def set_user
@@ -26,6 +34,9 @@ class Api::V1::UsersController < ApplicationController
   end
 
   def user_params
+    if params[:user][:password] == ''
+      params[:user][:password] = nil
+    end
     params.require(:user).permit(:firstname, :lastname, :email, :password)
   end
 end

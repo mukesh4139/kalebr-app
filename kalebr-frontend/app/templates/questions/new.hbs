@@ -1,15 +1,28 @@
 <div class="new-question pad1rem">
     <div class="input-wrapper">
         <div class="input-label"> Statement </div>
-      {{textarea  value=model.statement}}
+        {{#if showErrors}}
+            <div class="errors">
+              {{model.errors.statement.firstObject}}
+            </div>
+        {{/if}}
+      {{textarea value=model.statement cols="80" rows="6"}}
     </div>
 
     {{#each model.options as |option index|}}
         <div class="input-wrapper">
             <div class="input-label"> Option {{adder index 1}}</div>
-          {{input  value=option.statement}}
+          {{input value=option.statement}}
         </div>
     {{/each}}
+
+    {{#if showErrors}}
+        <div class="errors">
+            {{#unless optionsValid}}
+              {{invalidOptionsMsg}}
+            {{/unless}}
+        </div>
+    {{/if}}
 
     <div class="button width15rem" {{action 'createNewQuestion'}}>
         Create

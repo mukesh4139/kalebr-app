@@ -1,7 +1,15 @@
 {{outlet}}
 <div class="new-user pad1rem">
     <div class="input-wrapper">
-        <div class="input-label"> First Name </div>
+        <div class="input-label">
+            First Name
+        </div>
+      {{#if showErrors}}
+          <div class="errors">
+            {{model.errors.firstname.firstObject}}
+          </div>
+      {{/if}}
+
         {{input type=text value=model.firstname}}
     </div>
 
@@ -12,11 +20,23 @@
 
     <div class="input-wrapper">
         <div class="input-label"> Email </div>
+        {{#if showErrors}}
+            <div class="errors">
+              {{model.errors.email.firstObject}}
+            </div>
+        {{/if}}
         {{input type=text value=model.email}}
     </div>
 
     <div class="input-wrapper">
         <div class="input-label"> Password </div>
+        {{#if showErrors}}
+          {{#unless passwordValid}}
+              <div class="errors">
+                {{invalidPasswordMsg}}
+              </div>
+          {{/unless}}
+        {{/if}}
         {{input type="password" value = model.password}}
     </div>
 
