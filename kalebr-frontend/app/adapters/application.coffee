@@ -5,8 +5,15 @@
 adapter = ActiveModelAdapter.extend
   host: constants.HOST
   namespace: constants.NAMESPACE
+  headers: {
+    Authorization: "Bearer " + window.localStorage.getItem('auth_token')
+  }
 
   handleResponse: (status, headers, payload) ->
-    this._super(status, headers, payload)
+    if (this.isInvalid(status, headers, payload))
+      if (status == 422 || status == 500)
+        alert payload.message
+    else
+      this._super(status, headers, payload)
 
 `export default adapter`

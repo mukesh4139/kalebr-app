@@ -5,6 +5,10 @@ questionsRoute = Ember.Route.extend(
     @get('store').findAll('question')
 
   setupController: (controller, model) ->
+    model = model.map (question) ->
+      Em.ObjectProxy.create
+        content: question
+        showOptions: false
     controller.set 'model', model
 )
 

@@ -15,7 +15,6 @@ applicationRoute = Ember.Route.extend(
         Authorization: "Bearer " + auth_token
       success: (data) ->
         console.log(data.user.email, 'logged in')
-        self.transitionTo('users')
 
       error: (msg)  ->
         console.log(msg.responseJSON.errors[0])

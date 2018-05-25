@@ -10,5 +10,7 @@ Router.map ->
   @route 'users/new'
   @route 'questions'
   @route 'questions/new'
+  @route 'questions/edit', path: 'questions/:id/edit'
+  @route 'users/edit', path: 'users/:id/edit'
 
 `export default Router`
