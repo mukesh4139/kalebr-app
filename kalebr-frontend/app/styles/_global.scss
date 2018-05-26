@@ -18,14 +18,13 @@ body {
   }
 }
 
-
 .input-wrapper {
   padding: 1rem 0;
   .input-label {
     margin: 5px 0;
   }
   input {
-    width: 15rem;
+    width: 25rem;
     padding: 10px;
     border-radius: 5px;
     background-color: #fff;
@@ -50,6 +49,10 @@ body {
 
 .padtb1rem {
   padding: 1rem 0;
+}
+
+.padtb5 {
+  padding: 5px 0;
 }
 
 .width15rem {
@@ -87,6 +90,10 @@ body {
 
 .width65pc {
   width: 65pc;
+}
+
+.mr10 {
+  margin-right: 10px;
 }
 
 .button {

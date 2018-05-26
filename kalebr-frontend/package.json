@@ -20,8 +20,10 @@
   "license": "MIT",
   "devDependencies": {
     "active-model-adapter": "2.2.0",
+    "bootstrap-sass": "3.3.7",
     "broccoli-asset-rev": "^2.4.2",
     "ember-ajax": "^2.0.1",
+    "ember-bootstrap": "1.2.2",
     "ember-cli": "2.8.0",
     "ember-cli-app-version": "^1.0.0",
     "ember-cli-babel": "^5.1.6",

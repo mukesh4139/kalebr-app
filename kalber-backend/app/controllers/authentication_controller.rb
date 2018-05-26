@@ -10,7 +10,7 @@ class AuthenticationController < ApplicationController
   end
 
   def signed_in_user
-    render json: {user: @current_user}
+    render json: @current_user
   end
 
   private
