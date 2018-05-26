@@ -3,12 +3,16 @@
 
 login = Ember.Controller.extend
 
+  reset: ->
+    @set 'email', undefined
+    @set 'password', undefined
+
   emailIsValid: (->
-    @get('email').length > 0
+    @get('email.length') > 0
   ).property('email')
 
   passwordIsValid: (->
-    @get('password').length > 0
+    @get('password.length') > 0
   ).property('password')
 
   validLogin: (->
@@ -29,6 +33,7 @@ login = Ember.Controller.extend
           success: (data) ->
             if data.user and data.auth_token
               window.localStorage.setItem('auth_token', data.auth_token)
+              self.get('session').set 'currentUser', data.user
               self.transitionToRoute('users')
 
           error: (msg)->
@@ -41,8 +46,5 @@ login = Ember.Controller.extend
 
         else if !@get('passwordIsValid')
           alert 'Invalid Password'
-
-    cancel : ->
-      window.history.back()
 
 `export default login`

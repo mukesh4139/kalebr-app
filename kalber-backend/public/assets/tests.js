@@ -187,6 +187,28 @@ define('kalebr-frontend/tests/unit/helpers/adder-test', ['exports', 'kalebr-fron
     return assert.ok(result);
   });
 });
+define('kalebr-frontend/tests/unit/initializers/session-test', ['exports', 'ember', 'kalebr-frontend/initializers/session', 'qunit'], function (exports, _ember, _kalebrFrontendInitializersSession, _qunit) {
+  var application, registry;
+
+  application = null;
+
+  registry = null;
+
+  (0, _qunit.module)('Unit | Initializer | session', {
+    beforeEach: function beforeEach() {
+      return _ember['default'].run(function () {
+        application = _ember['default'].Application.create();
+        registry = application.registry;
+        return application.deferReadiness();
+      });
+    }
+  });
+
+  (0, _qunit.test)('it works', function (assert) {
+    (0, _kalebrFrontendInitializersSession.initialize)(registry, application);
+    return assert.ok(true);
+  });
+});
 define('kalebr-frontend/tests/unit/models/user-test', ['exports', 'ember-qunit'], function (exports, _emberQunit) {
 
   (0, _emberQunit.moduleForModel)('user', 'Unit | Model | user', {
@@ -290,6 +312,16 @@ define('kalebr-frontend/tests/unit/serializers/application-test', ['exports', 'e
     record = this.subject();
     serializedRecord = record.serialize();
     return assert.ok(serializedRecord);
+  });
+});
+define('kalebr-frontend/tests/unit/services/session-test', ['exports', 'ember-qunit'], function (exports, _emberQunit) {
+
+  (0, _emberQunit.moduleFor)('service:session', 'Unit | Service | session', {});
+
+  (0, _emberQunit.test)('it exists', function (assert) {
+    var service;
+    service = this.subject();
+    return assert.ok(service);
   });
 });
 /* jshint ignore:start */

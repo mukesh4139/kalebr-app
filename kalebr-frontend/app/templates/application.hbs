@@ -2,10 +2,14 @@
     <div class="app-container">
         <ul class="navigation">
             <li><a href="#">Home</a></li>
-            <li>{{#link-to 'users'}} Users {{/link-to}}</li>
-            <li>{{#link-to 'questions'}} Questions {{/link-to}}</li>
-            <li><a href="#">Sign Out</a></li>
-        </ul>
+            {{#if session.currentUser}}
+                <li>{{#link-to 'users'}} Users {{/link-to}}</li>
+                <li>{{#link-to 'questions'}} Questions {{/link-to}}</li>
+                <li {{action 'logout'}}>Sign Out</li>
+            {{else}}
+                <li>Sign In</li>
+            {{/if}}
+            </ul>
         <div class="application-container">
           {{outlet}}
         </div>

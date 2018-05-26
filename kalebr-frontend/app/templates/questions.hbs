@@ -8,18 +8,18 @@
     </div>
   <div class="questions-list users-list">
     {{#each model as |question|}}
-        <div class="flex pad1rem">
-            <div class="width10pc">{{question.id}}</div>
+        <div class="flex padtb1rem">
+            <div class="width5pc">{{question.id}}</div>
           <div class="width65pc">{{question.statement}}</div>
           <div class="width10pc">
             {{#link-to 'questions/edit' question.id}} Edit{{/link-to}}
           </div>
-          <div class="width10pc" {{action 'deleteRecord' question}}>Destroy</div>
-          <div class="width15pc" {{action 'toggleOptions' question}}>
+          <div class="width10pc" {{action 'deleteRecord' question}}>Del</div>
+          <div class="width20pc" {{action 'toggleOptions' question}}>
               Options {{#if question.showOptions}}&#9650; {{else}}&#9660; {{/if}}
           </div>
         </div>
-        <div class="flex pad1rem {{unless question.showOptions 'hide'}}">
+        <div class="flex padtb1rem {{unless question.showOptions 'hide'}}">
           {{#each question.options as |option index|}}
               <div class="single-option">
                   <span>{{adder index 1}}</span>.

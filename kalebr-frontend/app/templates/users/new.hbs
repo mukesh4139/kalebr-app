@@ -41,8 +41,10 @@
     </div>
 
     <div class="button width15rem" {{action 'createNewUser'}}>
-        Create
+        {{#if model.id}}
+          Update
+        {{else}}
+            Create
+        {{/if}}
     </div>
-
-
 </div>

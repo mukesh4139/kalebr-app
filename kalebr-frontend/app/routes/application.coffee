@@ -14,12 +14,20 @@ applicationRoute = Ember.Route.extend(
       headers:
         Authorization: "Bearer " + auth_token
       success: (data) ->
+        self.get('session').set 'currentUser', data.user
         console.log(data.user.email, 'logged in')
 
       error: (msg)  ->
         console.log(msg.responseJSON.errors[0])
         self.replaceWith('login')
     )
+
+  actions:
+    logout: ->
+      console.log('logging out ', @get('session.currentUser.email'))
+      @get('session').set 'currentUser', undefined
+      window.localStorage.setItem('auth_token', null)
+      @replaceWith('login')
 )
 
 `export default applicationRoute`

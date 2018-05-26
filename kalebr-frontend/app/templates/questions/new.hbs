@@ -25,6 +25,10 @@
     {{/if}}
 
     <div class="button width15rem" {{action 'createNewQuestion'}}>
-        Create
+      {{#if model.id}}
+          Update
+      {{else}}
+          Create
+      {{/if}}
     </div>
 </div>

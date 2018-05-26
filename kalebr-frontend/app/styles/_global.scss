@@ -12,6 +12,13 @@ body {
   background: #fafafa;
 }
 
+@media all and (max-width: 800px) {
+  .application-container {
+    margin:0;
+  }
+}
+
+
 .input-wrapper {
   padding: 1rem 0;
   .input-label {
@@ -41,6 +48,10 @@ body {
   padding: 1rem;
 }
 
+.padtb1rem {
+  padding: 1rem 0;
+}
+
 .width15rem {
   width: 15rem;
 }
@@ -48,6 +59,11 @@ body {
 .width5rem {
   width: 5rem;
 }
+
+.width5pc {
+  width: 5pc;
+}
+
 
 .width10pc {
   width: 10pc;

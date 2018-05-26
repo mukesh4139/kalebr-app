@@ -12,6 +12,9 @@
 
 .navigation a {
   text-decoration: none;
+  color: white; }
+
+.navigation li {
   display: block;
   padding: 1em;
   color: white; }
@@ -33,6 +36,10 @@ body {
 .application-container {
   margin: 0 20%;
   background: #fafafa; }
+
+@media all and (max-width: 800px) {
+  .application-container {
+    margin: 0; } }
 
 .input-wrapper {
   padding: 1rem 0; }
@@ -57,11 +64,17 @@ body {
 .pad1rem {
   padding: 1rem; }
 
+.padtb1rem {
+  padding: 1rem 0; }
+
 .width15rem {
   width: 15rem; }
 
 .width5rem {
   width: 5rem; }
+
+.width5pc {
+  width: 5pc; }
 
 .width10pc {
   width: 10pc; }
