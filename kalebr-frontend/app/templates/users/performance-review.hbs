@@ -1,0 +1,26 @@
+<div class="user-performance-review pad1rem">
+    <div class="">
+        Reviewee : <span>{{model.reviewee.firstname }} {{model.reviewee.lastname}}</span>
+    </div>
+
+    <div class="padtb1rem">
+        Select Reviewers
+    </div>
+
+    <div class="padtb1rem">
+      {{#each users as |user|}}
+        <div class="padtb5">
+          <span class="mr10">{{input type="checkbox" checked=user.selected}}</span>
+          {{user.firstname }} {{user.lastname}}
+        </div>
+      {{/each}}
+    </div>
+
+    <div class="button width15rem" {{action 'createPerformanceReview'}}>
+      {{#if model.id}}
+          Update
+      {{else}}
+          Assign
+      {{/if}}
+    </div>
+</div>

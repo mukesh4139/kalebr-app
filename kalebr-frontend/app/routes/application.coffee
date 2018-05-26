@@ -2,7 +2,7 @@
 `import constants from "kalebr-frontend/utils/constants"`
 
 applicationRoute = Ember.Route.extend(
-  setupController: ->
+  beforeModel: ->
     return @getCurrentUser()
 
   getCurrentUser: () ->
@@ -14,8 +14,14 @@ applicationRoute = Ember.Route.extend(
       headers:
         Authorization: "Bearer " + auth_token
       success: (data) ->
-        self.get('session').set 'currentUser', data.user
-        console.log(data.user.email, 'logged in')
+        unless data.errors
+          normalizedData = self.store.normalize('user', data.user)
+          currUser = self.store.push(normalizedData)
+          self.get('session').set 'currentUser', currUser
+          console.log(data.user.email, 'logged in')
+        else
+          console.log(msg.responseJSON.errors[0])
+          self.replaceWith('login')
 
       error: (msg)  ->
         console.log(msg.responseJSON.errors[0])

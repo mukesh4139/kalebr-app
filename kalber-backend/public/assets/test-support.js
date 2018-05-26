@@ -7178,6 +7178,20 @@ define('ember-qunit/test', ['exports', 'ember-qunit/test-wrapper', 'qunit'], fun
     _emberQunitTestWrapper['default'].apply(null, args);
   }
 });
+define('ember-raf-scheduler/test-support/register-waiter', ['exports', 'ember-raf-scheduler'], function (exports, _emberRafScheduler) {
+  'use strict';
+
+  exports['default'] = registerWaiter;
+
+  function registerWaiter() {
+    // We can't rely on the importable Ember since shims are no
+    // longer included by default, so use the global instance.
+    // eslint-disable-next-line
+    Ember.Test.registerWaiter(function () {
+      return _emberRafScheduler['default'].jobs === 0;
+    });
+  }
+});
 define('ember-test-helpers', ['exports', 'ember', 'ember-test-helpers/test-module', 'ember-test-helpers/test-module-for-acceptance', 'ember-test-helpers/test-module-for-integration', 'ember-test-helpers/test-module-for-component', 'ember-test-helpers/test-module-for-model', 'ember-test-helpers/test-context', 'ember-test-helpers/test-resolver'], function (exports, _ember, _emberTestHelpersTestModule, _emberTestHelpersTestModuleForAcceptance, _emberTestHelpersTestModuleForIntegration, _emberTestHelpersTestModuleForComponent, _emberTestHelpersTestModuleForModel, _emberTestHelpersTestContext, _emberTestHelpersTestResolver) {
   'use strict';
 

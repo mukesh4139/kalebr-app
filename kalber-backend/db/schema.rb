@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema.define(version: 20180524173506) do
+ActiveRecord::Schema.define(version: 20180526072500) do
 
   # These are extensions that must be enabled in order to support this database
   enable_extension "plpgsql"
@@ -23,10 +23,36 @@ ActiveRecord::Schema.define(version: 20180524173506) do
     t.index ["question_id"], name: "index_options_on_question_id"
   end
 
+  create_table "performance_reviews", force: :cascade do |t|
+    t.bigint "reviewee_id"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["reviewee_id"], name: "index_performance_reviews_on_reviewee_id"
+  end
+
+  create_table "performance_reviews_users", force: :cascade do |t|
+    t.bigint "performance_review_id"
+    t.bigint "reviewer_id"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["performance_review_id"], name: "index_performance_reviews_users_on_performance_review_id"
+    t.index ["reviewer_id"], name: "index_performance_reviews_users_on_reviewer_id"
+  end
+
   create_table "questions", force: :cascade do |t|
     t.text "statement"
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
+  end
+
+  create_table "reviews", force: :cascade do |t|
+    t.text "feedback"
+    t.bigint "performance_review_id"
+    t.bigint "user_id"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["performance_review_id"], name: "index_reviews_on_performance_review_id"
+    t.index ["user_id"], name: "index_reviews_on_user_id"
   end
 
   create_table "users", force: :cascade do |t|
@@ -50,4 +76,9 @@ ActiveRecord::Schema.define(version: 20180524173506) do
   end
 
   add_foreign_key "options", "questions"
+  add_foreign_key "performance_reviews", "users", column: "reviewee_id"
+  add_foreign_key "performance_reviews_users", "performance_reviews"
+  add_foreign_key "performance_reviews_users", "users", column: "reviewer_id"
+  add_foreign_key "reviews", "performance_reviews"
+  add_foreign_key "reviews", "users"
 end

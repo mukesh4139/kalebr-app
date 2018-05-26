@@ -36,6 +36,10 @@ class Api::V1::UsersController < ApplicationController
     end
   end
 
+  def reviews
+    render json: @user.reviews
+  end
+
   private
 
   def set_user

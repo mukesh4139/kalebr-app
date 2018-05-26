@@ -209,6 +209,18 @@ define('kalebr-frontend/tests/unit/initializers/session-test', ['exports', 'embe
     return assert.ok(true);
   });
 });
+define('kalebr-frontend/tests/unit/models/performance-review-test', ['exports', 'ember-qunit'], function (exports, _emberQunit) {
+
+  (0, _emberQunit.moduleForModel)('performance-review', 'Unit | Model | performance review', {
+    needs: []
+  });
+
+  (0, _emberQunit.test)('it exists', function (assert) {
+    var model;
+    model = this.subject();
+    return assert.ok(!!model);
+  });
+});
 define('kalebr-frontend/tests/unit/models/user-test', ['exports', 'ember-qunit'], function (exports, _emberQunit) {
 
   (0, _emberQunit.moduleForModel)('user', 'Unit | Model | user', {
@@ -224,6 +236,16 @@ define('kalebr-frontend/tests/unit/models/user-test', ['exports', 'ember-qunit']
 define('kalebr-frontend/tests/unit/routes/application-test', ['exports', 'ember-qunit'], function (exports, _emberQunit) {
 
   (0, _emberQunit.moduleFor)('route:application', 'Unit | Route | application', {});
+
+  (0, _emberQunit.test)('it exists', function (assert) {
+    var route;
+    route = this.subject();
+    return assert.ok(route);
+  });
+});
+define('kalebr-frontend/tests/unit/routes/home-test', ['exports', 'ember-qunit'], function (exports, _emberQunit) {
+
+  (0, _emberQunit.moduleFor)('route:home', 'Unit | Route | home', {});
 
   (0, _emberQunit.test)('it exists', function (assert) {
     var route;
@@ -294,6 +316,46 @@ define('kalebr-frontend/tests/unit/routes/users/edit-test', ['exports', 'ember-q
 define('kalebr-frontend/tests/unit/routes/users/new-test', ['exports', 'ember-qunit'], function (exports, _emberQunit) {
 
   (0, _emberQunit.moduleFor)('route:users/new', 'Unit | Route | users/new', {});
+
+  (0, _emberQunit.test)('it exists', function (assert) {
+    var route;
+    route = this.subject();
+    return assert.ok(route);
+  });
+});
+define('kalebr-frontend/tests/unit/routes/users/others-performance-reviews-test', ['exports', 'ember-qunit'], function (exports, _emberQunit) {
+
+  (0, _emberQunit.moduleFor)('route:users/others-performance-reviews', 'Unit | Route | users/others performance reviews', {});
+
+  (0, _emberQunit.test)('it exists', function (assert) {
+    var route;
+    route = this.subject();
+    return assert.ok(route);
+  });
+});
+define('kalebr-frontend/tests/unit/routes/users/performance-review-test', ['exports', 'ember-qunit'], function (exports, _emberQunit) {
+
+  (0, _emberQunit.moduleFor)('route:users/performance-review', 'Unit | Route | users/performance review', {});
+
+  (0, _emberQunit.test)('it exists', function (assert) {
+    var route;
+    route = this.subject();
+    return assert.ok(route);
+  });
+});
+define('kalebr-frontend/tests/unit/routes/users/review-test', ['exports', 'ember-qunit'], function (exports, _emberQunit) {
+
+  (0, _emberQunit.moduleFor)('route:users/review', 'Unit | Route | users/review', {});
+
+  (0, _emberQunit.test)('it exists', function (assert) {
+    var route;
+    route = this.subject();
+    return assert.ok(route);
+  });
+});
+define('kalebr-frontend/tests/unit/routes/users/reviews-test', ['exports', 'ember-qunit'], function (exports, _emberQunit) {
+
+  (0, _emberQunit.moduleFor)('route:users/reviews', 'Unit | Route | users/reviews', {});
 
   (0, _emberQunit.test)('it exists', function (assert) {
     var route;

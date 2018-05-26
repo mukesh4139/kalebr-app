@@ -1,0 +1,11 @@
+<div class="others-performance-reviews users pad1rem">
+    <div class="users-list">
+      {{#each model as |performanceReview|}}
+          <div class="single-user-row flex">
+              <div class="width10pc">{{performanceReview.id}}</div>
+              <div class="width30pc">{{performanceReview.reviewee.fullname}}</div>
+              {{#link-to 'users/review' session.currentUser}}<div class="width20pc">Go to Review</div>{{/link-to}}
+          </div>
+      {{/each}}
+    </div>
+</div>

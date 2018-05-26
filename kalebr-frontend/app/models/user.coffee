@@ -6,6 +6,13 @@ userModel = DS.Model.extend(EmberValidations, {
   lastname: DS.attr('string')
   email: DS.attr('string')
   password: DS.attr('string')
+  admin: DS.attr('boolean')
+  selfPerformanceReview: DS.belongsTo('performance-review', {inverse: 'reviewee'})
+  othersPerformanceReviews: DS.hasMany('performance-review', {inverse: null})
+
+  fullname: (->
+    @get('firstname') + ' ' + @get('lastname')
+  ).property('firstname', 'lastname')
 
   validations: {
     firstname: {

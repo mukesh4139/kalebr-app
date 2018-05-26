@@ -343,6 +343,676 @@ var runningTests = false;
     module.exports = { require: require, define: define };
   }
 })(this);
+;/**
+ * Copyright (c) 2014, Facebook, Inc.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * https://raw.github.com/facebook/regenerator/master/LICENSE file. An
+ * additional grant of patent rights can be found in the PATENTS file in
+ * the same directory.
+ */
+
+!(function(global) {
+  "use strict";
+
+  var hasOwn = Object.prototype.hasOwnProperty;
+  var undefined; // More compressible than void 0.
+  var $Symbol = typeof Symbol === "function" ? Symbol : {};
+  var iteratorSymbol = $Symbol.iterator || "@@iterator";
+  var toStringTagSymbol = $Symbol.toStringTag || "@@toStringTag";
+
+  var inModule = typeof module === "object";
+  var runtime = global.regeneratorRuntime;
+  if (runtime) {
+    if (inModule) {
+      // If regeneratorRuntime is defined globally and we're in a module,
+      // make the exports object identical to regeneratorRuntime.
+      module.exports = runtime;
+    }
+    // Don't bother evaluating the rest of this file if the runtime was
+    // already defined globally.
+    return;
+  }
+
+  // Define the runtime globally (as expected by generated code) as either
+  // module.exports (if we're in a module) or a new, empty object.
+  runtime = global.regeneratorRuntime = inModule ? module.exports : {};
+
+  function wrap(innerFn, outerFn, self, tryLocsList) {
+    // If outerFn provided and outerFn.prototype is a Generator, then outerFn.prototype instanceof Generator.
+    var protoGenerator = outerFn && outerFn.prototype instanceof Generator ? outerFn : Generator;
+    var generator = Object.create(protoGenerator.prototype);
+    var context = new Context(tryLocsList || []);
+
+    // The ._invoke method unifies the implementations of the .next,
+    // .throw, and .return methods.
+    generator._invoke = makeInvokeMethod(innerFn, self, context);
+
+    return generator;
+  }
+  runtime.wrap = wrap;
+
+  // Try/catch helper to minimize deoptimizations. Returns a completion
+  // record like context.tryEntries[i].completion. This interface could
+  // have been (and was previously) designed to take a closure to be
+  // invoked without arguments, but in all the cases we care about we
+  // already have an existing method we want to call, so there's no need
+  // to create a new function object. We can even get away with assuming
+  // the method takes exactly one argument, since that happens to be true
+  // in every case, so we don't have to touch the arguments object. The
+  // only additional allocation required is the completion record, which
+  // has a stable shape and so hopefully should be cheap to allocate.
+  function tryCatch(fn, obj, arg) {
+    try {
+      return { type: "normal", arg: fn.call(obj, arg) };
+    } catch (err) {
+      return { type: "throw", arg: err };
+    }
+  }
+
+  var GenStateSuspendedStart = "suspendedStart";
+  var GenStateSuspendedYield = "suspendedYield";
+  var GenStateExecuting = "executing";
+  var GenStateCompleted = "completed";
+
+  // Returning this object from the innerFn has the same effect as
+  // breaking out of the dispatch switch statement.
+  var ContinueSentinel = {};
+
+  // Dummy constructor functions that we use as the .constructor and
+  // .constructor.prototype properties for functions that return Generator
+  // objects. For full spec compliance, you may wish to configure your
+  // minifier not to mangle the names of these two functions.
+  function Generator() {}
+  function GeneratorFunction() {}
+  function GeneratorFunctionPrototype() {}
+
+  var Gp = GeneratorFunctionPrototype.prototype = Generator.prototype;
+  GeneratorFunction.prototype = Gp.constructor = GeneratorFunctionPrototype;
+  GeneratorFunctionPrototype.constructor = GeneratorFunction;
+  GeneratorFunctionPrototype[toStringTagSymbol] = GeneratorFunction.displayName = "GeneratorFunction";
+
+  // Helper for defining the .next, .throw, and .return methods of the
+  // Iterator interface in terms of a single ._invoke method.
+  function defineIteratorMethods(prototype) {
+    ["next", "throw", "return"].forEach(function(method) {
+      prototype[method] = function(arg) {
+        return this._invoke(method, arg);
+      };
+    });
+  }
+
+  runtime.isGeneratorFunction = function(genFun) {
+    var ctor = typeof genFun === "function" && genFun.constructor;
+    return ctor
+      ? ctor === GeneratorFunction ||
+        // For the native GeneratorFunction constructor, the best we can
+        // do is to check its .name property.
+        (ctor.displayName || ctor.name) === "GeneratorFunction"
+      : false;
+  };
+
+  runtime.mark = function(genFun) {
+    if (Object.setPrototypeOf) {
+      Object.setPrototypeOf(genFun, GeneratorFunctionPrototype);
+    } else {
+      genFun.__proto__ = GeneratorFunctionPrototype;
+      if (!(toStringTagSymbol in genFun)) {
+        genFun[toStringTagSymbol] = "GeneratorFunction";
+      }
+    }
+    genFun.prototype = Object.create(Gp);
+    return genFun;
+  };
+
+  // Within the body of any async function, `await x` is transformed to
+  // `yield regeneratorRuntime.awrap(x)`, so that the runtime can test
+  // `value instanceof AwaitArgument` to determine if the yielded value is
+  // meant to be awaited. Some may consider the name of this method too
+  // cutesy, but they are curmudgeons.
+  runtime.awrap = function(arg) {
+    return new AwaitArgument(arg);
+  };
+
+  function AwaitArgument(arg) {
+    this.arg = arg;
+  }
+
+  function AsyncIterator(generator) {
+    function invoke(method, arg, resolve, reject) {
+      var record = tryCatch(generator[method], generator, arg);
+      if (record.type === "throw") {
+        reject(record.arg);
+      } else {
+        var result = record.arg;
+        var value = result.value;
+        if (value instanceof AwaitArgument) {
+          return Promise.resolve(value.arg).then(function(value) {
+            invoke("next", value, resolve, reject);
+          }, function(err) {
+            invoke("throw", err, resolve, reject);
+          });
+        }
+
+        return Promise.resolve(value).then(function(unwrapped) {
+          // When a yielded Promise is resolved, its final value becomes
+          // the .value of the Promise<{value,done}> result for the
+          // current iteration. If the Promise is rejected, however, the
+          // result for this iteration will be rejected with the same
+          // reason. Note that rejections of yielded Promises are not
+          // thrown back into the generator function, as is the case
+          // when an awaited Promise is rejected. This difference in
+          // behavior between yield and await is important, because it
+          // allows the consumer to decide what to do with the yielded
+          // rejection (swallow it and continue, manually .throw it back
+          // into the generator, abandon iteration, whatever). With
+          // await, by contrast, there is no opportunity to examine the
+          // rejection reason outside the generator function, so the
+          // only option is to throw it from the await expression, and
+          // let the generator function handle the exception.
+          result.value = unwrapped;
+          resolve(result);
+        }, reject);
+      }
+    }
+
+    if (typeof process === "object" && process.domain) {
+      invoke = process.domain.bind(invoke);
+    }
+
+    var previousPromise;
+
+    function enqueue(method, arg) {
+      function callInvokeWithMethodAndArg() {
+        return new Promise(function(resolve, reject) {
+          invoke(method, arg, resolve, reject);
+        });
+      }
+
+      return previousPromise =
+        // If enqueue has been called before, then we want to wait until
+        // all previous Promises have been resolved before calling invoke,
+        // so that results are always delivered in the correct order. If
+        // enqueue has not been called before, then it is important to
+        // call invoke immediately, without waiting on a callback to fire,
+        // so that the async generator function has the opportunity to do
+        // any necessary setup in a predictable way. This predictability
+        // is why the Promise constructor synchronously invokes its
+        // executor callback, and why async functions synchronously
+        // execute code before the first await. Since we implement simple
+        // async functions in terms of async generators, it is especially
+        // important to get this right, even though it requires care.
+        previousPromise ? previousPromise.then(
+          callInvokeWithMethodAndArg,
+          // Avoid propagating failures to Promises returned by later
+          // invocations of the iterator.
+          callInvokeWithMethodAndArg
+        ) : callInvokeWithMethodAndArg();
+    }
+
+    // Define the unified helper method that is used to implement .next,
+    // .throw, and .return (see defineIteratorMethods).
+    this._invoke = enqueue;
+  }
+
+  defineIteratorMethods(AsyncIterator.prototype);
+
+  // Note that simple async functions are implemented on top of
+  // AsyncIterator objects; they just return a Promise for the value of
+  // the final result produced by the iterator.
+  runtime.async = function(innerFn, outerFn, self, tryLocsList) {
+    var iter = new AsyncIterator(
+      wrap(innerFn, outerFn, self, tryLocsList)
+    );
+
+    return runtime.isGeneratorFunction(outerFn)
+      ? iter // If outerFn is a generator, return the full iterator.
+      : iter.next().then(function(result) {
+          return result.done ? result.value : iter.next();
+        });
+  };
+
+  function makeInvokeMethod(innerFn, self, context) {
+    var state = GenStateSuspendedStart;
+
+    return function invoke(method, arg) {
+      if (state === GenStateExecuting) {
+        throw new Error("Generator is already running");
+      }
+
+      if (state === GenStateCompleted) {
+        if (method === "throw") {
+          throw arg;
+        }
+
+        // Be forgiving, per 25.3.3.3.3 of the spec:
+        // https://people.mozilla.org/~jorendorff/es6-draft.html#sec-generatorresume
+        return doneResult();
+      }
+
+      while (true) {
+        var delegate = context.delegate;
+        if (delegate) {
+          if (method === "return" ||
+              (method === "throw" && delegate.iterator[method] === undefined)) {
+            // A return or throw (when the delegate iterator has no throw
+            // method) always terminates the yield* loop.
+            context.delegate = null;
+
+            // If the delegate iterator has a return method, give it a
+            // chance to clean up.
+            var returnMethod = delegate.iterator["return"];
+            if (returnMethod) {
+              var record = tryCatch(returnMethod, delegate.iterator, arg);
+              if (record.type === "throw") {
+                // If the return method threw an exception, let that
+                // exception prevail over the original return or throw.
+                method = "throw";
+                arg = record.arg;
+                continue;
+              }
+            }
+
+            if (method === "return") {
+              // Continue with the outer return, now that the delegate
+              // iterator has been terminated.
+              continue;
+            }
+          }
+
+          var record = tryCatch(
+            delegate.iterator[method],
+            delegate.iterator,
+            arg
+          );
+
+          if (record.type === "throw") {
+            context.delegate = null;
+
+            // Like returning generator.throw(uncaught), but without the
+            // overhead of an extra function call.
+            method = "throw";
+            arg = record.arg;
+            continue;
+          }
+
+          // Delegate generator ran and handled its own exceptions so
+          // regardless of what the method was, we continue as if it is
+          // "next" with an undefined arg.
+          method = "next";
+          arg = undefined;
+
+          var info = record.arg;
+          if (info.done) {
+            context[delegate.resultName] = info.value;
+            context.next = delegate.nextLoc;
+          } else {
+            state = GenStateSuspendedYield;
+            return info;
+          }
+
+          context.delegate = null;
+        }
+
+        if (method === "next") {
+          // Setting context._sent for legacy support of Babel's
+          // function.sent implementation.
+          context.sent = context._sent = arg;
+
+        } else if (method === "throw") {
+          if (state === GenStateSuspendedStart) {
+            state = GenStateCompleted;
+            throw arg;
+          }
+
+          if (context.dispatchException(arg)) {
+            // If the dispatched exception was caught by a catch block,
+            // then let that catch block handle the exception normally.
+            method = "next";
+            arg = undefined;
+          }
+
+        } else if (method === "return") {
+          context.abrupt("return", arg);
+        }
+
+        state = GenStateExecuting;
+
+        var record = tryCatch(innerFn, self, context);
+        if (record.type === "normal") {
+          // If an exception is thrown from innerFn, we leave state ===
+          // GenStateExecuting and loop back for another invocation.
+          state = context.done
+            ? GenStateCompleted
+            : GenStateSuspendedYield;
+
+          var info = {
+            value: record.arg,
+            done: context.done
+          };
+
+          if (record.arg === ContinueSentinel) {
+            if (context.delegate && method === "next") {
+              // Deliberately forget the last sent value so that we don't
+              // accidentally pass it on to the delegate.
+              arg = undefined;
+            }
+          } else {
+            return info;
+          }
+
+        } else if (record.type === "throw") {
+          state = GenStateCompleted;
+          // Dispatch the exception by looping back around to the
+          // context.dispatchException(arg) call above.
+          method = "throw";
+          arg = record.arg;
+        }
+      }
+    };
+  }
+
+  // Define Generator.prototype.{next,throw,return} in terms of the
+  // unified ._invoke helper method.
+  defineIteratorMethods(Gp);
+
+  Gp[iteratorSymbol] = function() {
+    return this;
+  };
+
+  Gp[toStringTagSymbol] = "Generator";
+
+  Gp.toString = function() {
+    return "[object Generator]";
+  };
+
+  function pushTryEntry(locs) {
+    var entry = { tryLoc: locs[0] };
+
+    if (1 in locs) {
+      entry.catchLoc = locs[1];
+    }
+
+    if (2 in locs) {
+      entry.finallyLoc = locs[2];
+      entry.afterLoc = locs[3];
+    }
+
+    this.tryEntries.push(entry);
+  }
+
+  function resetTryEntry(entry) {
+    var record = entry.completion || {};
+    record.type = "normal";
+    delete record.arg;
+    entry.completion = record;
+  }
+
+  function Context(tryLocsList) {
+    // The root entry object (effectively a try statement without a catch
+    // or a finally block) gives us a place to store values thrown from
+    // locations where there is no enclosing try statement.
+    this.tryEntries = [{ tryLoc: "root" }];
+    tryLocsList.forEach(pushTryEntry, this);
+    this.reset(true);
+  }
+
+  runtime.keys = function(object) {
+    var keys = [];
+    for (var key in object) {
+      keys.push(key);
+    }
+    keys.reverse();
+
+    // Rather than returning an object with a next method, we keep
+    // things simple and return the next function itself.
+    return function next() {
+      while (keys.length) {
+        var key = keys.pop();
+        if (key in object) {
+          next.value = key;
+          next.done = false;
+          return next;
+        }
+      }
+
+      // To avoid creating an additional object, we just hang the .value
+      // and .done properties off the next function object itself. This
+      // also ensures that the minifier will not anonymize the function.
+      next.done = true;
+      return next;
+    };
+  };
+
+  function values(iterable) {
+    if (iterable) {
+      var iteratorMethod = iterable[iteratorSymbol];
+      if (iteratorMethod) {
+        return iteratorMethod.call(iterable);
+      }
+
+      if (typeof iterable.next === "function") {
+        return iterable;
+      }
+
+      if (!isNaN(iterable.length)) {
+        var i = -1, next = function next() {
+          while (++i < iterable.length) {
+            if (hasOwn.call(iterable, i)) {
+              next.value = iterable[i];
+              next.done = false;
+              return next;
+            }
+          }
+
+          next.value = undefined;
+          next.done = true;
+
+          return next;
+        };
+
+        return next.next = next;
+      }
+    }
+
+    // Return an iterator with no values.
+    return { next: doneResult };
+  }
+  runtime.values = values;
+
+  function doneResult() {
+    return { value: undefined, done: true };
+  }
+
+  Context.prototype = {
+    constructor: Context,
+
+    reset: function(skipTempReset) {
+      this.prev = 0;
+      this.next = 0;
+      // Resetting context._sent for legacy support of Babel's
+      // function.sent implementation.
+      this.sent = this._sent = undefined;
+      this.done = false;
+      this.delegate = null;
+
+      this.tryEntries.forEach(resetTryEntry);
+
+      if (!skipTempReset) {
+        for (var name in this) {
+          // Not sure about the optimal order of these conditions:
+          if (name.charAt(0) === "t" &&
+              hasOwn.call(this, name) &&
+              !isNaN(+name.slice(1))) {
+            this[name] = undefined;
+          }
+        }
+      }
+    },
+
+    stop: function() {
+      this.done = true;
+
+      var rootEntry = this.tryEntries[0];
+      var rootRecord = rootEntry.completion;
+      if (rootRecord.type === "throw") {
+        throw rootRecord.arg;
+      }
+
+      return this.rval;
+    },
+
+    dispatchException: function(exception) {
+      if (this.done) {
+        throw exception;
+      }
+
+      var context = this;
+      function handle(loc, caught) {
+        record.type = "throw";
+        record.arg = exception;
+        context.next = loc;
+        return !!caught;
+      }
+
+      for (var i = this.tryEntries.length - 1; i >= 0; --i) {
+        var entry = this.tryEntries[i];
+        var record = entry.completion;
+
+        if (entry.tryLoc === "root") {
+          // Exception thrown outside of any try block that could handle
+          // it, so set the completion value of the entire function to
+          // throw the exception.
+          return handle("end");
+        }
+
+        if (entry.tryLoc <= this.prev) {
+          var hasCatch = hasOwn.call(entry, "catchLoc");
+          var hasFinally = hasOwn.call(entry, "finallyLoc");
+
+          if (hasCatch && hasFinally) {
+            if (this.prev < entry.catchLoc) {
+              return handle(entry.catchLoc, true);
+            } else if (this.prev < entry.finallyLoc) {
+              return handle(entry.finallyLoc);
+            }
+
+          } else if (hasCatch) {
+            if (this.prev < entry.catchLoc) {
+              return handle(entry.catchLoc, true);
+            }
+
+          } else if (hasFinally) {
+            if (this.prev < entry.finallyLoc) {
+              return handle(entry.finallyLoc);
+            }
+
+          } else {
+            throw new Error("try statement without catch or finally");
+          }
+        }
+      }
+    },
+
+    abrupt: function(type, arg) {
+      for (var i = this.tryEntries.length - 1; i >= 0; --i) {
+        var entry = this.tryEntries[i];
+        if (entry.tryLoc <= this.prev &&
+            hasOwn.call(entry, "finallyLoc") &&
+            this.prev < entry.finallyLoc) {
+          var finallyEntry = entry;
+          break;
+        }
+      }
+
+      if (finallyEntry &&
+          (type === "break" ||
+           type === "continue") &&
+          finallyEntry.tryLoc <= arg &&
+          arg <= finallyEntry.finallyLoc) {
+        // Ignore the finally entry if control is not jumping to a
+        // location outside the try/catch block.
+        finallyEntry = null;
+      }
+
+      var record = finallyEntry ? finallyEntry.completion : {};
+      record.type = type;
+      record.arg = arg;
+
+      if (finallyEntry) {
+        this.next = finallyEntry.finallyLoc;
+      } else {
+        this.complete(record);
+      }
+
+      return ContinueSentinel;
+    },
+
+    complete: function(record, afterLoc) {
+      if (record.type === "throw") {
+        throw record.arg;
+      }
+
+      if (record.type === "break" ||
+          record.type === "continue") {
+        this.next = record.arg;
+      } else if (record.type === "return") {
+        this.rval = record.arg;
+        this.next = "end";
+      } else if (record.type === "normal" && afterLoc) {
+        this.next = afterLoc;
+      }
+    },
+
+    finish: function(finallyLoc) {
+      for (var i = this.tryEntries.length - 1; i >= 0; --i) {
+        var entry = this.tryEntries[i];
+        if (entry.finallyLoc === finallyLoc) {
+          this.complete(entry.completion, entry.afterLoc);
+          resetTryEntry(entry);
+          return ContinueSentinel;
+        }
+      }
+    },
+
+    "catch": function(tryLoc) {
+      for (var i = this.tryEntries.length - 1; i >= 0; --i) {
+        var entry = this.tryEntries[i];
+        if (entry.tryLoc === tryLoc) {
+          var record = entry.completion;
+          if (record.type === "throw") {
+            var thrown = record.arg;
+            resetTryEntry(entry);
+          }
+          return thrown;
+        }
+      }
+
+      // The context.catch method must only be called with a location
+      // argument that corresponds to a known catch block.
+      throw new Error("illegal catch attempt");
+    },
+
+    delegateYield: function(iterable, resultName, nextLoc) {
+      this.delegate = {
+        iterator: values(iterable),
+        resultName: resultName,
+        nextLoc: nextLoc
+      };
+
+      return ContinueSentinel;
+    }
+  };
+})(
+  // Among the various tricks for obtaining a reference to the global
+  // object, this seems to be the most reliable technique that does not
+  // use indirect eval (which violates Content Security Policy).
+  typeof global === "object" ? global :
+  typeof window === "object" ? window :
+  typeof self === "object" ? self : this
+);
+
 ;/*!
  * jQuery JavaScript Library v3.3.1
  * https://jquery.com/
@@ -64374,6 +65044,2606 @@ requireModule("ember");
   generateModule('rsvp', { 'default': Ember.RSVP });
 })();
 
+;if (typeof FastBoot === 'undefined') {
+/**!
+ * @fileOverview Kickass library to create and place poppers near their reference elements.
+ * @version 1.14.3
+ * @license
+ * Copyright (c) 2016 Federico Zivolo and contributors
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+(function (global, factory) {
+	typeof exports === 'object' && typeof module !== 'undefined' ? module.exports = factory() :
+	typeof define === 'function' && define.amd ? define(factory) :
+	(global.Popper = factory());
+}(this, (function () { 'use strict';
+
+var isBrowser = typeof window !== 'undefined' && typeof document !== 'undefined';
+
+var longerTimeoutBrowsers = ['Edge', 'Trident', 'Firefox'];
+var timeoutDuration = 0;
+for (var i = 0; i < longerTimeoutBrowsers.length; i += 1) {
+  if (isBrowser && navigator.userAgent.indexOf(longerTimeoutBrowsers[i]) >= 0) {
+    timeoutDuration = 1;
+    break;
+  }
+}
+
+function microtaskDebounce(fn) {
+  var called = false;
+  return function () {
+    if (called) {
+      return;
+    }
+    called = true;
+    window.Promise.resolve().then(function () {
+      called = false;
+      fn();
+    });
+  };
+}
+
+function taskDebounce(fn) {
+  var scheduled = false;
+  return function () {
+    if (!scheduled) {
+      scheduled = true;
+      setTimeout(function () {
+        scheduled = false;
+        fn();
+      }, timeoutDuration);
+    }
+  };
+}
+
+var supportsMicroTasks = isBrowser && window.Promise;
+
+/**
+* Create a debounced version of a method, that's asynchronously deferred
+* but called in the minimum time possible.
+*
+* @method
+* @memberof Popper.Utils
+* @argument {Function} fn
+* @returns {Function}
+*/
+var debounce = supportsMicroTasks ? microtaskDebounce : taskDebounce;
+
+/**
+ * Check if the given variable is a function
+ * @method
+ * @memberof Popper.Utils
+ * @argument {Any} functionToCheck - variable to check
+ * @returns {Boolean} answer to: is a function?
+ */
+function isFunction(functionToCheck) {
+  var getType = {};
+  return functionToCheck && getType.toString.call(functionToCheck) === '[object Function]';
+}
+
+/**
+ * Get CSS computed property of the given element
+ * @method
+ * @memberof Popper.Utils
+ * @argument {Eement} element
+ * @argument {String} property
+ */
+function getStyleComputedProperty(element, property) {
+  if (element.nodeType !== 1) {
+    return [];
+  }
+  // NOTE: 1 DOM access here
+  var css = getComputedStyle(element, null);
+  return property ? css[property] : css;
+}
+
+/**
+ * Returns the parentNode or the host of the element
+ * @method
+ * @memberof Popper.Utils
+ * @argument {Element} element
+ * @returns {Element} parent
+ */
+function getParentNode(element) {
+  if (element.nodeName === 'HTML') {
+    return element;
+  }
+  return element.parentNode || element.host;
+}
+
+/**
+ * Returns the scrolling parent of the given element
+ * @method
+ * @memberof Popper.Utils
+ * @argument {Element} element
+ * @returns {Element} scroll parent
+ */
+function getScrollParent(element) {
+  // Return body, `getScroll` will take care to get the correct `scrollTop` from it
+  if (!element) {
+    return document.body;
+  }
+
+  switch (element.nodeName) {
+    case 'HTML':
+    case 'BODY':
+      return element.ownerDocument.body;
+    case '#document':
+      return element.body;
+  }
+
+  // Firefox want us to check `-x` and `-y` variations as well
+
+  var _getStyleComputedProp = getStyleComputedProperty(element),
+      overflow = _getStyleComputedProp.overflow,
+      overflowX = _getStyleComputedProp.overflowX,
+      overflowY = _getStyleComputedProp.overflowY;
+
+  if (/(auto|scroll|overlay)/.test(overflow + overflowY + overflowX)) {
+    return element;
+  }
+
+  return getScrollParent(getParentNode(element));
+}
+
+var isIE11 = isBrowser && !!(window.MSInputMethodContext && document.documentMode);
+var isIE10 = isBrowser && /MSIE 10/.test(navigator.userAgent);
+
+/**
+ * Determines if the browser is Internet Explorer
+ * @method
+ * @memberof Popper.Utils
+ * @param {Number} version to check
+ * @returns {Boolean} isIE
+ */
+function isIE(version) {
+  if (version === 11) {
+    return isIE11;
+  }
+  if (version === 10) {
+    return isIE10;
+  }
+  return isIE11 || isIE10;
+}
+
+/**
+ * Returns the offset parent of the given element
+ * @method
+ * @memberof Popper.Utils
+ * @argument {Element} element
+ * @returns {Element} offset parent
+ */
+function getOffsetParent(element) {
+  if (!element) {
+    return document.documentElement;
+  }
+
+  var noOffsetParent = isIE(10) ? document.body : null;
+
+  // NOTE: 1 DOM access here
+  var offsetParent = element.offsetParent;
+  // Skip hidden elements which don't have an offsetParent
+  while (offsetParent === noOffsetParent && element.nextElementSibling) {
+    offsetParent = (element = element.nextElementSibling).offsetParent;
+  }
+
+  var nodeName = offsetParent && offsetParent.nodeName;
+
+  if (!nodeName || nodeName === 'BODY' || nodeName === 'HTML') {
+    return element ? element.ownerDocument.documentElement : document.documentElement;
+  }
+
+  // .offsetParent will return the closest TD or TABLE in case
+  // no offsetParent is present, I hate this job...
+  if (['TD', 'TABLE'].indexOf(offsetParent.nodeName) !== -1 && getStyleComputedProperty(offsetParent, 'position') === 'static') {
+    return getOffsetParent(offsetParent);
+  }
+
+  return offsetParent;
+}
+
+function isOffsetContainer(element) {
+  var nodeName = element.nodeName;
+
+  if (nodeName === 'BODY') {
+    return false;
+  }
+  return nodeName === 'HTML' || getOffsetParent(element.firstElementChild) === element;
+}
+
+/**
+ * Finds the root node (document, shadowDOM root) of the given element
+ * @method
+ * @memberof Popper.Utils
+ * @argument {Element} node
+ * @returns {Element} root node
+ */
+function getRoot(node) {
+  if (node.parentNode !== null) {
+    return getRoot(node.parentNode);
+  }
+
+  return node;
+}
+
+/**
+ * Finds the offset parent common to the two provided nodes
+ * @method
+ * @memberof Popper.Utils
+ * @argument {Element} element1
+ * @argument {Element} element2
+ * @returns {Element} common offset parent
+ */
+function findCommonOffsetParent(element1, element2) {
+  // This check is needed to avoid errors in case one of the elements isn't defined for any reason
+  if (!element1 || !element1.nodeType || !element2 || !element2.nodeType) {
+    return document.documentElement;
+  }
+
+  // Here we make sure to give as "start" the element that comes first in the DOM
+  var order = element1.compareDocumentPosition(element2) & Node.DOCUMENT_POSITION_FOLLOWING;
+  var start = order ? element1 : element2;
+  var end = order ? element2 : element1;
+
+  // Get common ancestor container
+  var range = document.createRange();
+  range.setStart(start, 0);
+  range.setEnd(end, 0);
+  var commonAncestorContainer = range.commonAncestorContainer;
+
+  // Both nodes are inside #document
+
+  if (element1 !== commonAncestorContainer && element2 !== commonAncestorContainer || start.contains(end)) {
+    if (isOffsetContainer(commonAncestorContainer)) {
+      return commonAncestorContainer;
+    }
+
+    return getOffsetParent(commonAncestorContainer);
+  }
+
+  // one of the nodes is inside shadowDOM, find which one
+  var element1root = getRoot(element1);
+  if (element1root.host) {
+    return findCommonOffsetParent(element1root.host, element2);
+  } else {
+    return findCommonOffsetParent(element1, getRoot(element2).host);
+  }
+}
+
+/**
+ * Gets the scroll value of the given element in the given side (top and left)
+ * @method
+ * @memberof Popper.Utils
+ * @argument {Element} element
+ * @argument {String} side `top` or `left`
+ * @returns {number} amount of scrolled pixels
+ */
+function getScroll(element) {
+  var side = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 'top';
+
+  var upperSide = side === 'top' ? 'scrollTop' : 'scrollLeft';
+  var nodeName = element.nodeName;
+
+  if (nodeName === 'BODY' || nodeName === 'HTML') {
+    var html = element.ownerDocument.documentElement;
+    var scrollingElement = element.ownerDocument.scrollingElement || html;
+    return scrollingElement[upperSide];
+  }
+
+  return element[upperSide];
+}
+
+/*
+ * Sum or subtract the element scroll values (left and top) from a given rect object
+ * @method
+ * @memberof Popper.Utils
+ * @param {Object} rect - Rect object you want to change
+ * @param {HTMLElement} element - The element from the function reads the scroll values
+ * @param {Boolean} subtract - set to true if you want to subtract the scroll values
+ * @return {Object} rect - The modifier rect object
+ */
+function includeScroll(rect, element) {
+  var subtract = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : false;
+
+  var scrollTop = getScroll(element, 'top');
+  var scrollLeft = getScroll(element, 'left');
+  var modifier = subtract ? -1 : 1;
+  rect.top += scrollTop * modifier;
+  rect.bottom += scrollTop * modifier;
+  rect.left += scrollLeft * modifier;
+  rect.right += scrollLeft * modifier;
+  return rect;
+}
+
+/*
+ * Helper to detect borders of a given element
+ * @method
+ * @memberof Popper.Utils
+ * @param {CSSStyleDeclaration} styles
+ * Result of `getStyleComputedProperty` on the given element
+ * @param {String} axis - `x` or `y`
+ * @return {number} borders - The borders size of the given axis
+ */
+
+function getBordersSize(styles, axis) {
+  var sideA = axis === 'x' ? 'Left' : 'Top';
+  var sideB = sideA === 'Left' ? 'Right' : 'Bottom';
+
+  return parseFloat(styles['border' + sideA + 'Width'], 10) + parseFloat(styles['border' + sideB + 'Width'], 10);
+}
+
+function getSize(axis, body, html, computedStyle) {
+  return Math.max(body['offset' + axis], body['scroll' + axis], html['client' + axis], html['offset' + axis], html['scroll' + axis], isIE(10) ? html['offset' + axis] + computedStyle['margin' + (axis === 'Height' ? 'Top' : 'Left')] + computedStyle['margin' + (axis === 'Height' ? 'Bottom' : 'Right')] : 0);
+}
+
+function getWindowSizes() {
+  var body = document.body;
+  var html = document.documentElement;
+  var computedStyle = isIE(10) && getComputedStyle(html);
+
+  return {
+    height: getSize('Height', body, html, computedStyle),
+    width: getSize('Width', body, html, computedStyle)
+  };
+}
+
+var classCallCheck = function (instance, Constructor) {
+  if (!(instance instanceof Constructor)) {
+    throw new TypeError("Cannot call a class as a function");
+  }
+};
+
+var createClass = function () {
+  function defineProperties(target, props) {
+    for (var i = 0; i < props.length; i++) {
+      var descriptor = props[i];
+      descriptor.enumerable = descriptor.enumerable || false;
+      descriptor.configurable = true;
+      if ("value" in descriptor) descriptor.writable = true;
+      Object.defineProperty(target, descriptor.key, descriptor);
+    }
+  }
+
+  return function (Constructor, protoProps, staticProps) {
+    if (protoProps) defineProperties(Constructor.prototype, protoProps);
+    if (staticProps) defineProperties(Constructor, staticProps);
+    return Constructor;
+  };
+}();
+
+
+
+
+
+var defineProperty = function (obj, key, value) {
+  if (key in obj) {
+    Object.defineProperty(obj, key, {
+      value: value,
+      enumerable: true,
+      configurable: true,
+      writable: true
+    });
+  } else {
+    obj[key] = value;
+  }
+
+  return obj;
+};
+
+var _extends = Object.assign || function (target) {
+  for (var i = 1; i < arguments.length; i++) {
+    var source = arguments[i];
+
+    for (var key in source) {
+      if (Object.prototype.hasOwnProperty.call(source, key)) {
+        target[key] = source[key];
+      }
+    }
+  }
+
+  return target;
+};
+
+/**
+ * Given element offsets, generate an output similar to getBoundingClientRect
+ * @method
+ * @memberof Popper.Utils
+ * @argument {Object} offsets
+ * @returns {Object} ClientRect like output
+ */
+function getClientRect(offsets) {
+  return _extends({}, offsets, {
+    right: offsets.left + offsets.width,
+    bottom: offsets.top + offsets.height
+  });
+}
+
+/**
+ * Get bounding client rect of given element
+ * @method
+ * @memberof Popper.Utils
+ * @param {HTMLElement} element
+ * @return {Object} client rect
+ */
+function getBoundingClientRect(element) {
+  var rect = {};
+
+  // IE10 10 FIX: Please, don't ask, the element isn't
+  // considered in DOM in some circumstances...
+  // This isn't reproducible in IE10 compatibility mode of IE11
+  try {
+    if (isIE(10)) {
+      rect = element.getBoundingClientRect();
+      var scrollTop = getScroll(element, 'top');
+      var scrollLeft = getScroll(element, 'left');
+      rect.top += scrollTop;
+      rect.left += scrollLeft;
+      rect.bottom += scrollTop;
+      rect.right += scrollLeft;
+    } else {
+      rect = element.getBoundingClientRect();
+    }
+  } catch (e) {}
+
+  var result = {
+    left: rect.left,
+    top: rect.top,
+    width: rect.right - rect.left,
+    height: rect.bottom - rect.top
+  };
+
+  // subtract scrollbar size from sizes
+  var sizes = element.nodeName === 'HTML' ? getWindowSizes() : {};
+  var width = sizes.width || element.clientWidth || result.right - result.left;
+  var height = sizes.height || element.clientHeight || result.bottom - result.top;
+
+  var horizScrollbar = element.offsetWidth - width;
+  var vertScrollbar = element.offsetHeight - height;
+
+  // if an hypothetical scrollbar is detected, we must be sure it's not a `border`
+  // we make this check conditional for performance reasons
+  if (horizScrollbar || vertScrollbar) {
+    var styles = getStyleComputedProperty(element);
+    horizScrollbar -= getBordersSize(styles, 'x');
+    vertScrollbar -= getBordersSize(styles, 'y');
+
+    result.width -= horizScrollbar;
+    result.height -= vertScrollbar;
+  }
+
+  return getClientRect(result);
+}
+
+function getOffsetRectRelativeToArbitraryNode(children, parent) {
+  var fixedPosition = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : false;
+
+  var isIE10 = isIE(10);
+  var isHTML = parent.nodeName === 'HTML';
+  var childrenRect = getBoundingClientRect(children);
+  var parentRect = getBoundingClientRect(parent);
+  var scrollParent = getScrollParent(children);
+
+  var styles = getStyleComputedProperty(parent);
+  var borderTopWidth = parseFloat(styles.borderTopWidth, 10);
+  var borderLeftWidth = parseFloat(styles.borderLeftWidth, 10);
+
+  // In cases where the parent is fixed, we must ignore negative scroll in offset calc
+  if (fixedPosition && parent.nodeName === 'HTML') {
+    parentRect.top = Math.max(parentRect.top, 0);
+    parentRect.left = Math.max(parentRect.left, 0);
+  }
+  var offsets = getClientRect({
+    top: childrenRect.top - parentRect.top - borderTopWidth,
+    left: childrenRect.left - parentRect.left - borderLeftWidth,
+    width: childrenRect.width,
+    height: childrenRect.height
+  });
+  offsets.marginTop = 0;
+  offsets.marginLeft = 0;
+
+  // Subtract margins of documentElement in case it's being used as parent
+  // we do this only on HTML because it's the only element that behaves
+  // differently when margins are applied to it. The margins are included in
+  // the box of the documentElement, in the other cases not.
+  if (!isIE10 && isHTML) {
+    var marginTop = parseFloat(styles.marginTop, 10);
+    var marginLeft = parseFloat(styles.marginLeft, 10);
+
+    offsets.top -= borderTopWidth - marginTop;
+    offsets.bottom -= borderTopWidth - marginTop;
+    offsets.left -= borderLeftWidth - marginLeft;
+    offsets.right -= borderLeftWidth - marginLeft;
+
+    // Attach marginTop and marginLeft because in some circumstances we may need them
+    offsets.marginTop = marginTop;
+    offsets.marginLeft = marginLeft;
+  }
+
+  if (isIE10 && !fixedPosition ? parent.contains(scrollParent) : parent === scrollParent && scrollParent.nodeName !== 'BODY') {
+    offsets = includeScroll(offsets, parent);
+  }
+
+  return offsets;
+}
+
+function getViewportOffsetRectRelativeToArtbitraryNode(element) {
+  var excludeScroll = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : false;
+
+  var html = element.ownerDocument.documentElement;
+  var relativeOffset = getOffsetRectRelativeToArbitraryNode(element, html);
+  var width = Math.max(html.clientWidth, window.innerWidth || 0);
+  var height = Math.max(html.clientHeight, window.innerHeight || 0);
+
+  var scrollTop = !excludeScroll ? getScroll(html) : 0;
+  var scrollLeft = !excludeScroll ? getScroll(html, 'left') : 0;
+
+  var offset = {
+    top: scrollTop - relativeOffset.top + relativeOffset.marginTop,
+    left: scrollLeft - relativeOffset.left + relativeOffset.marginLeft,
+    width: width,
+    height: height
+  };
+
+  return getClientRect(offset);
+}
+
+/**
+ * Check if the given element is fixed or is inside a fixed parent
+ * @method
+ * @memberof Popper.Utils
+ * @argument {Element} element
+ * @argument {Element} customContainer
+ * @returns {Boolean} answer to "isFixed?"
+ */
+function isFixed(element) {
+  var nodeName = element.nodeName;
+  if (nodeName === 'BODY' || nodeName === 'HTML') {
+    return false;
+  }
+  if (getStyleComputedProperty(element, 'position') === 'fixed') {
+    return true;
+  }
+  return isFixed(getParentNode(element));
+}
+
+/**
+ * Finds the first parent of an element that has a transformed property defined
+ * @method
+ * @memberof Popper.Utils
+ * @argument {Element} element
+ * @returns {Element} first transformed parent or documentElement
+ */
+
+function getFixedPositionOffsetParent(element) {
+  // This check is needed to avoid errors in case one of the elements isn't defined for any reason
+  if (!element || !element.parentElement || isIE()) {
+    return document.documentElement;
+  }
+  var el = element.parentElement;
+  while (el && getStyleComputedProperty(el, 'transform') === 'none') {
+    el = el.parentElement;
+  }
+  return el || document.documentElement;
+}
+
+/**
+ * Computed the boundaries limits and return them
+ * @method
+ * @memberof Popper.Utils
+ * @param {HTMLElement} popper
+ * @param {HTMLElement} reference
+ * @param {number} padding
+ * @param {HTMLElement} boundariesElement - Element used to define the boundaries
+ * @param {Boolean} fixedPosition - Is in fixed position mode
+ * @returns {Object} Coordinates of the boundaries
+ */
+function getBoundaries(popper, reference, padding, boundariesElement) {
+  var fixedPosition = arguments.length > 4 && arguments[4] !== undefined ? arguments[4] : false;
+
+  // NOTE: 1 DOM access here
+
+  var boundaries = { top: 0, left: 0 };
+  var offsetParent = fixedPosition ? getFixedPositionOffsetParent(popper) : findCommonOffsetParent(popper, reference);
+
+  // Handle viewport case
+  if (boundariesElement === 'viewport') {
+    boundaries = getViewportOffsetRectRelativeToArtbitraryNode(offsetParent, fixedPosition);
+  } else {
+    // Handle other cases based on DOM element used as boundaries
+    var boundariesNode = void 0;
+    if (boundariesElement === 'scrollParent') {
+      boundariesNode = getScrollParent(getParentNode(reference));
+      if (boundariesNode.nodeName === 'BODY') {
+        boundariesNode = popper.ownerDocument.documentElement;
+      }
+    } else if (boundariesElement === 'window') {
+      boundariesNode = popper.ownerDocument.documentElement;
+    } else {
+      boundariesNode = boundariesElement;
+    }
+
+    var offsets = getOffsetRectRelativeToArbitraryNode(boundariesNode, offsetParent, fixedPosition);
+
+    // In case of HTML, we need a different computation
+    if (boundariesNode.nodeName === 'HTML' && !isFixed(offsetParent)) {
+      var _getWindowSizes = getWindowSizes(),
+          height = _getWindowSizes.height,
+          width = _getWindowSizes.width;
+
+      boundaries.top += offsets.top - offsets.marginTop;
+      boundaries.bottom = height + offsets.top;
+      boundaries.left += offsets.left - offsets.marginLeft;
+      boundaries.right = width + offsets.left;
+    } else {
+      // for all the other DOM elements, this one is good
+      boundaries = offsets;
+    }
+  }
+
+  // Add paddings
+  boundaries.left += padding;
+  boundaries.top += padding;
+  boundaries.right -= padding;
+  boundaries.bottom -= padding;
+
+  return boundaries;
+}
+
+function getArea(_ref) {
+  var width = _ref.width,
+      height = _ref.height;
+
+  return width * height;
+}
+
+/**
+ * Utility used to transform the `auto` placement to the placement with more
+ * available space.
+ * @method
+ * @memberof Popper.Utils
+ * @argument {Object} data - The data object generated by update method
+ * @argument {Object} options - Modifiers configuration and options
+ * @returns {Object} The data object, properly modified
+ */
+function computeAutoPlacement(placement, refRect, popper, reference, boundariesElement) {
+  var padding = arguments.length > 5 && arguments[5] !== undefined ? arguments[5] : 0;
+
+  if (placement.indexOf('auto') === -1) {
+    return placement;
+  }
+
+  var boundaries = getBoundaries(popper, reference, padding, boundariesElement);
+
+  var rects = {
+    top: {
+      width: boundaries.width,
+      height: refRect.top - boundaries.top
+    },
+    right: {
+      width: boundaries.right - refRect.right,
+      height: boundaries.height
+    },
+    bottom: {
+      width: boundaries.width,
+      height: boundaries.bottom - refRect.bottom
+    },
+    left: {
+      width: refRect.left - boundaries.left,
+      height: boundaries.height
+    }
+  };
+
+  var sortedAreas = Object.keys(rects).map(function (key) {
+    return _extends({
+      key: key
+    }, rects[key], {
+      area: getArea(rects[key])
+    });
+  }).sort(function (a, b) {
+    return b.area - a.area;
+  });
+
+  var filteredAreas = sortedAreas.filter(function (_ref2) {
+    var width = _ref2.width,
+        height = _ref2.height;
+    return width >= popper.clientWidth && height >= popper.clientHeight;
+  });
+
+  var computedPlacement = filteredAreas.length > 0 ? filteredAreas[0].key : sortedAreas[0].key;
+
+  var variation = placement.split('-')[1];
+
+  return computedPlacement + (variation ? '-' + variation : '');
+}
+
+/**
+ * Get offsets to the reference element
+ * @method
+ * @memberof Popper.Utils
+ * @param {Object} state
+ * @param {Element} popper - the popper element
+ * @param {Element} reference - the reference element (the popper will be relative to this)
+ * @param {Element} fixedPosition - is in fixed position mode
+ * @returns {Object} An object containing the offsets which will be applied to the popper
+ */
+function getReferenceOffsets(state, popper, reference) {
+  var fixedPosition = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : null;
+
+  var commonOffsetParent = fixedPosition ? getFixedPositionOffsetParent(popper) : findCommonOffsetParent(popper, reference);
+  return getOffsetRectRelativeToArbitraryNode(reference, commonOffsetParent, fixedPosition);
+}
+
+/**
+ * Get the outer sizes of the given element (offset size + margins)
+ * @method
+ * @memberof Popper.Utils
+ * @argument {Element} element
+ * @returns {Object} object containing width and height properties
+ */
+function getOuterSizes(element) {
+  var styles = getComputedStyle(element);
+  var x = parseFloat(styles.marginTop) + parseFloat(styles.marginBottom);
+  var y = parseFloat(styles.marginLeft) + parseFloat(styles.marginRight);
+  var result = {
+    width: element.offsetWidth + y,
+    height: element.offsetHeight + x
+  };
+  return result;
+}
+
+/**
+ * Get the opposite placement of the given one
+ * @method
+ * @memberof Popper.Utils
+ * @argument {String} placement
+ * @returns {String} flipped placement
+ */
+function getOppositePlacement(placement) {
+  var hash = { left: 'right', right: 'left', bottom: 'top', top: 'bottom' };
+  return placement.replace(/left|right|bottom|top/g, function (matched) {
+    return hash[matched];
+  });
+}
+
+/**
+ * Get offsets to the popper
+ * @method
+ * @memberof Popper.Utils
+ * @param {Object} position - CSS position the Popper will get applied
+ * @param {HTMLElement} popper - the popper element
+ * @param {Object} referenceOffsets - the reference offsets (the popper will be relative to this)
+ * @param {String} placement - one of the valid placement options
+ * @returns {Object} popperOffsets - An object containing the offsets which will be applied to the popper
+ */
+function getPopperOffsets(popper, referenceOffsets, placement) {
+  placement = placement.split('-')[0];
+
+  // Get popper node sizes
+  var popperRect = getOuterSizes(popper);
+
+  // Add position, width and height to our offsets object
+  var popperOffsets = {
+    width: popperRect.width,
+    height: popperRect.height
+  };
+
+  // depending by the popper placement we have to compute its offsets slightly differently
+  var isHoriz = ['right', 'left'].indexOf(placement) !== -1;
+  var mainSide = isHoriz ? 'top' : 'left';
+  var secondarySide = isHoriz ? 'left' : 'top';
+  var measurement = isHoriz ? 'height' : 'width';
+  var secondaryMeasurement = !isHoriz ? 'height' : 'width';
+
+  popperOffsets[mainSide] = referenceOffsets[mainSide] + referenceOffsets[measurement] / 2 - popperRect[measurement] / 2;
+  if (placement === secondarySide) {
+    popperOffsets[secondarySide] = referenceOffsets[secondarySide] - popperRect[secondaryMeasurement];
+  } else {
+    popperOffsets[secondarySide] = referenceOffsets[getOppositePlacement(secondarySide)];
+  }
+
+  return popperOffsets;
+}
+
+/**
+ * Mimics the `find` method of Array
+ * @method
+ * @memberof Popper.Utils
+ * @argument {Array} arr
+ * @argument prop
+ * @argument value
+ * @returns index or -1
+ */
+function find(arr, check) {
+  // use native find if supported
+  if (Array.prototype.find) {
+    return arr.find(check);
+  }
+
+  // use `filter` to obtain the same behavior of `find`
+  return arr.filter(check)[0];
+}
+
+/**
+ * Return the index of the matching object
+ * @method
+ * @memberof Popper.Utils
+ * @argument {Array} arr
+ * @argument prop
+ * @argument value
+ * @returns index or -1
+ */
+function findIndex(arr, prop, value) {
+  // use native findIndex if supported
+  if (Array.prototype.findIndex) {
+    return arr.findIndex(function (cur) {
+      return cur[prop] === value;
+    });
+  }
+
+  // use `find` + `indexOf` if `findIndex` isn't supported
+  var match = find(arr, function (obj) {
+    return obj[prop] === value;
+  });
+  return arr.indexOf(match);
+}
+
+/**
+ * Loop trough the list of modifiers and run them in order,
+ * each of them will then edit the data object.
+ * @method
+ * @memberof Popper.Utils
+ * @param {dataObject} data
+ * @param {Array} modifiers
+ * @param {String} ends - Optional modifier name used as stopper
+ * @returns {dataObject}
+ */
+function runModifiers(modifiers, data, ends) {
+  var modifiersToRun = ends === undefined ? modifiers : modifiers.slice(0, findIndex(modifiers, 'name', ends));
+
+  modifiersToRun.forEach(function (modifier) {
+    if (modifier['function']) {
+      // eslint-disable-line dot-notation
+      console.warn('`modifier.function` is deprecated, use `modifier.fn`!');
+    }
+    var fn = modifier['function'] || modifier.fn; // eslint-disable-line dot-notation
+    if (modifier.enabled && isFunction(fn)) {
+      // Add properties to offsets to make them a complete clientRect object
+      // we do this before each modifier to make sure the previous one doesn't
+      // mess with these values
+      data.offsets.popper = getClientRect(data.offsets.popper);
+      data.offsets.reference = getClientRect(data.offsets.reference);
+
+      data = fn(data, modifier);
+    }
+  });
+
+  return data;
+}
+
+/**
+ * Updates the position of the popper, computing the new offsets and applying
+ * the new style.<br />
+ * Prefer `scheduleUpdate` over `update` because of performance reasons.
+ * @method
+ * @memberof Popper
+ */
+function update() {
+  // if popper is destroyed, don't perform any further update
+  if (this.state.isDestroyed) {
+    return;
+  }
+
+  var data = {
+    instance: this,
+    styles: {},
+    arrowStyles: {},
+    attributes: {},
+    flipped: false,
+    offsets: {}
+  };
+
+  // compute reference element offsets
+  data.offsets.reference = getReferenceOffsets(this.state, this.popper, this.reference, this.options.positionFixed);
+
+  // compute auto placement, store placement inside the data object,
+  // modifiers will be able to edit `placement` if needed
+  // and refer to originalPlacement to know the original value
+  data.placement = computeAutoPlacement(this.options.placement, data.offsets.reference, this.popper, this.reference, this.options.modifiers.flip.boundariesElement, this.options.modifiers.flip.padding);
+
+  // store the computed placement inside `originalPlacement`
+  data.originalPlacement = data.placement;
+
+  data.positionFixed = this.options.positionFixed;
+
+  // compute the popper offsets
+  data.offsets.popper = getPopperOffsets(this.popper, data.offsets.reference, data.placement);
+
+  data.offsets.popper.position = this.options.positionFixed ? 'fixed' : 'absolute';
+
+  // run the modifiers
+  data = runModifiers(this.modifiers, data);
+
+  // the first `update` will call `onCreate` callback
+  // the other ones will call `onUpdate` callback
+  if (!this.state.isCreated) {
+    this.state.isCreated = true;
+    this.options.onCreate(data);
+  } else {
+    this.options.onUpdate(data);
+  }
+}
+
+/**
+ * Helper used to know if the given modifier is enabled.
+ * @method
+ * @memberof Popper.Utils
+ * @returns {Boolean}
+ */
+function isModifierEnabled(modifiers, modifierName) {
+  return modifiers.some(function (_ref) {
+    var name = _ref.name,
+        enabled = _ref.enabled;
+    return enabled && name === modifierName;
+  });
+}
+
+/**
+ * Get the prefixed supported property name
+ * @method
+ * @memberof Popper.Utils
+ * @argument {String} property (camelCase)
+ * @returns {String} prefixed property (camelCase or PascalCase, depending on the vendor prefix)
+ */
+function getSupportedPropertyName(property) {
+  var prefixes = [false, 'ms', 'Webkit', 'Moz', 'O'];
+  var upperProp = property.charAt(0).toUpperCase() + property.slice(1);
+
+  for (var i = 0; i < prefixes.length; i++) {
+    var prefix = prefixes[i];
+    var toCheck = prefix ? '' + prefix + upperProp : property;
+    if (typeof document.body.style[toCheck] !== 'undefined') {
+      return toCheck;
+    }
+  }
+  return null;
+}
+
+/**
+ * Destroy the popper
+ * @method
+ * @memberof Popper
+ */
+function destroy() {
+  this.state.isDestroyed = true;
+
+  // touch DOM only if `applyStyle` modifier is enabled
+  if (isModifierEnabled(this.modifiers, 'applyStyle')) {
+    this.popper.removeAttribute('x-placement');
+    this.popper.style.position = '';
+    this.popper.style.top = '';
+    this.popper.style.left = '';
+    this.popper.style.right = '';
+    this.popper.style.bottom = '';
+    this.popper.style.willChange = '';
+    this.popper.style[getSupportedPropertyName('transform')] = '';
+  }
+
+  this.disableEventListeners();
+
+  // remove the popper if user explicity asked for the deletion on destroy
+  // do not use `remove` because IE11 doesn't support it
+  if (this.options.removeOnDestroy) {
+    this.popper.parentNode.removeChild(this.popper);
+  }
+  return this;
+}
+
+/**
+ * Get the window associated with the element
+ * @argument {Element} element
+ * @returns {Window}
+ */
+function getWindow(element) {
+  var ownerDocument = element.ownerDocument;
+  return ownerDocument ? ownerDocument.defaultView : window;
+}
+
+function attachToScrollParents(scrollParent, event, callback, scrollParents) {
+  var isBody = scrollParent.nodeName === 'BODY';
+  var target = isBody ? scrollParent.ownerDocument.defaultView : scrollParent;
+  target.addEventListener(event, callback, { passive: true });
+
+  if (!isBody) {
+    attachToScrollParents(getScrollParent(target.parentNode), event, callback, scrollParents);
+  }
+  scrollParents.push(target);
+}
+
+/**
+ * Setup needed event listeners used to update the popper position
+ * @method
+ * @memberof Popper.Utils
+ * @private
+ */
+function setupEventListeners(reference, options, state, updateBound) {
+  // Resize event listener on window
+  state.updateBound = updateBound;
+  getWindow(reference).addEventListener('resize', state.updateBound, { passive: true });
+
+  // Scroll event listener on scroll parents
+  var scrollElement = getScrollParent(reference);
+  attachToScrollParents(scrollElement, 'scroll', state.updateBound, state.scrollParents);
+  state.scrollElement = scrollElement;
+  state.eventsEnabled = true;
+
+  return state;
+}
+
+/**
+ * It will add resize/scroll events and start recalculating
+ * position of the popper element when they are triggered.
+ * @method
+ * @memberof Popper
+ */
+function enableEventListeners() {
+  if (!this.state.eventsEnabled) {
+    this.state = setupEventListeners(this.reference, this.options, this.state, this.scheduleUpdate);
+  }
+}
+
+/**
+ * Remove event listeners used to update the popper position
+ * @method
+ * @memberof Popper.Utils
+ * @private
+ */
+function removeEventListeners(reference, state) {
+  // Remove resize event listener on window
+  getWindow(reference).removeEventListener('resize', state.updateBound);
+
+  // Remove scroll event listener on scroll parents
+  state.scrollParents.forEach(function (target) {
+    target.removeEventListener('scroll', state.updateBound);
+  });
+
+  // Reset state
+  state.updateBound = null;
+  state.scrollParents = [];
+  state.scrollElement = null;
+  state.eventsEnabled = false;
+  return state;
+}
+
+/**
+ * It will remove resize/scroll events and won't recalculate popper position
+ * when they are triggered. It also won't trigger onUpdate callback anymore,
+ * unless you call `update` method manually.
+ * @method
+ * @memberof Popper
+ */
+function disableEventListeners() {
+  if (this.state.eventsEnabled) {
+    cancelAnimationFrame(this.scheduleUpdate);
+    this.state = removeEventListeners(this.reference, this.state);
+  }
+}
+
+/**
+ * Tells if a given input is a number
+ * @method
+ * @memberof Popper.Utils
+ * @param {*} input to check
+ * @return {Boolean}
+ */
+function isNumeric(n) {
+  return n !== '' && !isNaN(parseFloat(n)) && isFinite(n);
+}
+
+/**
+ * Set the style to the given popper
+ * @method
+ * @memberof Popper.Utils
+ * @argument {Element} element - Element to apply the style to
+ * @argument {Object} styles
+ * Object with a list of properties and values which will be applied to the element
+ */
+function setStyles(element, styles) {
+  Object.keys(styles).forEach(function (prop) {
+    var unit = '';
+    // add unit if the value is numeric and is one of the following
+    if (['width', 'height', 'top', 'right', 'bottom', 'left'].indexOf(prop) !== -1 && isNumeric(styles[prop])) {
+      unit = 'px';
+    }
+    element.style[prop] = styles[prop] + unit;
+  });
+}
+
+/**
+ * Set the attributes to the given popper
+ * @method
+ * @memberof Popper.Utils
+ * @argument {Element} element - Element to apply the attributes to
+ * @argument {Object} styles
+ * Object with a list of properties and values which will be applied to the element
+ */
+function setAttributes(element, attributes) {
+  Object.keys(attributes).forEach(function (prop) {
+    var value = attributes[prop];
+    if (value !== false) {
+      element.setAttribute(prop, attributes[prop]);
+    } else {
+      element.removeAttribute(prop);
+    }
+  });
+}
+
+/**
+ * @function
+ * @memberof Modifiers
+ * @argument {Object} data - The data object generated by `update` method
+ * @argument {Object} data.styles - List of style properties - values to apply to popper element
+ * @argument {Object} data.attributes - List of attribute properties - values to apply to popper element
+ * @argument {Object} options - Modifiers configuration and options
+ * @returns {Object} The same data object
+ */
+function applyStyle(data) {
+  // any property present in `data.styles` will be applied to the popper,
+  // in this way we can make the 3rd party modifiers add custom styles to it
+  // Be aware, modifiers could override the properties defined in the previous
+  // lines of this modifier!
+  setStyles(data.instance.popper, data.styles);
+
+  // any property present in `data.attributes` will be applied to the popper,
+  // they will be set as HTML attributes of the element
+  setAttributes(data.instance.popper, data.attributes);
+
+  // if arrowElement is defined and arrowStyles has some properties
+  if (data.arrowElement && Object.keys(data.arrowStyles).length) {
+    setStyles(data.arrowElement, data.arrowStyles);
+  }
+
+  return data;
+}
+
+/**
+ * Set the x-placement attribute before everything else because it could be used
+ * to add margins to the popper margins needs to be calculated to get the
+ * correct popper offsets.
+ * @method
+ * @memberof Popper.modifiers
+ * @param {HTMLElement} reference - The reference element used to position the popper
+ * @param {HTMLElement} popper - The HTML element used as popper
+ * @param {Object} options - Popper.js options
+ */
+function applyStyleOnLoad(reference, popper, options, modifierOptions, state) {
+  // compute reference element offsets
+  var referenceOffsets = getReferenceOffsets(state, popper, reference, options.positionFixed);
+
+  // compute auto placement, store placement inside the data object,
+  // modifiers will be able to edit `placement` if needed
+  // and refer to originalPlacement to know the original value
+  var placement = computeAutoPlacement(options.placement, referenceOffsets, popper, reference, options.modifiers.flip.boundariesElement, options.modifiers.flip.padding);
+
+  popper.setAttribute('x-placement', placement);
+
+  // Apply `position` to popper before anything else because
+  // without the position applied we can't guarantee correct computations
+  setStyles(popper, { position: options.positionFixed ? 'fixed' : 'absolute' });
+
+  return options;
+}
+
+/**
+ * @function
+ * @memberof Modifiers
+ * @argument {Object} data - The data object generated by `update` method
+ * @argument {Object} options - Modifiers configuration and options
+ * @returns {Object} The data object, properly modified
+ */
+function computeStyle(data, options) {
+  var x = options.x,
+      y = options.y;
+  var popper = data.offsets.popper;
+
+  // Remove this legacy support in Popper.js v2
+
+  var legacyGpuAccelerationOption = find(data.instance.modifiers, function (modifier) {
+    return modifier.name === 'applyStyle';
+  }).gpuAcceleration;
+  if (legacyGpuAccelerationOption !== undefined) {
+    console.warn('WARNING: `gpuAcceleration` option moved to `computeStyle` modifier and will not be supported in future versions of Popper.js!');
+  }
+  var gpuAcceleration = legacyGpuAccelerationOption !== undefined ? legacyGpuAccelerationOption : options.gpuAcceleration;
+
+  var offsetParent = getOffsetParent(data.instance.popper);
+  var offsetParentRect = getBoundingClientRect(offsetParent);
+
+  // Styles
+  var styles = {
+    position: popper.position
+  };
+
+  // Avoid blurry text by using full pixel integers.
+  // For pixel-perfect positioning, top/bottom prefers rounded
+  // values, while left/right prefers floored values.
+  var offsets = {
+    left: Math.floor(popper.left),
+    top: Math.round(popper.top),
+    bottom: Math.round(popper.bottom),
+    right: Math.floor(popper.right)
+  };
+
+  var sideA = x === 'bottom' ? 'top' : 'bottom';
+  var sideB = y === 'right' ? 'left' : 'right';
+
+  // if gpuAcceleration is set to `true` and transform is supported,
+  //  we use `translate3d` to apply the position to the popper we
+  // automatically use the supported prefixed version if needed
+  var prefixedProperty = getSupportedPropertyName('transform');
+
+  // now, let's make a step back and look at this code closely (wtf?)
+  // If the content of the popper grows once it's been positioned, it
+  // may happen that the popper gets misplaced because of the new content
+  // overflowing its reference element
+  // To avoid this problem, we provide two options (x and y), which allow
+  // the consumer to define the offset origin.
+  // If we position a popper on top of a reference element, we can set
+  // `x` to `top` to make the popper grow towards its top instead of
+  // its bottom.
+  var left = void 0,
+      top = void 0;
+  if (sideA === 'bottom') {
+    top = -offsetParentRect.height + offsets.bottom;
+  } else {
+    top = offsets.top;
+  }
+  if (sideB === 'right') {
+    left = -offsetParentRect.width + offsets.right;
+  } else {
+    left = offsets.left;
+  }
+  if (gpuAcceleration && prefixedProperty) {
+    styles[prefixedProperty] = 'translate3d(' + left + 'px, ' + top + 'px, 0)';
+    styles[sideA] = 0;
+    styles[sideB] = 0;
+    styles.willChange = 'transform';
+  } else {
+    // othwerise, we use the standard `top`, `left`, `bottom` and `right` properties
+    var invertTop = sideA === 'bottom' ? -1 : 1;
+    var invertLeft = sideB === 'right' ? -1 : 1;
+    styles[sideA] = top * invertTop;
+    styles[sideB] = left * invertLeft;
+    styles.willChange = sideA + ', ' + sideB;
+  }
+
+  // Attributes
+  var attributes = {
+    'x-placement': data.placement
+  };
+
+  // Update `data` attributes, styles and arrowStyles
+  data.attributes = _extends({}, attributes, data.attributes);
+  data.styles = _extends({}, styles, data.styles);
+  data.arrowStyles = _extends({}, data.offsets.arrow, data.arrowStyles);
+
+  return data;
+}
+
+/**
+ * Helper used to know if the given modifier depends from another one.<br />
+ * It checks if the needed modifier is listed and enabled.
+ * @method
+ * @memberof Popper.Utils
+ * @param {Array} modifiers - list of modifiers
+ * @param {String} requestingName - name of requesting modifier
+ * @param {String} requestedName - name of requested modifier
+ * @returns {Boolean}
+ */
+function isModifierRequired(modifiers, requestingName, requestedName) {
+  var requesting = find(modifiers, function (_ref) {
+    var name = _ref.name;
+    return name === requestingName;
+  });
+
+  var isRequired = !!requesting && modifiers.some(function (modifier) {
+    return modifier.name === requestedName && modifier.enabled && modifier.order < requesting.order;
+  });
+
+  if (!isRequired) {
+    var _requesting = '`' + requestingName + '`';
+    var requested = '`' + requestedName + '`';
+    console.warn(requested + ' modifier is required by ' + _requesting + ' modifier in order to work, be sure to include it before ' + _requesting + '!');
+  }
+  return isRequired;
+}
+
+/**
+ * @function
+ * @memberof Modifiers
+ * @argument {Object} data - The data object generated by update method
+ * @argument {Object} options - Modifiers configuration and options
+ * @returns {Object} The data object, properly modified
+ */
+function arrow(data, options) {
+  var _data$offsets$arrow;
+
+  // arrow depends on keepTogether in order to work
+  if (!isModifierRequired(data.instance.modifiers, 'arrow', 'keepTogether')) {
+    return data;
+  }
+
+  var arrowElement = options.element;
+
+  // if arrowElement is a string, suppose it's a CSS selector
+  if (typeof arrowElement === 'string') {
+    arrowElement = data.instance.popper.querySelector(arrowElement);
+
+    // if arrowElement is not found, don't run the modifier
+    if (!arrowElement) {
+      return data;
+    }
+  } else {
+    // if the arrowElement isn't a query selector we must check that the
+    // provided DOM node is child of its popper node
+    if (!data.instance.popper.contains(arrowElement)) {
+      console.warn('WARNING: `arrow.element` must be child of its popper element!');
+      return data;
+    }
+  }
+
+  var placement = data.placement.split('-')[0];
+  var _data$offsets = data.offsets,
+      popper = _data$offsets.popper,
+      reference = _data$offsets.reference;
+
+  var isVertical = ['left', 'right'].indexOf(placement) !== -1;
+
+  var len = isVertical ? 'height' : 'width';
+  var sideCapitalized = isVertical ? 'Top' : 'Left';
+  var side = sideCapitalized.toLowerCase();
+  var altSide = isVertical ? 'left' : 'top';
+  var opSide = isVertical ? 'bottom' : 'right';
+  var arrowElementSize = getOuterSizes(arrowElement)[len];
+
+  //
+  // extends keepTogether behavior making sure the popper and its
+  // reference have enough pixels in conjuction
+  //
+
+  // top/left side
+  if (reference[opSide] - arrowElementSize < popper[side]) {
+    data.offsets.popper[side] -= popper[side] - (reference[opSide] - arrowElementSize);
+  }
+  // bottom/right side
+  if (reference[side] + arrowElementSize > popper[opSide]) {
+    data.offsets.popper[side] += reference[side] + arrowElementSize - popper[opSide];
+  }
+  data.offsets.popper = getClientRect(data.offsets.popper);
+
+  // compute center of the popper
+  var center = reference[side] + reference[len] / 2 - arrowElementSize / 2;
+
+  // Compute the sideValue using the updated popper offsets
+  // take popper margin in account because we don't have this info available
+  var css = getStyleComputedProperty(data.instance.popper);
+  var popperMarginSide = parseFloat(css['margin' + sideCapitalized], 10);
+  var popperBorderSide = parseFloat(css['border' + sideCapitalized + 'Width'], 10);
+  var sideValue = center - data.offsets.popper[side] - popperMarginSide - popperBorderSide;
+
+  // prevent arrowElement from being placed not contiguously to its popper
+  sideValue = Math.max(Math.min(popper[len] - arrowElementSize, sideValue), 0);
+
+  data.arrowElement = arrowElement;
+  data.offsets.arrow = (_data$offsets$arrow = {}, defineProperty(_data$offsets$arrow, side, Math.round(sideValue)), defineProperty(_data$offsets$arrow, altSide, ''), _data$offsets$arrow);
+
+  return data;
+}
+
+/**
+ * Get the opposite placement variation of the given one
+ * @method
+ * @memberof Popper.Utils
+ * @argument {String} placement variation
+ * @returns {String} flipped placement variation
+ */
+function getOppositeVariation(variation) {
+  if (variation === 'end') {
+    return 'start';
+  } else if (variation === 'start') {
+    return 'end';
+  }
+  return variation;
+}
+
+/**
+ * List of accepted placements to use as values of the `placement` option.<br />
+ * Valid placements are:
+ * - `auto`
+ * - `top`
+ * - `right`
+ * - `bottom`
+ * - `left`
+ *
+ * Each placement can have a variation from this list:
+ * - `-start`
+ * - `-end`
+ *
+ * Variations are interpreted easily if you think of them as the left to right
+ * written languages. Horizontally (`top` and `bottom`), `start` is left and `end`
+ * is right.<br />
+ * Vertically (`left` and `right`), `start` is top and `end` is bottom.
+ *
+ * Some valid examples are:
+ * - `top-end` (on top of reference, right aligned)
+ * - `right-start` (on right of reference, top aligned)
+ * - `bottom` (on bottom, centered)
+ * - `auto-right` (on the side with more space available, alignment depends by placement)
+ *
+ * @static
+ * @type {Array}
+ * @enum {String}
+ * @readonly
+ * @method placements
+ * @memberof Popper
+ */
+var placements = ['auto-start', 'auto', 'auto-end', 'top-start', 'top', 'top-end', 'right-start', 'right', 'right-end', 'bottom-end', 'bottom', 'bottom-start', 'left-end', 'left', 'left-start'];
+
+// Get rid of `auto` `auto-start` and `auto-end`
+var validPlacements = placements.slice(3);
+
+/**
+ * Given an initial placement, returns all the subsequent placements
+ * clockwise (or counter-clockwise).
+ *
+ * @method
+ * @memberof Popper.Utils
+ * @argument {String} placement - A valid placement (it accepts variations)
+ * @argument {Boolean} counter - Set to true to walk the placements counterclockwise
+ * @returns {Array} placements including their variations
+ */
+function clockwise(placement) {
+  var counter = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : false;
+
+  var index = validPlacements.indexOf(placement);
+  var arr = validPlacements.slice(index + 1).concat(validPlacements.slice(0, index));
+  return counter ? arr.reverse() : arr;
+}
+
+var BEHAVIORS = {
+  FLIP: 'flip',
+  CLOCKWISE: 'clockwise',
+  COUNTERCLOCKWISE: 'counterclockwise'
+};
+
+/**
+ * @function
+ * @memberof Modifiers
+ * @argument {Object} data - The data object generated by update method
+ * @argument {Object} options - Modifiers configuration and options
+ * @returns {Object} The data object, properly modified
+ */
+function flip(data, options) {
+  // if `inner` modifier is enabled, we can't use the `flip` modifier
+  if (isModifierEnabled(data.instance.modifiers, 'inner')) {
+    return data;
+  }
+
+  if (data.flipped && data.placement === data.originalPlacement) {
+    // seems like flip is trying to loop, probably there's not enough space on any of the flippable sides
+    return data;
+  }
+
+  var boundaries = getBoundaries(data.instance.popper, data.instance.reference, options.padding, options.boundariesElement, data.positionFixed);
+
+  var placement = data.placement.split('-')[0];
+  var placementOpposite = getOppositePlacement(placement);
+  var variation = data.placement.split('-')[1] || '';
+
+  var flipOrder = [];
+
+  switch (options.behavior) {
+    case BEHAVIORS.FLIP:
+      flipOrder = [placement, placementOpposite];
+      break;
+    case BEHAVIORS.CLOCKWISE:
+      flipOrder = clockwise(placement);
+      break;
+    case BEHAVIORS.COUNTERCLOCKWISE:
+      flipOrder = clockwise(placement, true);
+      break;
+    default:
+      flipOrder = options.behavior;
+  }
+
+  flipOrder.forEach(function (step, index) {
+    if (placement !== step || flipOrder.length === index + 1) {
+      return data;
+    }
+
+    placement = data.placement.split('-')[0];
+    placementOpposite = getOppositePlacement(placement);
+
+    var popperOffsets = data.offsets.popper;
+    var refOffsets = data.offsets.reference;
+
+    // using floor because the reference offsets may contain decimals we are not going to consider here
+    var floor = Math.floor;
+    var overlapsRef = placement === 'left' && floor(popperOffsets.right) > floor(refOffsets.left) || placement === 'right' && floor(popperOffsets.left) < floor(refOffsets.right) || placement === 'top' && floor(popperOffsets.bottom) > floor(refOffsets.top) || placement === 'bottom' && floor(popperOffsets.top) < floor(refOffsets.bottom);
+
+    var overflowsLeft = floor(popperOffsets.left) < floor(boundaries.left);
+    var overflowsRight = floor(popperOffsets.right) > floor(boundaries.right);
+    var overflowsTop = floor(popperOffsets.top) < floor(boundaries.top);
+    var overflowsBottom = floor(popperOffsets.bottom) > floor(boundaries.bottom);
+
+    var overflowsBoundaries = placement === 'left' && overflowsLeft || placement === 'right' && overflowsRight || placement === 'top' && overflowsTop || placement === 'bottom' && overflowsBottom;
+
+    // flip the variation if required
+    var isVertical = ['top', 'bottom'].indexOf(placement) !== -1;
+    var flippedVariation = !!options.flipVariations && (isVertical && variation === 'start' && overflowsLeft || isVertical && variation === 'end' && overflowsRight || !isVertical && variation === 'start' && overflowsTop || !isVertical && variation === 'end' && overflowsBottom);
+
+    if (overlapsRef || overflowsBoundaries || flippedVariation) {
+      // this boolean to detect any flip loop
+      data.flipped = true;
+
+      if (overlapsRef || overflowsBoundaries) {
+        placement = flipOrder[index + 1];
+      }
+
+      if (flippedVariation) {
+        variation = getOppositeVariation(variation);
+      }
+
+      data.placement = placement + (variation ? '-' + variation : '');
+
+      // this object contains `position`, we want to preserve it along with
+      // any additional property we may add in the future
+      data.offsets.popper = _extends({}, data.offsets.popper, getPopperOffsets(data.instance.popper, data.offsets.reference, data.placement));
+
+      data = runModifiers(data.instance.modifiers, data, 'flip');
+    }
+  });
+  return data;
+}
+
+/**
+ * @function
+ * @memberof Modifiers
+ * @argument {Object} data - The data object generated by update method
+ * @argument {Object} options - Modifiers configuration and options
+ * @returns {Object} The data object, properly modified
+ */
+function keepTogether(data) {
+  var _data$offsets = data.offsets,
+      popper = _data$offsets.popper,
+      reference = _data$offsets.reference;
+
+  var placement = data.placement.split('-')[0];
+  var floor = Math.floor;
+  var isVertical = ['top', 'bottom'].indexOf(placement) !== -1;
+  var side = isVertical ? 'right' : 'bottom';
+  var opSide = isVertical ? 'left' : 'top';
+  var measurement = isVertical ? 'width' : 'height';
+
+  if (popper[side] < floor(reference[opSide])) {
+    data.offsets.popper[opSide] = floor(reference[opSide]) - popper[measurement];
+  }
+  if (popper[opSide] > floor(reference[side])) {
+    data.offsets.popper[opSide] = floor(reference[side]);
+  }
+
+  return data;
+}
+
+/**
+ * Converts a string containing value + unit into a px value number
+ * @function
+ * @memberof {modifiers~offset}
+ * @private
+ * @argument {String} str - Value + unit string
+ * @argument {String} measurement - `height` or `width`
+ * @argument {Object} popperOffsets
+ * @argument {Object} referenceOffsets
+ * @returns {Number|String}
+ * Value in pixels, or original string if no values were extracted
+ */
+function toValue(str, measurement, popperOffsets, referenceOffsets) {
+  // separate value from unit
+  var split = str.match(/((?:\-|\+)?\d*\.?\d*)(.*)/);
+  var value = +split[1];
+  var unit = split[2];
+
+  // If it's not a number it's an operator, I guess
+  if (!value) {
+    return str;
+  }
+
+  if (unit.indexOf('%') === 0) {
+    var element = void 0;
+    switch (unit) {
+      case '%p':
+        element = popperOffsets;
+        break;
+      case '%':
+      case '%r':
+      default:
+        element = referenceOffsets;
+    }
+
+    var rect = getClientRect(element);
+    return rect[measurement] / 100 * value;
+  } else if (unit === 'vh' || unit === 'vw') {
+    // if is a vh or vw, we calculate the size based on the viewport
+    var size = void 0;
+    if (unit === 'vh') {
+      size = Math.max(document.documentElement.clientHeight, window.innerHeight || 0);
+    } else {
+      size = Math.max(document.documentElement.clientWidth, window.innerWidth || 0);
+    }
+    return size / 100 * value;
+  } else {
+    // if is an explicit pixel unit, we get rid of the unit and keep the value
+    // if is an implicit unit, it's px, and we return just the value
+    return value;
+  }
+}
+
+/**
+ * Parse an `offset` string to extrapolate `x` and `y` numeric offsets.
+ * @function
+ * @memberof {modifiers~offset}
+ * @private
+ * @argument {String} offset
+ * @argument {Object} popperOffsets
+ * @argument {Object} referenceOffsets
+ * @argument {String} basePlacement
+ * @returns {Array} a two cells array with x and y offsets in numbers
+ */
+function parseOffset(offset, popperOffsets, referenceOffsets, basePlacement) {
+  var offsets = [0, 0];
+
+  // Use height if placement is left or right and index is 0 otherwise use width
+  // in this way the first offset will use an axis and the second one
+  // will use the other one
+  var useHeight = ['right', 'left'].indexOf(basePlacement) !== -1;
+
+  // Split the offset string to obtain a list of values and operands
+  // The regex addresses values with the plus or minus sign in front (+10, -20, etc)
+  var fragments = offset.split(/(\+|\-)/).map(function (frag) {
+    return frag.trim();
+  });
+
+  // Detect if the offset string contains a pair of values or a single one
+  // they could be separated by comma or space
+  var divider = fragments.indexOf(find(fragments, function (frag) {
+    return frag.search(/,|\s/) !== -1;
+  }));
+
+  if (fragments[divider] && fragments[divider].indexOf(',') === -1) {
+    console.warn('Offsets separated by white space(s) are deprecated, use a comma (,) instead.');
+  }
+
+  // If divider is found, we divide the list of values and operands to divide
+  // them by ofset X and Y.
+  var splitRegex = /\s*,\s*|\s+/;
+  var ops = divider !== -1 ? [fragments.slice(0, divider).concat([fragments[divider].split(splitRegex)[0]]), [fragments[divider].split(splitRegex)[1]].concat(fragments.slice(divider + 1))] : [fragments];
+
+  // Convert the values with units to absolute pixels to allow our computations
+  ops = ops.map(function (op, index) {
+    // Most of the units rely on the orientation of the popper
+    var measurement = (index === 1 ? !useHeight : useHeight) ? 'height' : 'width';
+    var mergeWithPrevious = false;
+    return op
+    // This aggregates any `+` or `-` sign that aren't considered operators
+    // e.g.: 10 + +5 => [10, +, +5]
+    .reduce(function (a, b) {
+      if (a[a.length - 1] === '' && ['+', '-'].indexOf(b) !== -1) {
+        a[a.length - 1] = b;
+        mergeWithPrevious = true;
+        return a;
+      } else if (mergeWithPrevious) {
+        a[a.length - 1] += b;
+        mergeWithPrevious = false;
+        return a;
+      } else {
+        return a.concat(b);
+      }
+    }, [])
+    // Here we convert the string values into number values (in px)
+    .map(function (str) {
+      return toValue(str, measurement, popperOffsets, referenceOffsets);
+    });
+  });
+
+  // Loop trough the offsets arrays and execute the operations
+  ops.forEach(function (op, index) {
+    op.forEach(function (frag, index2) {
+      if (isNumeric(frag)) {
+        offsets[index] += frag * (op[index2 - 1] === '-' ? -1 : 1);
+      }
+    });
+  });
+  return offsets;
+}
+
+/**
+ * @function
+ * @memberof Modifiers
+ * @argument {Object} data - The data object generated by update method
+ * @argument {Object} options - Modifiers configuration and options
+ * @argument {Number|String} options.offset=0
+ * The offset value as described in the modifier description
+ * @returns {Object} The data object, properly modified
+ */
+function offset(data, _ref) {
+  var offset = _ref.offset;
+  var placement = data.placement,
+      _data$offsets = data.offsets,
+      popper = _data$offsets.popper,
+      reference = _data$offsets.reference;
+
+  var basePlacement = placement.split('-')[0];
+
+  var offsets = void 0;
+  if (isNumeric(+offset)) {
+    offsets = [+offset, 0];
+  } else {
+    offsets = parseOffset(offset, popper, reference, basePlacement);
+  }
+
+  if (basePlacement === 'left') {
+    popper.top += offsets[0];
+    popper.left -= offsets[1];
+  } else if (basePlacement === 'right') {
+    popper.top += offsets[0];
+    popper.left += offsets[1];
+  } else if (basePlacement === 'top') {
+    popper.left += offsets[0];
+    popper.top -= offsets[1];
+  } else if (basePlacement === 'bottom') {
+    popper.left += offsets[0];
+    popper.top += offsets[1];
+  }
+
+  data.popper = popper;
+  return data;
+}
+
+/**
+ * @function
+ * @memberof Modifiers
+ * @argument {Object} data - The data object generated by `update` method
+ * @argument {Object} options - Modifiers configuration and options
+ * @returns {Object} The data object, properly modified
+ */
+function preventOverflow(data, options) {
+  var boundariesElement = options.boundariesElement || getOffsetParent(data.instance.popper);
+
+  // If offsetParent is the reference element, we really want to
+  // go one step up and use the next offsetParent as reference to
+  // avoid to make this modifier completely useless and look like broken
+  if (data.instance.reference === boundariesElement) {
+    boundariesElement = getOffsetParent(boundariesElement);
+  }
+
+  // NOTE: DOM access here
+  // resets the popper's position so that the document size can be calculated excluding
+  // the size of the popper element itself
+  var transformProp = getSupportedPropertyName('transform');
+  var popperStyles = data.instance.popper.style; // assignment to help minification
+  var top = popperStyles.top,
+      left = popperStyles.left,
+      transform = popperStyles[transformProp];
+
+  popperStyles.top = '';
+  popperStyles.left = '';
+  popperStyles[transformProp] = '';
+
+  var boundaries = getBoundaries(data.instance.popper, data.instance.reference, options.padding, boundariesElement, data.positionFixed);
+
+  // NOTE: DOM access here
+  // restores the original style properties after the offsets have been computed
+  popperStyles.top = top;
+  popperStyles.left = left;
+  popperStyles[transformProp] = transform;
+
+  options.boundaries = boundaries;
+
+  var order = options.priority;
+  var popper = data.offsets.popper;
+
+  var check = {
+    primary: function primary(placement) {
+      var value = popper[placement];
+      if (popper[placement] < boundaries[placement] && !options.escapeWithReference) {
+        value = Math.max(popper[placement], boundaries[placement]);
+      }
+      return defineProperty({}, placement, value);
+    },
+    secondary: function secondary(placement) {
+      var mainSide = placement === 'right' ? 'left' : 'top';
+      var value = popper[mainSide];
+      if (popper[placement] > boundaries[placement] && !options.escapeWithReference) {
+        value = Math.min(popper[mainSide], boundaries[placement] - (placement === 'right' ? popper.width : popper.height));
+      }
+      return defineProperty({}, mainSide, value);
+    }
+  };
+
+  order.forEach(function (placement) {
+    var side = ['left', 'top'].indexOf(placement) !== -1 ? 'primary' : 'secondary';
+    popper = _extends({}, popper, check[side](placement));
+  });
+
+  data.offsets.popper = popper;
+
+  return data;
+}
+
+/**
+ * @function
+ * @memberof Modifiers
+ * @argument {Object} data - The data object generated by `update` method
+ * @argument {Object} options - Modifiers configuration and options
+ * @returns {Object} The data object, properly modified
+ */
+function shift(data) {
+  var placement = data.placement;
+  var basePlacement = placement.split('-')[0];
+  var shiftvariation = placement.split('-')[1];
+
+  // if shift shiftvariation is specified, run the modifier
+  if (shiftvariation) {
+    var _data$offsets = data.offsets,
+        reference = _data$offsets.reference,
+        popper = _data$offsets.popper;
+
+    var isVertical = ['bottom', 'top'].indexOf(basePlacement) !== -1;
+    var side = isVertical ? 'left' : 'top';
+    var measurement = isVertical ? 'width' : 'height';
+
+    var shiftOffsets = {
+      start: defineProperty({}, side, reference[side]),
+      end: defineProperty({}, side, reference[side] + reference[measurement] - popper[measurement])
+    };
+
+    data.offsets.popper = _extends({}, popper, shiftOffsets[shiftvariation]);
+  }
+
+  return data;
+}
+
+/**
+ * @function
+ * @memberof Modifiers
+ * @argument {Object} data - The data object generated by update method
+ * @argument {Object} options - Modifiers configuration and options
+ * @returns {Object} The data object, properly modified
+ */
+function hide(data) {
+  if (!isModifierRequired(data.instance.modifiers, 'hide', 'preventOverflow')) {
+    return data;
+  }
+
+  var refRect = data.offsets.reference;
+  var bound = find(data.instance.modifiers, function (modifier) {
+    return modifier.name === 'preventOverflow';
+  }).boundaries;
+
+  if (refRect.bottom < bound.top || refRect.left > bound.right || refRect.top > bound.bottom || refRect.right < bound.left) {
+    // Avoid unnecessary DOM access if visibility hasn't changed
+    if (data.hide === true) {
+      return data;
+    }
+
+    data.hide = true;
+    data.attributes['x-out-of-boundaries'] = '';
+  } else {
+    // Avoid unnecessary DOM access if visibility hasn't changed
+    if (data.hide === false) {
+      return data;
+    }
+
+    data.hide = false;
+    data.attributes['x-out-of-boundaries'] = false;
+  }
+
+  return data;
+}
+
+/**
+ * @function
+ * @memberof Modifiers
+ * @argument {Object} data - The data object generated by `update` method
+ * @argument {Object} options - Modifiers configuration and options
+ * @returns {Object} The data object, properly modified
+ */
+function inner(data) {
+  var placement = data.placement;
+  var basePlacement = placement.split('-')[0];
+  var _data$offsets = data.offsets,
+      popper = _data$offsets.popper,
+      reference = _data$offsets.reference;
+
+  var isHoriz = ['left', 'right'].indexOf(basePlacement) !== -1;
+
+  var subtractLength = ['top', 'left'].indexOf(basePlacement) === -1;
+
+  popper[isHoriz ? 'left' : 'top'] = reference[basePlacement] - (subtractLength ? popper[isHoriz ? 'width' : 'height'] : 0);
+
+  data.placement = getOppositePlacement(placement);
+  data.offsets.popper = getClientRect(popper);
+
+  return data;
+}
+
+/**
+ * Modifier function, each modifier can have a function of this type assigned
+ * to its `fn` property.<br />
+ * These functions will be called on each update, this means that you must
+ * make sure they are performant enough to avoid performance bottlenecks.
+ *
+ * @function ModifierFn
+ * @argument {dataObject} data - The data object generated by `update` method
+ * @argument {Object} options - Modifiers configuration and options
+ * @returns {dataObject} The data object, properly modified
+ */
+
+/**
+ * Modifiers are plugins used to alter the behavior of your poppers.<br />
+ * Popper.js uses a set of 9 modifiers to provide all the basic functionalities
+ * needed by the library.
+ *
+ * Usually you don't want to override the `order`, `fn` and `onLoad` props.
+ * All the other properties are configurations that could be tweaked.
+ * @namespace modifiers
+ */
+var modifiers = {
+  /**
+   * Modifier used to shift the popper on the start or end of its reference
+   * element.<br />
+   * It will read the variation of the `placement` property.<br />
+   * It can be one either `-end` or `-start`.
+   * @memberof modifiers
+   * @inner
+   */
+  shift: {
+    /** @prop {number} order=100 - Index used to define the order of execution */
+    order: 100,
+    /** @prop {Boolean} enabled=true - Whether the modifier is enabled or not */
+    enabled: true,
+    /** @prop {ModifierFn} */
+    fn: shift
+  },
+
+  /**
+   * The `offset` modifier can shift your popper on both its axis.
+   *
+   * It accepts the following units:
+   * - `px` or unitless, interpreted as pixels
+   * - `%` or `%r`, percentage relative to the length of the reference element
+   * - `%p`, percentage relative to the length of the popper element
+   * - `vw`, CSS viewport width unit
+   * - `vh`, CSS viewport height unit
+   *
+   * For length is intended the main axis relative to the placement of the popper.<br />
+   * This means that if the placement is `top` or `bottom`, the length will be the
+   * `width`. In case of `left` or `right`, it will be the height.
+   *
+   * You can provide a single value (as `Number` or `String`), or a pair of values
+   * as `String` divided by a comma or one (or more) white spaces.<br />
+   * The latter is a deprecated method because it leads to confusion and will be
+   * removed in v2.<br />
+   * Additionally, it accepts additions and subtractions between different units.
+   * Note that multiplications and divisions aren't supported.
+   *
+   * Valid examples are:
+   * ```
+   * 10
+   * '10%'
+   * '10, 10'
+   * '10%, 10'
+   * '10 + 10%'
+   * '10 - 5vh + 3%'
+   * '-10px + 5vh, 5px - 6%'
+   * ```
+   * > **NB**: If you desire to apply offsets to your poppers in a way that may make them overlap
+   * > with their reference element, unfortunately, you will have to disable the `flip` modifier.
+   * > More on this [reading this issue](https://github.com/FezVrasta/popper.js/issues/373)
+   *
+   * @memberof modifiers
+   * @inner
+   */
+  offset: {
+    /** @prop {number} order=200 - Index used to define the order of execution */
+    order: 200,
+    /** @prop {Boolean} enabled=true - Whether the modifier is enabled or not */
+    enabled: true,
+    /** @prop {ModifierFn} */
+    fn: offset,
+    /** @prop {Number|String} offset=0
+     * The offset value as described in the modifier description
+     */
+    offset: 0
+  },
+
+  /**
+   * Modifier used to prevent the popper from being positioned outside the boundary.
+   *
+   * An scenario exists where the reference itself is not within the boundaries.<br />
+   * We can say it has "escaped the boundaries" — or just "escaped".<br />
+   * In this case we need to decide whether the popper should either:
+   *
+   * - detach from the reference and remain "trapped" in the boundaries, or
+   * - if it should ignore the boundary and "escape with its reference"
+   *
+   * When `escapeWithReference` is set to`true` and reference is completely
+   * outside its boundaries, the popper will overflow (or completely leave)
+   * the boundaries in order to remain attached to the edge of the reference.
+   *
+   * @memberof modifiers
+   * @inner
+   */
+  preventOverflow: {
+    /** @prop {number} order=300 - Index used to define the order of execution */
+    order: 300,
+    /** @prop {Boolean} enabled=true - Whether the modifier is enabled or not */
+    enabled: true,
+    /** @prop {ModifierFn} */
+    fn: preventOverflow,
+    /**
+     * @prop {Array} [priority=['left','right','top','bottom']]
+     * Popper will try to prevent overflow following these priorities by default,
+     * then, it could overflow on the left and on top of the `boundariesElement`
+     */
+    priority: ['left', 'right', 'top', 'bottom'],
+    /**
+     * @prop {number} padding=5
+     * Amount of pixel used to define a minimum distance between the boundaries
+     * and the popper this makes sure the popper has always a little padding
+     * between the edges of its container
+     */
+    padding: 5,
+    /**
+     * @prop {String|HTMLElement} boundariesElement='scrollParent'
+     * Boundaries used by the modifier, can be `scrollParent`, `window`,
+     * `viewport` or any DOM element.
+     */
+    boundariesElement: 'scrollParent'
+  },
+
+  /**
+   * Modifier used to make sure the reference and its popper stay near eachothers
+   * without leaving any gap between the two. Expecially useful when the arrow is
+   * enabled and you want to assure it to point to its reference element.
+   * It cares only about the first axis, you can still have poppers with margin
+   * between the popper and its reference element.
+   * @memberof modifiers
+   * @inner
+   */
+  keepTogether: {
+    /** @prop {number} order=400 - Index used to define the order of execution */
+    order: 400,
+    /** @prop {Boolean} enabled=true - Whether the modifier is enabled or not */
+    enabled: true,
+    /** @prop {ModifierFn} */
+    fn: keepTogether
+  },
+
+  /**
+   * This modifier is used to move the `arrowElement` of the popper to make
+   * sure it is positioned between the reference element and its popper element.
+   * It will read the outer size of the `arrowElement` node to detect how many
+   * pixels of conjuction are needed.
+   *
+   * It has no effect if no `arrowElement` is provided.
+   * @memberof modifiers
+   * @inner
+   */
+  arrow: {
+    /** @prop {number} order=500 - Index used to define the order of execution */
+    order: 500,
+    /** @prop {Boolean} enabled=true - Whether the modifier is enabled or not */
+    enabled: true,
+    /** @prop {ModifierFn} */
+    fn: arrow,
+    /** @prop {String|HTMLElement} element='[x-arrow]' - Selector or node used as arrow */
+    element: '[x-arrow]'
+  },
+
+  /**
+   * Modifier used to flip the popper's placement when it starts to overlap its
+   * reference element.
+   *
+   * Requires the `preventOverflow` modifier before it in order to work.
+   *
+   * **NOTE:** this modifier will interrupt the current update cycle and will
+   * restart it if it detects the need to flip the placement.
+   * @memberof modifiers
+   * @inner
+   */
+  flip: {
+    /** @prop {number} order=600 - Index used to define the order of execution */
+    order: 600,
+    /** @prop {Boolean} enabled=true - Whether the modifier is enabled or not */
+    enabled: true,
+    /** @prop {ModifierFn} */
+    fn: flip,
+    /**
+     * @prop {String|Array} behavior='flip'
+     * The behavior used to change the popper's placement. It can be one of
+     * `flip`, `clockwise`, `counterclockwise` or an array with a list of valid
+     * placements (with optional variations).
+     */
+    behavior: 'flip',
+    /**
+     * @prop {number} padding=5
+     * The popper will flip if it hits the edges of the `boundariesElement`
+     */
+    padding: 5,
+    /**
+     * @prop {String|HTMLElement} boundariesElement='viewport'
+     * The element which will define the boundaries of the popper position,
+     * the popper will never be placed outside of the defined boundaries
+     * (except if keepTogether is enabled)
+     */
+    boundariesElement: 'viewport'
+  },
+
+  /**
+   * Modifier used to make the popper flow toward the inner of the reference element.
+   * By default, when this modifier is disabled, the popper will be placed outside
+   * the reference element.
+   * @memberof modifiers
+   * @inner
+   */
+  inner: {
+    /** @prop {number} order=700 - Index used to define the order of execution */
+    order: 700,
+    /** @prop {Boolean} enabled=false - Whether the modifier is enabled or not */
+    enabled: false,
+    /** @prop {ModifierFn} */
+    fn: inner
+  },
+
+  /**
+   * Modifier used to hide the popper when its reference element is outside of the
+   * popper boundaries. It will set a `x-out-of-boundaries` attribute which can
+   * be used to hide with a CSS selector the popper when its reference is
+   * out of boundaries.
+   *
+   * Requires the `preventOverflow` modifier before it in order to work.
+   * @memberof modifiers
+   * @inner
+   */
+  hide: {
+    /** @prop {number} order=800 - Index used to define the order of execution */
+    order: 800,
+    /** @prop {Boolean} enabled=true - Whether the modifier is enabled or not */
+    enabled: true,
+    /** @prop {ModifierFn} */
+    fn: hide
+  },
+
+  /**
+   * Computes the style that will be applied to the popper element to gets
+   * properly positioned.
+   *
+   * Note that this modifier will not touch the DOM, it just prepares the styles
+   * so that `applyStyle` modifier can apply it. This separation is useful
+   * in case you need to replace `applyStyle` with a custom implementation.
+   *
+   * This modifier has `850` as `order` value to maintain backward compatibility
+   * with previous versions of Popper.js. Expect the modifiers ordering method
+   * to change in future major versions of the library.
+   *
+   * @memberof modifiers
+   * @inner
+   */
+  computeStyle: {
+    /** @prop {number} order=850 - Index used to define the order of execution */
+    order: 850,
+    /** @prop {Boolean} enabled=true - Whether the modifier is enabled or not */
+    enabled: true,
+    /** @prop {ModifierFn} */
+    fn: computeStyle,
+    /**
+     * @prop {Boolean} gpuAcceleration=true
+     * If true, it uses the CSS 3d transformation to position the popper.
+     * Otherwise, it will use the `top` and `left` properties.
+     */
+    gpuAcceleration: true,
+    /**
+     * @prop {string} [x='bottom']
+     * Where to anchor the X axis (`bottom` or `top`). AKA X offset origin.
+     * Change this if your popper should grow in a direction different from `bottom`
+     */
+    x: 'bottom',
+    /**
+     * @prop {string} [x='left']
+     * Where to anchor the Y axis (`left` or `right`). AKA Y offset origin.
+     * Change this if your popper should grow in a direction different from `right`
+     */
+    y: 'right'
+  },
+
+  /**
+   * Applies the computed styles to the popper element.
+   *
+   * All the DOM manipulations are limited to this modifier. This is useful in case
+   * you want to integrate Popper.js inside a framework or view library and you
+   * want to delegate all the DOM manipulations to it.
+   *
+   * Note that if you disable this modifier, you must make sure the popper element
+   * has its position set to `absolute` before Popper.js can do its work!
+   *
+   * Just disable this modifier and define you own to achieve the desired effect.
+   *
+   * @memberof modifiers
+   * @inner
+   */
+  applyStyle: {
+    /** @prop {number} order=900 - Index used to define the order of execution */
+    order: 900,
+    /** @prop {Boolean} enabled=true - Whether the modifier is enabled or not */
+    enabled: true,
+    /** @prop {ModifierFn} */
+    fn: applyStyle,
+    /** @prop {Function} */
+    onLoad: applyStyleOnLoad,
+    /**
+     * @deprecated since version 1.10.0, the property moved to `computeStyle` modifier
+     * @prop {Boolean} gpuAcceleration=true
+     * If true, it uses the CSS 3d transformation to position the popper.
+     * Otherwise, it will use the `top` and `left` properties.
+     */
+    gpuAcceleration: undefined
+  }
+};
+
+/**
+ * The `dataObject` is an object containing all the informations used by Popper.js
+ * this object get passed to modifiers and to the `onCreate` and `onUpdate` callbacks.
+ * @name dataObject
+ * @property {Object} data.instance The Popper.js instance
+ * @property {String} data.placement Placement applied to popper
+ * @property {String} data.originalPlacement Placement originally defined on init
+ * @property {Boolean} data.flipped True if popper has been flipped by flip modifier
+ * @property {Boolean} data.hide True if the reference element is out of boundaries, useful to know when to hide the popper.
+ * @property {HTMLElement} data.arrowElement Node used as arrow by arrow modifier
+ * @property {Object} data.styles Any CSS property defined here will be applied to the popper, it expects the JavaScript nomenclature (eg. `marginBottom`)
+ * @property {Object} data.arrowStyles Any CSS property defined here will be applied to the popper arrow, it expects the JavaScript nomenclature (eg. `marginBottom`)
+ * @property {Object} data.boundaries Offsets of the popper boundaries
+ * @property {Object} data.offsets The measurements of popper, reference and arrow elements.
+ * @property {Object} data.offsets.popper `top`, `left`, `width`, `height` values
+ * @property {Object} data.offsets.reference `top`, `left`, `width`, `height` values
+ * @property {Object} data.offsets.arrow] `top` and `left` offsets, only one of them will be different from 0
+ */
+
+/**
+ * Default options provided to Popper.js constructor.<br />
+ * These can be overriden using the `options` argument of Popper.js.<br />
+ * To override an option, simply pass as 3rd argument an object with the same
+ * structure of this object, example:
+ * ```
+ * new Popper(ref, pop, {
+ *   modifiers: {
+ *     preventOverflow: { enabled: false }
+ *   }
+ * })
+ * ```
+ * @type {Object}
+ * @static
+ * @memberof Popper
+ */
+var Defaults = {
+  /**
+   * Popper's placement
+   * @prop {Popper.placements} placement='bottom'
+   */
+  placement: 'bottom',
+
+  /**
+   * Set this to true if you want popper to position it self in 'fixed' mode
+   * @prop {Boolean} positionFixed=false
+   */
+  positionFixed: false,
+
+  /**
+   * Whether events (resize, scroll) are initially enabled
+   * @prop {Boolean} eventsEnabled=true
+   */
+  eventsEnabled: true,
+
+  /**
+   * Set to true if you want to automatically remove the popper when
+   * you call the `destroy` method.
+   * @prop {Boolean} removeOnDestroy=false
+   */
+  removeOnDestroy: false,
+
+  /**
+   * Callback called when the popper is created.<br />
+   * By default, is set to no-op.<br />
+   * Access Popper.js instance with `data.instance`.
+   * @prop {onCreate}
+   */
+  onCreate: function onCreate() {},
+
+  /**
+   * Callback called when the popper is updated, this callback is not called
+   * on the initialization/creation of the popper, but only on subsequent
+   * updates.<br />
+   * By default, is set to no-op.<br />
+   * Access Popper.js instance with `data.instance`.
+   * @prop {onUpdate}
+   */
+  onUpdate: function onUpdate() {},
+
+  /**
+   * List of modifiers used to modify the offsets before they are applied to the popper.
+   * They provide most of the functionalities of Popper.js
+   * @prop {modifiers}
+   */
+  modifiers: modifiers
+};
+
+/**
+ * @callback onCreate
+ * @param {dataObject} data
+ */
+
+/**
+ * @callback onUpdate
+ * @param {dataObject} data
+ */
+
+// Utils
+// Methods
+var Popper = function () {
+  /**
+   * Create a new Popper.js instance
+   * @class Popper
+   * @param {HTMLElement|referenceObject} reference - The reference element used to position the popper
+   * @param {HTMLElement} popper - The HTML element used as popper.
+   * @param {Object} options - Your custom options to override the ones defined in [Defaults](#defaults)
+   * @return {Object} instance - The generated Popper.js instance
+   */
+  function Popper(reference, popper) {
+    var _this = this;
+
+    var options = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
+    classCallCheck(this, Popper);
+
+    this.scheduleUpdate = function () {
+      return requestAnimationFrame(_this.update);
+    };
+
+    // make update() debounced, so that it only runs at most once-per-tick
+    this.update = debounce(this.update.bind(this));
+
+    // with {} we create a new object with the options inside it
+    this.options = _extends({}, Popper.Defaults, options);
+
+    // init state
+    this.state = {
+      isDestroyed: false,
+      isCreated: false,
+      scrollParents: []
+    };
+
+    // get reference and popper elements (allow jQuery wrappers)
+    this.reference = reference && reference.jquery ? reference[0] : reference;
+    this.popper = popper && popper.jquery ? popper[0] : popper;
+
+    // Deep merge modifiers options
+    this.options.modifiers = {};
+    Object.keys(_extends({}, Popper.Defaults.modifiers, options.modifiers)).forEach(function (name) {
+      _this.options.modifiers[name] = _extends({}, Popper.Defaults.modifiers[name] || {}, options.modifiers ? options.modifiers[name] : {});
+    });
+
+    // Refactoring modifiers' list (Object => Array)
+    this.modifiers = Object.keys(this.options.modifiers).map(function (name) {
+      return _extends({
+        name: name
+      }, _this.options.modifiers[name]);
+    })
+    // sort the modifiers by order
+    .sort(function (a, b) {
+      return a.order - b.order;
+    });
+
+    // modifiers have the ability to execute arbitrary code when Popper.js get inited
+    // such code is executed in the same order of its modifier
+    // they could add new properties to their options configuration
+    // BE AWARE: don't add options to `options.modifiers.name` but to `modifierOptions`!
+    this.modifiers.forEach(function (modifierOptions) {
+      if (modifierOptions.enabled && isFunction(modifierOptions.onLoad)) {
+        modifierOptions.onLoad(_this.reference, _this.popper, _this.options, modifierOptions, _this.state);
+      }
+    });
+
+    // fire the first update to position the popper in the right place
+    this.update();
+
+    var eventsEnabled = this.options.eventsEnabled;
+    if (eventsEnabled) {
+      // setup event listeners, they will take care of update the position in specific situations
+      this.enableEventListeners();
+    }
+
+    this.state.eventsEnabled = eventsEnabled;
+  }
+
+  // We can't use class properties because they don't get listed in the
+  // class prototype and break stuff like Sinon stubs
+
+
+  createClass(Popper, [{
+    key: 'update',
+    value: function update$$1() {
+      return update.call(this);
+    }
+  }, {
+    key: 'destroy',
+    value: function destroy$$1() {
+      return destroy.call(this);
+    }
+  }, {
+    key: 'enableEventListeners',
+    value: function enableEventListeners$$1() {
+      return enableEventListeners.call(this);
+    }
+  }, {
+    key: 'disableEventListeners',
+    value: function disableEventListeners$$1() {
+      return disableEventListeners.call(this);
+    }
+
+    /**
+     * Schedule an update, it will run on the next UI update available
+     * @method scheduleUpdate
+     * @memberof Popper
+     */
+
+
+    /**
+     * Collection of utilities useful when writing custom modifiers.
+     * Starting from version 1.7, this method is available only if you
+     * include `popper-utils.js` before `popper.js`.
+     *
+     * **DEPRECATION**: This way to access PopperUtils is deprecated
+     * and will be removed in v2! Use the PopperUtils module directly instead.
+     * Due to the high instability of the methods contained in Utils, we can't
+     * guarantee them to follow semver. Use them at your own risk!
+     * @static
+     * @private
+     * @type {Object}
+     * @deprecated since version 1.8
+     * @member Utils
+     * @memberof Popper
+     */
+
+  }]);
+  return Popper;
+}();
+
+/**
+ * The `referenceObject` is an object that provides an interface compatible with Popper.js
+ * and lets you use it as replacement of a real DOM node.<br />
+ * You can use this method to position a popper relatively to a set of coordinates
+ * in case you don't have a DOM node to use as reference.
+ *
+ * ```
+ * new Popper(referenceObject, popperNode);
+ * ```
+ *
+ * NB: This feature isn't supported in Internet Explorer 10
+ * @name referenceObject
+ * @property {Function} data.getBoundingClientRect
+ * A function that returns a set of coordinates compatible with the native `getBoundingClientRect` method.
+ * @property {number} data.clientWidth
+ * An ES6 getter that will return the width of the virtual reference element.
+ * @property {number} data.clientHeight
+ * An ES6 getter that will return the height of the virtual reference element.
+ */
+
+
+Popper.Utils = (typeof window !== 'undefined' ? window : global).PopperUtils;
+Popper.placements = placements;
+Popper.Defaults = Defaults;
+
+return Popper;
+
+})));
+
+
+}
+;/* globals Ember, DS */
+(function() {
+  function _possibleConstructorReturn(self, call) {
+    return call && (typeof call === "object" || typeof call === "function") ? call : self;
+  }
+
+  function _inherits(subClass, superClass) {
+    subClass.prototype = Object.create(superClass && superClass.prototype, {
+      constructor: {
+        value: subClass,
+        enumerable: false,
+        writable: true,
+        configurable: true
+      }
+    });
+
+    if (superClass) {
+      Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass;
+    }
+  }
+
+  var ExtendOverrideMixin = Ember.Mixin.create({
+    extend: function() {
+      if (Object.getPrototypeOf(this) === Function.prototype) {
+        // The class we're extending is a base class, does not have anything
+        // else in the prototype chain, so continue as normal
+        return this._super.apply(this, arguments);
+      }
+
+      // Create a simple wrapper class to defer to the rest of the prototype chain
+      // for native classes and classes that extend from native classes. This is the
+      // output for creating classes from Babel, so it should be crosscompatible.
+      var Class = function (_ref) {
+        _inherits(Class, _ref);
+
+        function Class() {
+          return _possibleConstructorReturn(this, (Class.__proto__ || Object.getPrototypeOf(Class)).apply(this, arguments));
+        }
+
+        return Class;
+      }(this);
+
+      // Assign the name of the parent class for better logging and debugging
+      Object.defineProperty(Class, 'name', { value: this.name || this.toString() })
+
+      for (var i = 0; i < arguments.length; i++) {
+        Object.assign(Class.prototype, arguments[i]);
+      }
+
+      return Class;
+    }
+  });
+
+  // reopen Ember.Object directly to pass in the extends so it and all subclasses get it
+  Ember.Object.reopenClass(ExtendOverrideMixin);
+
+  // class methods like 'extend' are finalized on the class when the class is first
+  // defined (via extend) so we need to manually apply the "mixin". This is not a
+  // problem with classes that extend further down the chain.
+  ExtendOverrideMixin.apply(Ember.Component);
+  ExtendOverrideMixin.apply(Ember.Service);
+  ExtendOverrideMixin.apply(Ember.Controller);
+
+  if (window.DS !== undefined && DS.Model !== undefined) {
+    ExtendOverrideMixin.apply(DS.Model);
+  }
+})();
+
+;Ember.libraries.register('Ember Bootstrap', '1.2.2');
 ;/* globals define */
 define('ember/load-initializers', ['exports', 'ember-load-initializers', 'ember'], function(exports, loadInitializers, Ember) {
   Ember['default'].deprecate(
@@ -64503,7 +67773,2765 @@ createDeprecatedModule('resolver');
   }
 })();
 
-;define('active-model-adapter/active-model-adapter', ['exports', 'ember-data', 'ember-inflector'], function (exports, _emberData, _emberInflector) {
+;define('@ember-decorators/argument/-debug/decorators/immutable', ['exports', '@ember-decorators/argument/-debug/utils/validation-decorator'], function (exports, _emberDecoratorsArgumentDebugUtilsValidationDecorator) {
+  'use strict';
+
+  var immutable = (0, _emberDecoratorsArgumentDebugUtilsValidationDecorator['default'])(function (target, key, desc, options, validations) {
+    validations.isImmutable = true;
+  });
+
+  exports['default'] = immutable;
+});
+define('@ember-decorators/argument/-debug/decorators/required', ['exports', '@ember-decorators/argument/-debug/utils/validation-decorator'], function (exports, _emberDecoratorsArgumentDebugUtilsValidationDecorator) {
+  'use strict';
+
+  var required = (0, _emberDecoratorsArgumentDebugUtilsValidationDecorator['default'])(function (target, key, desc, options, validations) {
+    validations.isRequired = true;
+  });
+
+  exports['default'] = required;
+});
+define('@ember-decorators/argument/-debug/decorators/type', ['exports', '@ember-decorators/argument/-debug/utils/validation-decorator', '@ember-decorators/argument/-debug/utils/validators'], function (exports, _emberDecoratorsArgumentDebugUtilsValidationDecorator, _emberDecoratorsArgumentDebugUtilsValidators) {
+  'use strict';
+
+  exports['default'] = type;
+
+  function type(type) {
+    true && !(arguments.length === 1) && Ember.assert('The @type decorator can only receive one type, but instead received ' + arguments.length + '. Use the \'unionOf\' helper to create a union type.', arguments.length === 1);
+
+    var validator = (0, _emberDecoratorsArgumentDebugUtilsValidators.resolveValidator)(type);
+
+    return (0, _emberDecoratorsArgumentDebugUtilsValidationDecorator['default'])(function (target, key, desc, options, validations) {
+      validations.typeValidators.push(validator);
+    });
+  }
+});
+define("@ember-decorators/argument/-debug/errors", ["exports"], function (exports) {
+  "use strict";
+
+  function _classCallCheck(instance, Constructor) {
+    if (!(instance instanceof Constructor)) {
+      throw new TypeError("Cannot call a class as a function");
+    }
+  }
+
+  function _possibleConstructorReturn(self, call) {
+    if (!self) {
+      throw new ReferenceError("this hasn't been initialised - super() hasn't been called");
+    }return call && (typeof call === "object" || typeof call === "function") ? call : self;
+  }
+
+  function _inherits(subClass, superClass) {
+    if (typeof superClass !== "function" && superClass !== null) {
+      throw new TypeError("Super expression must either be null or a function, not " + typeof superClass);
+    }subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } });if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass;
+  }
+
+  var MutabilityError = (function (_Error) {
+    _inherits(MutabilityError, _Error);
+
+    function MutabilityError() {
+      _classCallCheck(this, MutabilityError);
+
+      return _possibleConstructorReturn(this, _Error.apply(this, arguments));
+    }
+
+    return MutabilityError;
+  })(Error);
+
+  exports.MutabilityError = MutabilityError;
+  var RequiredFieldError = (function (_Error2) {
+    _inherits(RequiredFieldError, _Error2);
+
+    function RequiredFieldError() {
+      _classCallCheck(this, RequiredFieldError);
+
+      return _possibleConstructorReturn(this, _Error2.apply(this, arguments));
+    }
+
+    return RequiredFieldError;
+  })(Error);
+
+  exports.RequiredFieldError = RequiredFieldError;
+  var TypeError = (function (_Error3) {
+    _inherits(TypeError, _Error3);
+
+    function TypeError() {
+      _classCallCheck(this, TypeError);
+
+      return _possibleConstructorReturn(this, _Error3.apply(this, arguments));
+    }
+
+    return TypeError;
+  })(Error);
+  exports.TypeError = TypeError;
+});
+define('@ember-decorators/argument/-debug/helpers/array-of', ['exports', '@ember-decorators/argument/-debug/utils/validators'], function (exports, _emberDecoratorsArgumentDebugUtilsValidators) {
+  'use strict';
+
+  exports['default'] = arrayOf;
+
+  function arrayOf(type) {
+    true && !(arguments.length === 1) && Ember.assert('The \'arrayOf\' helper must receive exactly one type. Use the \'unionOf\' helper to create a union type.', arguments.length === 1);
+
+    var validator = (0, _emberDecoratorsArgumentDebugUtilsValidators.resolveValidator)(type);
+
+    return (0, _emberDecoratorsArgumentDebugUtilsValidators.makeValidator)('arrayOf(' + validator + ')', function (value) {
+      return Array.isArray(value) && value.every(validator);
+    });
+  }
+});
+define('@ember-decorators/argument/-debug/helpers/one-of', ['exports', '@ember-decorators/argument/-debug/utils/validators'], function (exports, _emberDecoratorsArgumentDebugUtilsValidators) {
+  'use strict';
+
+  exports['default'] = oneOf;
+
+  function oneOf() {
+    for (var _len = arguments.length, list = Array(_len), _key = 0; _key < _len; _key++) {
+      list[_key] = arguments[_key];
+    }
+
+    true && !(arguments.length >= 1) && Ember.assert('The \'oneOf\' helper must receive at least one argument', arguments.length >= 1);
+    true && !list.every(function (item) {
+      return typeof item === 'string';
+    }) && Ember.assert('The \'oneOf\' helper must receive arguments of strings, received: ' + list, list.every(function (item) {
+      return typeof item === 'string';
+    }));
+
+    return (0, _emberDecoratorsArgumentDebugUtilsValidators.makeValidator)('oneOf(' + list.join() + ')', function (value) {
+      return list.includes(value);
+    });
+  }
+});
+define('@ember-decorators/argument/-debug/helpers/optional', ['exports', '@ember-decorators/argument/-debug/utils/validators'], function (exports, _emberDecoratorsArgumentDebugUtilsValidators) {
+  'use strict';
+
+  exports['default'] = optional;
+
+  var nullValidator = (0, _emberDecoratorsArgumentDebugUtilsValidators.resolveValidator)(null);
+  var undefinedValidator = (0, _emberDecoratorsArgumentDebugUtilsValidators.resolveValidator)(undefined);
+
+  function optional(type) {
+    true && !(arguments.length === 1) && Ember.assert('The \'optional\' helper must receive exactly one type. Use the \'unionOf\' helper to create a union type.', arguments.length === 1);
+
+    var validator = (0, _emberDecoratorsArgumentDebugUtilsValidators.resolveValidator)(type);
+    var validatorDesc = validator.toString();
+
+    true && !(validatorDesc !== 'null') && Ember.assert('Passsing \'null\' to the \'optional\' helper does not make sense.', validatorDesc !== 'null');
+    true && !(validatorDesc !== 'undefined') && Ember.assert('Passsing \'undefined\' to the \'optional\' helper does not make sense.', validatorDesc !== 'undefined');
+
+    return (0, _emberDecoratorsArgumentDebugUtilsValidators.makeValidator)('optional(' + validator + ')', function (value) {
+      return validator(value) || nullValidator(value) || undefinedValidator(value);
+    });
+  }
+});
+define("@ember-decorators/argument/-debug/helpers/shape-of", ["exports", "@ember-decorators/argument/-debug/utils/validators"], function (exports, _emberDecoratorsArgumentDebugUtilsValidators) {
+  "use strict";
+
+  exports["default"] = shapeOf;
+  var _typeof = typeof Symbol === "function" && typeof Symbol.iterator === "symbol" ? function (obj) {
+    return typeof obj;
+  } : function (obj) {
+    return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj;
+  };
+
+  function shapeOf(shape) {
+    true && !(arguments.length === 1) && Ember.assert('The \'shapeOf\' helper must receive exactly one shape', arguments.length === 1);
+    true && !((typeof shape === 'undefined' ? 'undefined' : _typeof(shape)) === 'object') && Ember.assert('The \'shapeOf\' helper must receive an object to match the shape to, received: ' + shape, (typeof shape === 'undefined' ? 'undefined' : _typeof(shape)) === 'object');
+    true && !(Object.keys(shape).length > 0) && Ember.assert('The object passed to the \'shapeOf\' helper must have at least one key:type pair', Object.keys(shape).length > 0);
+
+    var typeDesc = [];
+
+    for (var key in shape) {
+      shape[key] = (0, _emberDecoratorsArgumentDebugUtilsValidators.resolveValidator)(shape[key]);
+
+      typeDesc.push(key + ':' + shape[key]);
+    }
+
+    return (0, _emberDecoratorsArgumentDebugUtilsValidators.makeValidator)('shapeOf({' + typeDesc.join() + '})', function (value) {
+      for (var _key in shape) {
+        if (shape[_key](Ember.get(value, _key)) !== true) {
+          return false;
+        }
+      }
+
+      return true;
+    });
+  }
+});
+define('@ember-decorators/argument/-debug/helpers/union-of', ['exports', '@ember-decorators/argument/-debug/utils/validators'], function (exports, _emberDecoratorsArgumentDebugUtilsValidators) {
+  'use strict';
+
+  exports['default'] = unionOf;
+
+  function unionOf() {
+    for (var _len = arguments.length, types = Array(_len), _key = 0; _key < _len; _key++) {
+      types[_key] = arguments[_key];
+    }
+
+    true && !(arguments.length > 1) && Ember.assert('The \'unionOf\' helper must receive more than one type', arguments.length > 1);
+
+    var validators = types.map(_emberDecoratorsArgumentDebugUtilsValidators.resolveValidator);
+
+    return (0, _emberDecoratorsArgumentDebugUtilsValidators.makeValidator)('unionOf(' + validators.join() + ')', function (value) {
+      return validators.some(function (validator) {
+        return validator(value);
+      });
+    });
+  }
+});
+define('@ember-decorators/argument/-debug/index', ['exports', '@ember-decorators/argument/-debug/decorators/immutable', '@ember-decorators/argument/-debug/decorators/required', '@ember-decorators/argument/-debug/decorators/type', '@ember-decorators/argument/-debug/helpers/array-of', '@ember-decorators/argument/-debug/helpers/shape-of', '@ember-decorators/argument/-debug/helpers/union-of', '@ember-decorators/argument/-debug/helpers/optional', '@ember-decorators/argument/-debug/helpers/one-of', '@ember-decorators/argument/-debug/errors', '@ember-decorators/argument/-debug/utils/validations-for'], function (exports, _emberDecoratorsArgumentDebugDecoratorsImmutable, _emberDecoratorsArgumentDebugDecoratorsRequired, _emberDecoratorsArgumentDebugDecoratorsType, _emberDecoratorsArgumentDebugHelpersArrayOf, _emberDecoratorsArgumentDebugHelpersShapeOf, _emberDecoratorsArgumentDebugHelpersUnionOf, _emberDecoratorsArgumentDebugHelpersOptional, _emberDecoratorsArgumentDebugHelpersOneOf, _emberDecoratorsArgumentDebugErrors, _emberDecoratorsArgumentDebugUtilsValidationsFor) {
+  'use strict';
+
+  Object.defineProperty(exports, 'immutable', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsArgumentDebugDecoratorsImmutable['default'];
+    }
+  });
+  Object.defineProperty(exports, 'required', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsArgumentDebugDecoratorsRequired['default'];
+    }
+  });
+  Object.defineProperty(exports, 'type', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsArgumentDebugDecoratorsType['default'];
+    }
+  });
+  Object.defineProperty(exports, 'arrayOf', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsArgumentDebugHelpersArrayOf['default'];
+    }
+  });
+  Object.defineProperty(exports, 'shapeOf', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsArgumentDebugHelpersShapeOf['default'];
+    }
+  });
+  Object.defineProperty(exports, 'unionOf', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsArgumentDebugHelpersUnionOf['default'];
+    }
+  });
+  Object.defineProperty(exports, 'optional', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsArgumentDebugHelpersOptional['default'];
+    }
+  });
+  Object.defineProperty(exports, 'oneOf', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsArgumentDebugHelpersOneOf['default'];
+    }
+  });
+  Object.defineProperty(exports, 'MutabilityError', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsArgumentDebugErrors.MutabilityError;
+    }
+  });
+  Object.defineProperty(exports, 'RequiredFieldError', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsArgumentDebugErrors.RequiredFieldError;
+    }
+  });
+  Object.defineProperty(exports, 'TypeError', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsArgumentDebugErrors.TypeError;
+    }
+  });
+  Object.defineProperty(exports, 'getValidationsForKey', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsArgumentDebugUtilsValidationsFor.getValidationsForKey;
+    }
+  });
+});
+define("@ember-decorators/argument/-debug/utils/computed", ["exports"], function (exports) {
+  "use strict";
+
+  exports.isMandatorySetter = isMandatorySetter;
+  exports.isDescriptor = isDescriptor;
+  exports.isDescriptorTrap = isDescriptorTrap;
+  var _typeof = typeof Symbol === "function" && typeof Symbol.iterator === "symbol" ? function (obj) {
+    return typeof obj;
+  } : function (obj) {
+    return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj;
+  };
+
+  function isMandatorySetter(setter) {
+    return setter && setter.toString().match('You must use .*set()') !== null;
+  }
+
+  function isDescriptor(maybeDesc) {
+    return maybeDesc !== null && (typeof maybeDesc === 'undefined' ? 'undefined' : _typeof(maybeDesc)) === 'object' && maybeDesc.isDescriptor;
+  }
+
+  function isDescriptorTrap(maybeDesc) {
+    return maybeDesc !== null && (typeof maybeDesc === 'undefined' ? 'undefined' : _typeof(maybeDesc)) === 'object' && !!maybeDesc.__DESCRIPTOR__;
+  }
+});
+define("@ember-decorators/argument/-debug/utils/object", ["exports"], function (exports) {
+  "use strict";
+
+  exports.getPropertyDescriptor = getPropertyDescriptor;
+
+  function getPropertyDescriptor(_x, _x2) {
+    var _left;
+
+    var _again = true;
+
+    _function: while (_again) {
+      var object = _x,
+          key = _x2;
+      _again = false;
+
+      if (object === undefined) return;
+
+      if (_left = Object.getOwnPropertyDescriptor(object, key)) {
+        return _left;
+      }
+
+      _x = Object.getPrototypeOf(object);
+      _x2 = key;
+      _again = true;
+      continue _function;
+    }
+  }
+});
+define("@ember-decorators/argument/-debug/utils/validation-decorator", ["exports", "@ember-decorators/argument/-debug/utils/computed", "@ember-decorators/argument/-debug/utils/object", "@ember-decorators/argument/-debug/utils/validations-for", "@ember-decorators/argument/-debug/errors"], function (exports, _emberDecoratorsArgumentDebugUtilsComputed, _emberDecoratorsArgumentDebugUtilsObject, _emberDecoratorsArgumentDebugUtilsValidationsFor, _emberDecoratorsArgumentDebugErrors) {
+  "use strict";
+
+  exports["default"] = validationDecorator;
+  var _typeof = typeof Symbol === "function" && typeof Symbol.iterator === "symbol" ? function (obj) {
+    return typeof obj;
+  } : function (obj) {
+    return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj;
+  };
+
+  function _possibleConstructorReturn(self, call) {
+    if (!self) {
+      throw new ReferenceError("this hasn't been initialised - super() hasn't been called");
+    }return call && (typeof call === "object" || typeof call === "function") ? call : self;
+  }
+
+  function _inherits(subClass, superClass) {
+    if (typeof superClass !== "function" && superClass !== null) {
+      throw new _emberDecoratorsArgumentDebugErrors.TypeError("Super expression must either be null or a function, not " + typeof superClass);
+    }subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } });if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass;
+  }
+
+  function _classCallCheck(instance, Constructor) {
+    if (!(instance instanceof Constructor)) {
+      throw new _emberDecoratorsArgumentDebugErrors.TypeError("Cannot call a class as a function");
+    }
+  }
+
+  /* globals requireModule */
+
+  var notifyPropertyChange = Ember.notifyPropertyChange || Ember.propertyDidChange;
+
+  function guardBind(fn) {
+    if (typeof fn === 'function') {
+      for (var _len = arguments.length, args = Array(_len > 1 ? _len - 1 : 0), _key = 1; _key < _len; _key++) {
+        args[_key - 1] = arguments[_key];
+      }
+
+      return fn.bind.apply(fn, args);
+    }
+  }
+
+  var ValidatedProperty = (function () {
+    function ValidatedProperty(_ref2) {
+      var originalValue = _ref2.originalValue,
+          klass = _ref2.klass,
+          keyName = _ref2.keyName,
+          isImmutable = _ref2.isImmutable,
+          typeValidators = _ref2.typeValidators;
+
+      _classCallCheck(this, ValidatedProperty);
+
+      this.isDescriptor = true;
+
+      this.klass = klass;
+      this.originalValue = originalValue;
+      this.isImmutable = isImmutable;
+      this.typeValidators = typeValidators;
+
+      runValidators(typeValidators, klass, keyName, originalValue, 'init');
+    }
+
+    ValidatedProperty.prototype.get = function get(obj, keyName) {
+      var klass = this.klass,
+          originalValue = this.originalValue,
+          isImmutable = this.isImmutable,
+          typeValidators = this.typeValidators;
+
+      var newValue = this._get(obj, keyName);
+
+      if (isImmutable && newValue !== originalValue) {
+        throw new _emberDecoratorsArgumentDebugErrors.MutabilityError('Immutable value ' + klass.name + '#' + keyName + ' changed by underlying computed, original value: ' + originalValue + ', new value: ' + newValue);
+      }
+
+      if (typeValidators.length > 0) {
+        runValidators(typeValidators, klass, keyName, newValue, 'get');
+      }
+
+      return newValue;
+    };
+
+    ValidatedProperty.prototype.set = function set(obj, keyName, value) {
+      var klass = this.klass,
+          isImmutable = this.isImmutable,
+          typeValidators = this.typeValidators;
+
+      if (isImmutable) {
+        throw new _emberDecoratorsArgumentDebugErrors.MutabilityError('Attempted to set ' + klass.name + '#' + keyName + ' to the value ' + value + ' but the field is immutable');
+      }
+
+      var newValue = this._set(obj, keyName, value);
+
+      if (typeValidators.length > 0) {
+        runValidators(typeValidators, klass, keyName, newValue, 'set');
+      }
+
+      return newValue;
+    };
+
+    return ValidatedProperty;
+  })();
+
+  var StandardValidatedProperty = (function (_ValidatedProperty) {
+    _inherits(StandardValidatedProperty, _ValidatedProperty);
+
+    function StandardValidatedProperty(_ref3) {
+      var originalValue = _ref3.originalValue;
+
+      _classCallCheck(this, StandardValidatedProperty);
+
+      var _this = _possibleConstructorReturn(this, _ValidatedProperty.apply(this, arguments));
+
+      _this.cachedValue = originalValue;
+      return _this;
+    }
+
+    StandardValidatedProperty.prototype._get = function _get() {
+      return this.cachedValue;
+    };
+
+    StandardValidatedProperty.prototype._set = function _set(obj, keyName, value) {
+      if (value === this.cachedValue) return value;
+
+      this.cachedValue = value;
+
+      notifyPropertyChange(obj, keyName);
+
+      return this.cachedValue;
+    };
+
+    return StandardValidatedProperty;
+  })(ValidatedProperty);
+
+  var NativeComputedValidatedProperty = (function (_ValidatedProperty2) {
+    _inherits(NativeComputedValidatedProperty, _ValidatedProperty2);
+
+    function NativeComputedValidatedProperty(_ref4) {
+      var desc = _ref4.desc;
+
+      _classCallCheck(this, NativeComputedValidatedProperty);
+
+      var _this2 = _possibleConstructorReturn(this, _ValidatedProperty2.apply(this, arguments));
+
+      _this2.desc = desc;
+      return _this2;
+    }
+
+    NativeComputedValidatedProperty.prototype._get = function _get(obj) {
+      return this.desc.get.call(obj);
+    };
+
+    NativeComputedValidatedProperty.prototype._set = function _set(obj, keyName, value) {
+      // By default Ember.get will check to see if the value has changed before setting
+      // and calling propertyDidChange. In order to not change behavior, we must do the same
+      var currentValue = this._get(obj);
+
+      if (value === currentValue) return value;
+
+      this.desc.set.call(obj, value);
+
+      notifyPropertyChange(obj, keyName);
+
+      return this._get(obj);
+    };
+
+    return NativeComputedValidatedProperty;
+  })(ValidatedProperty);
+
+  var ComputedValidatedProperty = (function (_ValidatedProperty3) {
+    _inherits(ComputedValidatedProperty, _ValidatedProperty3);
+
+    function ComputedValidatedProperty(_ref5) {
+      var desc = _ref5.desc;
+
+      _classCallCheck(this, ComputedValidatedProperty);
+
+      var _this3 = _possibleConstructorReturn(this, _ValidatedProperty3.apply(this, arguments));
+
+      _this3.desc = desc;
+
+      _this3.setup = guardBind(desc.setup, desc);
+      _this3.teardown = guardBind(desc.teardown, desc);
+      _this3.willChange = guardBind(desc.willChange, desc);
+      _this3.didChange = guardBind(desc.didChange, desc);
+      _this3.willWatch = guardBind(desc.willWatch, desc);
+      _this3.didUnwatch = guardBind(desc.didUnwatch, desc);
+      return _this3;
+    }
+
+    ComputedValidatedProperty.prototype._get = function _get(obj, keyName) {
+      return this.desc.get(obj, keyName);
+    };
+
+    ComputedValidatedProperty.prototype._set = function _set(obj, keyName, value) {
+      if (true) {
+        return this.desc.set(obj, keyName, value);
+      }
+
+      this.desc.set(obj, keyName, value);
+
+      var _Ember$meta = Ember.meta(obj),
+          cache = _Ember$meta.cache;
+
+      return (typeof cache === 'undefined' ? 'undefined' : _typeof(cache)) === 'object' ? cache[keyName] : value;
+    };
+
+    return ComputedValidatedProperty;
+  })(ValidatedProperty);
+
+  function runValidators(validators, klass, key, value, phase) {
+    validators.forEach(function (validator) {
+      if (validator(value) === false) {
+        var formattedValue = typeof value === 'string' ? '\'' + value + '\'' : value;
+        throw new _emberDecoratorsArgumentDebugErrors.TypeError(klass.name + '#' + key + ' expected value of type ' + validator + ' during \'' + phase + '\', but received: ' + formattedValue);
+      }
+    });
+  }
+
+  function wrapField(klass, instance, validations, keyName) {
+    var _validations$keyName = validations[keyName],
+        isImmutable = _validations$keyName.isImmutable,
+        isRequired = _validations$keyName.isRequired,
+        typeValidators = _validations$keyName.typeValidators,
+        typeRequired = _validations$keyName.typeRequired;
+
+    if (isRequired && instance[keyName] === undefined && !instance.hasOwnProperty(keyName)) {
+      throw new _emberDecoratorsArgumentDebugErrors.RequiredFieldError(klass.name + '#' + keyName + ' is a required value, but was not provided. You can provide it as an argument, as a class field, or in the constructor');
+    }
+
+    // opt out early if no further validations
+    if (!isImmutable && typeValidators.length === 0) {
+      if (typeValidators.length === 0 && typeRequired) {
+        throw new _emberDecoratorsArgumentDebugErrors.TypeError(klass.name + '#' + keyName + ' requires a type, add one using the @type decorator');
+      }
+
+      return;
+    }
+
+    var originalValue = instance[keyName];
+    var meta = Ember.meta(instance);
+
+    if (false) {
+      var possibleDesc = meta.peekDescriptors(keyName);
+
+      if (possibleDesc !== undefined) {
+        originalValue = possibleDesc;
+      }
+    }
+
+    if ((0, _emberDecoratorsArgumentDebugUtilsComputed.isDescriptorTrap)(originalValue)) {
+      originalValue = originalValue.__DESCRIPTOR__;
+    }
+
+    var validatedProperty = void 0;
+
+    if ((0, _emberDecoratorsArgumentDebugUtilsComputed.isDescriptor)(originalValue)) {
+      var desc = originalValue;
+
+      originalValue = desc.get(instance, keyName);
+
+      validatedProperty = new ComputedValidatedProperty({
+        desc: desc, isImmutable: isImmutable, keyName: keyName, klass: klass, originalValue: originalValue, typeValidators: typeValidators
+      });
+    } else {
+      var _desc = (0, _emberDecoratorsArgumentDebugUtilsObject.getPropertyDescriptor)(instance, keyName);
+
+      if ((typeof _desc.get === 'function' || typeof _desc.set === 'function') && !(0, _emberDecoratorsArgumentDebugUtilsComputed.isMandatorySetter)(_desc.set)) {
+        validatedProperty = new NativeComputedValidatedProperty({
+          desc: _desc, isImmutable: isImmutable, keyName: keyName, klass: klass, originalValue: originalValue, typeValidators: typeValidators
+        });
+      } else {
+        validatedProperty = new StandardValidatedProperty({
+          isImmutable: isImmutable, keyName: keyName, klass: klass, originalValue: originalValue, typeValidators: typeValidators
+        });
+      }
+    }
+
+    if (false) {
+      // We're trying to fly under the radar here, so don't use Ember.defineProperty.
+      // Ember should think the property is completely unchanged.
+      Object.defineProperty(instance, keyName, {
+        configurable: true,
+        enumerable: true,
+        get: function get() {
+          return validatedProperty.get(this, keyName);
+        }
+      });
+
+      meta.writeDescriptors(keyName, validatedProperty);
+    } else {
+      // We're trying to fly under the radar here, so don't use Ember.defineProperty.
+      // Ember should think the property is completely unchanged.
+      Object.defineProperty(instance, keyName, {
+        configurable: true,
+        enumerable: true,
+        writable: true,
+        value: validatedProperty
+      });
+    }
+  }
+
+  var ValidatingCreateMixin = Ember.Mixin.create({
+    create: function create() {
+      var instance = this._super.apply(this, arguments);
+
+      var klass = this;
+      var prototype = Object.getPrototypeOf(instance);
+      var validations = (0, _emberDecoratorsArgumentDebugUtilsValidationsFor.getValidationsFor)(prototype);
+
+      if (!validations) {
+        return instance;
+      }
+
+      for (var key in validations) {
+        wrapField(klass, instance, validations, key);
+      }
+
+      return instance;
+    }
+  });
+
+  Ember.Object.reopenClass(ValidatingCreateMixin);
+
+  // Reopening a parent class does not apply the mixin to existing child classes,
+  // so we need to apply it directly
+  ValidatingCreateMixin.apply(Ember.Component);
+  ValidatingCreateMixin.apply(Ember.Service);
+  ValidatingCreateMixin.apply(Ember.Controller);
+
+  if (requireModule.has('ember-data')) {
+    var DS = requireModule('ember-data')["default"];
+
+    if (DS.Model) {
+      ValidatingCreateMixin.apply(DS.Model);
+    }
+  }
+
+  function validationDecorator(fn) {
+    return function (target, key, desc, options) {
+      var validations = (0, _emberDecoratorsArgumentDebugUtilsValidationsFor.getValidationsForKey)(target, key);
+
+      fn(target, key, desc, options, validations);
+
+      if (!desc.get && !desc.set) {
+        // always ensure the property is writeable, doesn't make sense otherwise (babel bug?)
+        desc.writable = true;
+        desc.configurable = true;
+      }
+
+      if (desc.initializer === null) {
+        desc.initializer = undefined;
+      }
+    };
+  }
+});
+define("@ember-decorators/argument/-debug/utils/validations-for", ["exports"], function (exports) {
+  "use strict";
+
+  exports.getValidationsFor = getValidationsFor;
+  exports.getOrCreateValidationsFor = getOrCreateValidationsFor;
+  exports.getValidationsForKey = getValidationsForKey;
+  function _classCallCheck(instance, Constructor) {
+    if (!(instance instanceof Constructor)) {
+      throw new TypeError("Cannot call a class as a function");
+    }
+  }
+
+  var validationMetaMap = new WeakMap();
+
+  var FieldValidations = function FieldValidations() {
+    var parentValidations = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : null;
+
+    _classCallCheck(this, FieldValidations);
+
+    if (parentValidations === null) {
+      this.isRequired = false;
+      this.isImmutable = false;
+      this.isArgument = false;
+      this.typeRequired = false;
+
+      this.typeValidators = [];
+    } else {
+      var isRequired = parentValidations.isRequired,
+          isImmutable = parentValidations.isImmutable,
+          isArgument = parentValidations.isArgument,
+          typeRequired = parentValidations.typeRequired,
+          typeValidators = parentValidations.typeValidators;
+
+      this.isRequired = isRequired;
+      this.isImmutable = isImmutable;
+      this.isArgument = isArgument;
+      this.typeRequired = typeRequired;
+
+      this.typeValidators = typeValidators.slice();
+    }
+  };
+
+  function getValidationsFor(_x) {
+    var _left;
+
+    var _again = true;
+
+    _function: while (_again) {
+      var target = _x;
+      _again = false;
+
+      // Reached the root of the prototype chain
+      if (target === null) return;
+
+      if (_left = validationMetaMap.get(target)) {
+        return _left;
+      }
+
+      _x = Object.getPrototypeOf(target);
+      _again = true;
+      continue _function;
+    }
+  }
+
+  function getOrCreateValidationsFor(target) {
+    if (!validationMetaMap.has(target)) {
+      var parentMeta = getValidationsFor(Object.getPrototypeOf(target));
+      validationMetaMap.set(target, Object.create(parentMeta || null));
+    }
+
+    return validationMetaMap.get(target);
+  }
+
+  function getValidationsForKey(target, key) {
+    var validations = getOrCreateValidationsFor(target);
+
+    if (!Object.hasOwnProperty.call(validations, key)) {
+      var parentValidations = validations[key];
+      validations[key] = new FieldValidations(parentValidations);
+    }
+
+    return validations[key];
+  }
+});
+define("@ember-decorators/argument/-debug/utils/validators", ["exports"], function (exports) {
+  "use strict";
+
+  exports.makeValidator = makeValidator;
+  exports.resolveValidator = resolveValidator;
+  var _typeof = typeof Symbol === "function" && typeof Symbol.iterator === "symbol" ? function (obj) {
+    return typeof obj;
+  } : function (obj) {
+    return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj;
+  };
+
+  function instanceOf(type) {
+    return makeValidator(type.toString(), function (value) {
+      return value instanceof type;
+    });
+  }
+
+  var primitiveTypeValidators = {
+    any: makeValidator('any', function () {
+      return true;
+    }),
+    object: makeValidator('object', function (value) {
+      return typeof value !== 'boolean' && typeof value !== 'number' && typeof value !== 'string' && (typeof value === 'undefined' ? 'undefined' : _typeof(value)) !== 'symbol' && value !== null && value !== undefined;
+    }),
+
+    boolean: makeValidator('boolean', function (value) {
+      return typeof value === 'boolean';
+    }),
+    number: makeValidator('number', function (value) {
+      return typeof value === 'number';
+    }),
+    string: makeValidator('string', function (value) {
+      return typeof value === 'string';
+    }),
+    symbol: makeValidator('symbol', function (value) {
+      return (typeof value === 'undefined' ? 'undefined' : _typeof(value)) === 'symbol';
+    }),
+
+    "null": makeValidator('null', function (value) {
+      return value === null;
+    }),
+    undefined: makeValidator('undefined', function (value) {
+      return value === undefined;
+    })
+  };
+
+  function makeValidator(desc, fn) {
+    fn.isValidator = true;
+    fn.toString = function () {
+      return desc;
+    };
+    return fn;
+  }
+
+  function resolveValidator(type) {
+    if (type === null || type === undefined) {
+      return type === null ? primitiveTypeValidators["null"] : primitiveTypeValidators.undefined;
+    } else if (type.isValidator === true) {
+      return type;
+    } else if (typeof type === 'function' || (typeof type === 'undefined' ? 'undefined' : _typeof(type)) === 'object') {
+      // We allow objects for certain classes in IE, like Element, which have typeof 'object' for some reason
+      return instanceOf(type);
+    } else if (typeof type === 'string') {
+      true && !(primitiveTypeValidators[type] !== undefined) && Ember.assert('Unknown primitive type received: ' + type, primitiveTypeValidators[type] !== undefined);
+
+      return primitiveTypeValidators[type];
+    } else {
+      true && !false && Ember.assert('Types must either be a primitive type string, class, validator, or null or undefined, received: ' + type, false);
+    }
+  }
+});
+define('@ember-decorators/argument/-debug/validated-component', ['exports', 'ember-get-config', '@ember-decorators/argument/-debug/utils/validation-decorator', '@ember-decorators/argument/-debug/utils/validations-for'], function (exports, _emberGetConfig, _emberDecoratorsArgumentDebugUtilsValidationDecorator, _emberDecoratorsArgumentDebugUtilsValidationsFor) {
+  'use strict';
+
+  var validatedComponent = void 0;
+
+  var whitelist = {
+    ariaRole: true,
+    'class': true,
+    classNames: true,
+    id: true,
+    isVisible: true,
+    tagName: true
+  };
+
+  if (true) {
+    validatedComponent = Ember.Component.extend();
+
+    validatedComponent.reopenClass({
+      create: function create(props) {
+        // First create the instance to realize any dynamically added bindings or fields
+        var instance = this._super.apply(this, arguments);
+
+        var prototype = Object.getPrototypeOf(instance);
+        var validations = (0, _emberDecoratorsArgumentDebugUtilsValidationsFor.getValidationsFor)(prototype) || {};
+        if (Ember.getWithDefault(_emberGetConfig['default'], '@ember-decorators/argument.ignoreComponentsWithoutValidations', false) && Object.keys(validations).length === 0) {
+          return instance;
+        }
+
+        var attributes = instance.attributeBindings || [];
+        var classNames = (instance.classNameBindings || []).map(function (binding) {
+          return binding.split(':')[0];
+        });
+
+        for (var key in props.attrs) {
+          var isValidArgOrAttr = key in validations && validations[key].isArgument || key in whitelist || attributes.indexOf(key) !== -1 || classNames.indexOf(key) !== -1;
+
+          true && !isValidArgOrAttr && Ember.assert('Attempted to assign the argument \'' + key + '\' on an instance of ' + (this.name || this) + ', but no argument was defined for that key. Use the @argument helper on the class field to define an argument for that class.', isValidArgOrAttr);
+        }
+
+        return instance;
+      }
+    });
+  } else {
+    validatedComponent = Ember.Component;
+  }
+
+  exports['default'] = validatedComponent;
+});
+define('@ember-decorators/argument/errors', ['exports', '@ember-decorators/argument/-debug'], function (exports, _emberDecoratorsArgumentDebug) {
+  'use strict';
+
+  Object.defineProperty(exports, 'MutabilityError', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsArgumentDebug.MutabilityError;
+    }
+  });
+  Object.defineProperty(exports, 'RequiredFieldError', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsArgumentDebug.RequiredFieldError;
+    }
+  });
+  Object.defineProperty(exports, 'TypeError', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsArgumentDebug.TypeError;
+    }
+  });
+});
+define("@ember-decorators/argument/index", ["exports", "ember-get-config", "@ember-decorators/argument/utils/make-computed", "@ember-decorators/argument/-debug"], function (exports, _emberGetConfig, _emberDecoratorsArgumentUtilsMakeComputed, _emberDecoratorsArgumentDebug) {
+  "use strict";
+
+  exports.argument = argument;
+  var _typeof = typeof Symbol === "function" && typeof Symbol.iterator === "symbol" ? function (obj) {
+    return typeof obj;
+  } : function (obj) {
+    return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj;
+  };
+
+  var valueMap = new WeakMap();
+
+  function valuesFor(obj) {
+    if (!valueMap.has(obj)) {
+      valueMap.set(obj, Object.create(null));
+    }
+
+    return valueMap.get(obj);
+  }
+
+  var internalArgumentDecorator = function internalArgumentDecorator(target, key, desc, options) {
+    if (true) {
+      var validations = (0, _emberDecoratorsArgumentDebug.getValidationsForKey)(target, key);
+      validations.isArgument = true;
+      validations.typeRequired = Ember.getWithDefault(_emberGetConfig["default"], '@ember-decorators/argument.typeRequired', false);
+    }
+
+    // always ensure the property is writeable, doesn't make sense otherwise (babel bug?)
+    desc.writable = true;
+    desc.configurable = true;
+
+    if (desc.initializer === null || desc.initializer === undefined) {
+      desc.initializer = undefined;
+      return;
+    }
+
+    var initializer = desc.initializer;
+
+    var get = function get() {
+      var values = valuesFor(this);
+
+      if (!Object.hasOwnProperty.call(values, key)) {
+        values[key] = initializer.call(this);
+      }
+
+      return values[key];
+    };
+
+    if (options.defaultIfNullish === true || options.defaultIfUndefined === true) {
+      var defaultIf = void 0;
+
+      if (options.defaultIfNullish === true) {
+        defaultIf = function defaultIf(v) {
+          return v === undefined || v === null;
+        };
+      } else {
+        defaultIf = function defaultIf(v) {
+          return v === undefined;
+        };
+      }
+
+      if (false) {
+        return {
+          get: get,
+          set: function set(value) {
+            if (defaultIf(value)) {
+              valuesFor(this)[key] = initializer.call(this);
+            } else {
+              valuesFor(this)[key] = value;
+            }
+          }
+        };
+      }
+
+      var descriptor = (0, _emberDecoratorsArgumentUtilsMakeComputed["default"])({
+        get: get,
+        set: function set(keyName, value) {
+          if (defaultIf(value)) {
+            return valuesFor(this)[key] = initializer.call(this);
+          } else {
+            return valuesFor(this)[key] = value;
+          }
+        }
+      });
+
+      // Decorators spec doesn't allow us to make a computed directly on
+      // the prototype, so we need to wrap the descriptor in a getter
+      return {
+        get: function get() {
+          return descriptor;
+        }
+      };
+    } else {
+      return {
+        get: get,
+        set: function set(value) {
+          valuesFor(this)[key] = value;
+        }
+      };
+    }
+  };
+
+  function argument(maybeOptions, maybeKey, maybeDesc) {
+    if (typeof maybeKey === 'string' && (typeof maybeDesc === 'undefined' ? 'undefined' : _typeof(maybeDesc)) === 'object') {
+      return internalArgumentDecorator(maybeOptions, maybeKey, maybeDesc, { defaultIfUndefined: false });
+    }
+
+    return function (target, key, desc) {
+      return internalArgumentDecorator(target, key, desc, maybeOptions);
+    };
+  }
+});
+define('@ember-decorators/argument/type', ['exports', '@ember-decorators/argument/-debug'], function (exports, _emberDecoratorsArgumentDebug) {
+  'use strict';
+
+  Object.defineProperty(exports, 'type', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsArgumentDebug.type;
+    }
+  });
+  Object.defineProperty(exports, 'arrayOf', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsArgumentDebug.arrayOf;
+    }
+  });
+  Object.defineProperty(exports, 'shapeOf', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsArgumentDebug.shapeOf;
+    }
+  });
+  Object.defineProperty(exports, 'unionOf', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsArgumentDebug.unionOf;
+    }
+  });
+  Object.defineProperty(exports, 'optional', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsArgumentDebug.optional;
+    }
+  });
+  Object.defineProperty(exports, 'oneOf', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsArgumentDebug.oneOf;
+    }
+  });
+});
+define('@ember-decorators/argument/types', ['exports', '@ember-decorators/argument/-debug'], function (exports, _emberDecoratorsArgumentDebug) {
+  'use strict';
+
+  function _classCallCheck(instance, Constructor) {
+    if (!(instance instanceof Constructor)) {
+      throw new TypeError("Cannot call a class as a function");
+    }
+  }
+
+  /**
+   * Action type, covers both string actions and closure actions
+   */
+  var Action = (0, _emberDecoratorsArgumentDebug.unionOf)('string', Function);
+
+  exports.Action = Action;
+  /**
+   * Action type, covers both string actions and closure actions
+   */
+  var ClosureAction = Function;
+
+  exports.ClosureAction = ClosureAction;
+  /**
+   * Element type polyfill for fastboot
+   */
+  var Element = window ? window.Element : function Element() {
+    _classCallCheck(this, Element);
+  };
+
+  exports.Element = Element;
+  /**
+   * Node type polyfill for fastboot
+   */
+  var Node = window ? window.Node : function Node() {
+    _classCallCheck(this, Node);
+  };
+  exports.Node = Node;
+});
+define("@ember-decorators/argument/utils/make-computed", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = makeComputed;
+
+  function makeComputed(desc) {
+    if (true) {
+      return Ember.computed(desc);
+    } else {
+      var get = desc.get,
+          set = desc.set;
+
+      return Ember.computed(function (key, value) {
+        if (arguments.length > 1) {
+          return set.call(this, key, value);
+        }
+
+        return get.call(this);
+      });
+    }
+  }
+});
+define('@ember-decorators/argument/validation', ['exports', '@ember-decorators/argument/-debug'], function (exports, _emberDecoratorsArgumentDebug) {
+  'use strict';
+
+  Object.defineProperty(exports, 'immutable', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsArgumentDebug.immutable;
+    }
+  });
+  Object.defineProperty(exports, 'required', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsArgumentDebug.required;
+    }
+  });
+});
+define('@ember-decorators/component/index', ['exports', '@ember-decorators/utils/collapse-proto', '@ember-decorators/utils/decorator'], function (exports, _emberDecoratorsUtilsCollapseProto, _emberDecoratorsUtilsDecorator) {
+  'use strict';
+
+  exports.classNames = classNames;
+  exports.tagName = tagName;
+  function _toConsumableArray(arr) {
+    if (Array.isArray(arr)) {
+      for (var i = 0, arr2 = Array(arr.length); i < arr.length; i++) {
+        arr2[i] = arr[i];
+      }return arr2;
+    } else {
+      return Array.from(arr);
+    }
+  }
+
+  /**
+    Decorator which indicates that the field or computed should be bound
+    to an attribute value on the component. This replaces `attributeBindings`
+    by directly allowing you to specify which properties should be bound.
+  
+    ```js
+    export default class AttributeDemoComponent extends Component {
+      @attribute role = 'button';
+  
+      // With provided attribute name
+      @attribute('data-foo') foo = 'lol';
+  
+      @attribute
+      @computed
+      get id() {
+        // return generated id
+      }
+    }
+    ```
+  
+    @function
+    @param {string} name? - The name of the attribute to bind the value to if it is truthy
+  */
+  var attribute = (0, _emberDecoratorsUtilsDecorator.decoratorWithParams)(function (target, key, desc, params) {
+    true && !(params.length <= 1) && Ember.assert('The @attribute decorator may take up to one parameter, the bound attribute name. Received: ' + params.length, params.length <= 1);
+    true && !params.every(function (s) {
+      return typeof s === 'string';
+    }) && Ember.assert('The @attribute decorator may only receive strings as parameters. Received: ' + params, params.every(function (s) {
+      return typeof s === 'string';
+    }));
+
+    (0, _emberDecoratorsUtilsCollapseProto['default'])(target);
+
+    if (!target.hasOwnProperty('attributeBindings')) {
+      var parentValue = target.attributeBindings;
+      target.attributeBindings = Array.isArray(parentValue) ? parentValue.slice() : [];
+    }
+
+    var binding = params[0] ? key + ':' + params[0] : key;
+
+    target.attributeBindings.push(binding);
+
+    if (desc) {
+      // Decorated fields are currently not configurable in Babel for some reason, so ensure
+      // that the field becomes configurable (else it messes with things)
+      desc.configurable = true;
+    }
+
+    return desc;
+  });
+
+  exports.attribute = attribute;
+  /**
+    Decorator which indicates that the field or computed should be bound to
+    the component class names. This replaces `classNameBindings` by directly
+    allowing you to specify which properties should be bound.
+  
+    ```js
+    export default class ClassNameDemoComponent extends Component {
+      @className boundField = 'default-class';
+  
+      // With provided true/false class names
+      @className('active', 'inactive') isActive = true;
+  
+      @className
+      @computed
+      get boundComputed() {
+        // return generated class
+      }
+    }
+    ```
+  
+    @function
+    @param {string} truthyName? - The class to be applied if the value the field
+                                  is truthy, defaults to the name of the field.
+    @param {string} falsyName? - The class to be applied if the value of the field
+                                 is falsy.
+  */
+  var className = (0, _emberDecoratorsUtilsDecorator.decoratorWithParams)(function (target, key, desc, params) {
+    true && !(params.length <= 2) && Ember.assert('The @className decorator may take up to two parameters, the truthy class and falsy class for the class binding. Received: ' + params.length, params.length <= 2);
+    true && !params.every(function (s) {
+      return typeof s === 'string';
+    }) && Ember.assert('The @className decorator may only receive strings as parameters. Received: ' + params, params.every(function (s) {
+      return typeof s === 'string';
+    }));
+
+    (0, _emberDecoratorsUtilsCollapseProto['default'])(target);
+
+    if (!target.hasOwnProperty('classNameBindings')) {
+      var parentValue = target.classNameBindings;
+      target.classNameBindings = Array.isArray(parentValue) ? parentValue.slice() : [];
+    }
+
+    var binding = params.length > 0 ? key + ':' + params.join(':') : key;
+
+    target.classNameBindings.push(binding);
+
+    if (desc) {
+      // Decorated fields are currently not configurable in Babel for some reason, so ensure
+      // that the field becomes configurable (else it messes with things)
+      desc.configurable = true;
+    }
+
+    return desc;
+  });
+
+  exports.className = className;
+  /**
+    Class decorator which specifies the class names to be applied to a component.
+    This replaces the `classNames` property on components in the traditional Ember
+    object model.
+  
+    ```js
+    @classNames('a-static-class', 'another-static-class')
+    export default class ClassNamesDemoComponent extends Component {}
+    ```
+  
+    @param {...string} classNames - The list of classes to be applied to the component
+  */
+
+  function classNames() {
+    for (var _len = arguments.length, classNames = Array(_len), _key = 0; _key < _len; _key++) {
+      classNames[_key] = arguments[_key];
+    }
+
+    true && !classNames.reduce(function (allStrings, name) {
+      return allStrings && typeof name === 'string';
+    }, true) && Ember.assert('The @classNames decorator must be provided strings, received: ' + classNames, classNames.reduce(function (allStrings, name) {
+      return allStrings && typeof name === 'string';
+    }, true));
+
+    return function (klass) {
+      var prototype = klass.prototype;
+
+      (0, _emberDecoratorsUtilsCollapseProto['default'])(prototype);
+
+      if ('classNames' in prototype) {
+        var parentClasses = prototype.classNames;
+        classNames.unshift.apply(classNames, _toConsumableArray(parentClasses));
+      }
+
+      prototype.classNames = classNames;
+
+      return klass;
+    };
+  }
+
+  /**
+    Class decorator which specifies the tag name of the component. This replaces
+    the `tagName` property on components in the traditional Ember object model.
+  
+    ```js
+    @tagName('button')
+    export default class TagNameDemoComponent extends Component {}
+    ```
+  
+    @param {string} tagName - The HTML tag to be used for the component
+  */
+
+  function tagName(tagName) {
+    true && !(arguments.length === 1) && Ember.assert('The @tagName decorator must be provided exactly one argument, received: ' + tagName, arguments.length === 1);
+    true && !(typeof tagName === 'string') && Ember.assert('The @tagName decorator must be provided a string, received: ' + tagName, typeof tagName === 'string');
+
+    return function (klass) {
+      klass.prototype.tagName = tagName;
+      return klass;
+    };
+  }
+});
+define('@ember-decorators/controller/index', ['exports', '@ember-decorators/utils/computed'], function (exports, _emberDecoratorsUtilsComputed) {
+  'use strict';
+
+  function _toConsumableArray(arr) {
+    if (Array.isArray(arr)) {
+      for (var i = 0, arr2 = Array(arr.length); i < arr.length; i++) {
+        arr2[i] = arr[i];
+      }return arr2;
+    } else {
+      return Array.from(arr);
+    }
+  }
+
+  /**
+    Decorator that injects a controller into a controller as the decorated
+    property
+  
+     ```javascript
+    export default class IndexController extends Controller {
+      @controller application;
+    }
+    ```
+  
+    @function
+    @param {string} controllerName? - The name of the controller to inject. If not provided, the property name will be used
+    @return {Controller}
+  */
+  var controller = (0, _emberDecoratorsUtilsComputed.computedDecoratorWithParams)(function (target, key, desc, params) {
+    return params.length > 0 ? Ember.inject.controller.apply(undefined, _toConsumableArray(params)) : Ember.inject.controller(key);
+  });
+  exports.controller = controller;
+});
+define('@ember-decorators/data/index', ['exports', 'ember-data', '@ember-decorators/utils/computed'], function (exports, _emberData, _emberDecoratorsUtilsComputed) {
+  'use strict';
+
+  function _toConsumableArray(arr) {
+    if (Array.isArray(arr)) {
+      for (var i = 0, arr2 = Array(arr.length); i < arr.length; i++) {
+        arr2[i] = arr[i];
+      }return arr2;
+    } else {
+      return Array.from(arr);
+    }
+  }
+
+  function computedDecoratorWithKeyReflection(fn) {
+    return (0, _emberDecoratorsUtilsComputed.computedDecoratorWithParams)(function (target, keyName, desc, params) {
+      var key = void 0;
+
+      if (typeof params[0] === 'string') {
+        key = params.shift();
+      } else {
+        key = keyName;
+      }
+
+      return fn.apply(undefined, [key].concat(_toConsumableArray(params)));
+    });
+  }
+
+  /**
+    Decorator that turns the property into an Ember Data attribute
+  
+    ```js
+    export default class User extends Model {
+      @attr firstName;
+  
+      @attr('string') lastName;
+  
+      @attr('number', { defaultValue: 0 })
+      age;
+    }
+    ```
+  
+    @function
+    @param {string} type? - Type of the attribute
+    @param {object} options? - Options for the attribute
+  */
+  var attr = (0, _emberDecoratorsUtilsComputed.computedDecoratorWithParams)(function (target, key, desc, params) {
+    return _emberData['default'].attr.apply(_emberData['default'], _toConsumableArray(params));
+  });
+
+  exports.attr = attr;
+  /**
+    Decorator that turns the property into an Ember Data `hasMany` relationship
+  
+    ```js
+    export default class User extends Model {
+      @hasMany posts;
+  
+      @hasMany('user') friends;
+  
+      @hasMany('user', { async: false })
+      followers;
+    }
+    ```
+  
+    @function
+    @param {string} type? - Type of relationship
+    @param {object} options? - Options for the relationship
+  */
+  var hasMany = computedDecoratorWithKeyReflection(_emberData['default'].hasMany);
+
+  exports.hasMany = hasMany;
+  /**
+    Decorator that turns the property into an Ember Data `belongsTo` relationship
+  
+    ```javascript
+    export default class Post extends Model {
+      @belongsTo user;
+  
+      @belongsTo('user') editor
+  
+      @belongsTo('post', { async: false })
+      parentPost;
+    }
+    ```
+    @function
+    @param {string} type? - Type of the relationship
+    @param {object} options? - Type of the relationship
+  */
+  var belongsTo = computedDecoratorWithKeyReflection(_emberData['default'].belongsTo);
+  exports.belongsTo = belongsTo;
+});
+define('@ember-decorators/object/computed', ['exports', '@ember-decorators/utils/computed'], function (exports, _emberDecoratorsUtilsComputed) {
+  'use strict';
+
+  function _toConsumableArray(arr) {
+    if (Array.isArray(arr)) {
+      for (var i = 0, arr2 = Array(arr.length); i < arr.length; i++) {
+        arr2[i] = arr[i];
+      }return arr2;
+    } else {
+      return Array.from(arr);
+    }
+  }
+
+  function legacyMacro(fn) {
+    return (0, _emberDecoratorsUtilsComputed.computedDecoratorWithRequiredParams)(function (target, key, desc, params) {
+      if (desc !== undefined && desc.value !== undefined) {
+        return fn.apply(undefined, _toConsumableArray(params).concat([desc.value]));
+      }
+
+      return fn.apply(undefined, _toConsumableArray(params));
+    });
+  }
+
+  function legacyMacroWithRequiredMethod(fn) {
+    return (0, _emberDecoratorsUtilsComputed.computedDecoratorWithRequiredParams)(function (target, key, desc, params) {
+      var method = desc !== undefined && typeof desc.value === 'function' ? desc.value : params.pop();
+
+      true && !(typeof method === 'function') && Ember.assert('The @' + fn.name + ' decorator must be used to decorate a method', typeof method === 'function');
+
+      return fn.apply(undefined, _toConsumableArray(params).concat([method]));
+    });
+  }
+
+  /**
+    Creates a new property that is an alias for another property on an object.
+  
+    Equivalent to the Ember [alias](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/alias) macro.
+  
+    ```js
+    export default class UserProfileComponent extends Component {
+      person = {
+        first: 'Joe'
+      };
+  
+      @alias('person.first') firstName;
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey - Key for the aliased property
+    @return {any}
+  */
+  var alias = legacyMacro(Ember.computed.alias);
+
+  exports.alias = alias;
+  /**
+    A computed property that performs a logical and on the original values for the
+    provided dependent properties.
+  
+    Equivalent to the Ember [and](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/and) macro.
+  
+    ```js
+    export default class UserProfileComponent extends Component {
+      person = {
+        first: 'Joe'
+      };
+  
+      @and('person.{first,last}') hasFullName; // false
+    }
+    ```
+  
+    @function
+    @param {...string} dependentKeys - Keys for the properties to `and`
+    @return {boolean}
+  */
+  var and = legacyMacro(Ember.computed.and);
+
+  exports.and = and;
+  /**
+    A computed property that converts the provided dependent property into a
+    boolean value.
+  
+    Equivalent to the Ember [bool](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/bool) macro.
+  
+    ```js
+    export default class MessagesNotificationComponent extends Component {
+      messageCount = 1;
+  
+      @bool('messageCount') hasMessages; // true
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey - Key for the property to convert
+    @return {boolean}
+  */
+  var bool = legacyMacro(Ember.computed.bool);
+
+  exports.bool = bool;
+  /**
+    A computed property that returns the array of values for the provided
+    dependent properties.
+  
+    Equivalent to the Ember [collect](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/collect) macro.
+  
+    ```js
+    export default class CameraEquipmentComponent extends Component {
+      light = 'strobe';
+      lens = '35mm prime';
+  
+      @collect('light', 'lens') equipment; // ['strobe', '35mm prime']
+    }
+    ```
+  
+    @function
+    @param {...string} dependentKeys - Keys for the properties to collect
+    @return {any[]}
+  */
+  var collect = legacyMacro(Ember.computed.collect);
+
+  exports.collect = collect;
+  /**
+    Creates a new property that is an alias for another property on an object.
+    Calls to get or set this property behave as though they were called on
+    the original property, but will also trigger a deprecation warning.
+  
+    Equivalent to the Ember [deprecatingAlias](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/deprecatingAlias) macro.
+  
+    ```js
+    export default class UserProfileComponent extends {
+      person = {
+        first: 'Joe'
+      };
+  
+      @deprecatingAlias('person.first', {
+        id: 'user-profile.firstName',
+        until: '3.0.0',
+        url: 'https://example.com/deprecations/user-profile.firstName'
+      }) firstName;
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey - Key for the property to alias
+    @param {object} options
+  */
+  var deprecatingAlias = legacyMacro(Ember.computed.deprecatingAlias);
+
+  exports.deprecatingAlias = deprecatingAlias;
+  /**
+    A computed property that returns `true` if the value of the dependent
+    property is null, an empty string, empty array, or empty function.
+  
+    Equivalent to the Ember [empty](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/empty) macro.
+  
+    ```js
+    export default class FoodItemsComponent extends Component {
+      items = ['taco', 'burrito'];
+  
+      @empty('items') isEmpty; // false
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey - Key of the property to check emptiness of
+    @return {boolean}
+  */
+  var empty = legacyMacro(Ember.computed.empty);
+
+  exports.empty = empty;
+  /**
+    A computed property that returns true if the dependent properties are equal.
+  
+    Equivalent to the Ember [equal](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/equal) macro.
+  
+    ```js
+    export default class NapTimeComponent extends Component {
+      state = 'sleepy';
+  
+      @equal('state', 'sleepy') napTime; // true
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey - Key for the property to check
+    @param {any} value - Value to compare the dependent property to
+    @return {boolean}
+  */
+  var equal = legacyMacro(Ember.computed.equal);
+
+  exports.equal = equal;
+  /**
+    Filters the items in the array by the provided callback.
+  
+    Equivalent to the Ember [filter](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/filter) macro.
+  
+    ```js
+    export default class ChoresListComponent extends Component {
+      chores = [
+        { name: 'cook', done: true },
+        { name: 'clean', done: true },
+        { name: 'write more unit tests', done: false }
+      ];
+  
+      @filter('chores')
+      remainingChores(chore, index, array) {
+        return !chore.done;
+      } // [{name: 'write more unit tests', done: false}]
+  
+      // alternative syntax:
+  
+      @filter('chores', function(chore, index, array) {
+        return !chore.done;
+      }) remainingChores; // [{name: 'write more unit tests', done: false}]
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey - Key for the array to filter
+    @param { (item: any, index: number, array: any[]) => boolean} callback? - The function to filter with
+    @return {any[]}
+  */
+  var filter = legacyMacroWithRequiredMethod(Ember.computed.filter);
+
+  exports.filter = filter;
+  /**
+    Filters the array by the property and value.
+  
+    Equivalent to the Ember [filter](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/filterBy) macro.
+  
+    ```js
+    export default class ChoresListComponent extends Component {
+      chores = [
+        { name: 'cook', done: true },
+        { name: 'clean', done: true },
+        { name: 'write more unit tests', done: false }
+      ];
+  
+      @filterBy('chores', 'done', false) remainingChores; // [{name: 'write more unit tests', done: false}]
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey - Key for the array to filter
+    @param {string} propertyKey - Property of the array items to filter by
+    @param {any} value - Value to filter by
+    @return {any[]}
+  */
+  var filterBy = legacyMacro(Ember.computed.filterBy);
+
+  exports.filterBy = filterBy;
+  /**
+    A computed property that returns `true` if the provided dependent property
+    is strictly greater than the provided value.
+  
+    Equivalent to the Ember [gt](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/gt) macro.
+  
+    ```js
+    export default class CatPartyComponent extends Component {
+      totalCats = 11;
+  
+      @gt('totalCats', 10) isCatParty; // true
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey - Key for the property to compare
+    @param {number} value - Value to compare against
+    @return {boolean}
+  */
+  var gt = legacyMacro(Ember.computed.gt);
+
+  exports.gt = gt;
+  /**
+    A computed property that returns `true` if the provided dependent property
+    is greater than or equal to the provided value.
+  
+    Equivalent to the Ember [gte](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/gte) macro.
+  
+    ```js
+    export default class PlayerListComponent extends Component {
+      totalPlayers = 14;
+  
+      @gte('totalPlayers', 14) hasEnoughPlayers; // true
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey - Key for the property to compare
+    @param {number} value - Value to compare against
+    @return {boolean}
+  */
+  var gte = legacyMacro(Ember.computed.gte);
+
+  exports.gte = gte;
+  /**
+    A computed property which returns a new array with all the duplicated elements
+    from two or more dependent arrays.
+  
+    Equivalent to the Ember [intersect](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/intersect) macro.
+  
+    ```js
+    export default class FoodListComponent extends Component {
+      likes = [ 'tacos', 'puppies', 'pizza' ];
+      foods = ['tacos', 'pizza'];
+  
+      @intersect('likes', 'foods') favoriteFoods; // ['tacos', 'pizza']
+    }
+    ```
+  
+    @function
+    @param {...string} dependentKeys - Keys of the arrays to intersect
+    @return {any[]}
+  */
+  var intersect = legacyMacro(Ember.computed.intersect);
+
+  exports.intersect = intersect;
+  /**
+    A computed property that returns `true` if the provided dependent property
+    is strictly less than the provided value.
+  
+    Equivalent to the Ember [lt](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/lt) macro
+  
+    ```js
+    export default class DogPartyComponent extends Component {
+      totalDogs = 3;
+  
+      @lt('totalDogs', 10) isDogParty; // true
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey - Key for the property to compare
+    @param {number} value - Value to compare against
+    @return {boolean}
+  */
+  var lt = legacyMacro(Ember.computed.lt);
+
+  exports.lt = lt;
+  /**
+    A computed property that returns `true` if the provided dependent property
+    is less than or equal to the provided value.
+  
+    Equivalent to the Ember [lte](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/lte) macro.
+  
+    ```js
+    export default class PlayerListComponent extends Component {
+      totalPlayers = 14;
+  
+      @lte('totalPlayers', 14) hasEnoughPlayers; // true
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey - Key for the property to compare
+    @param {number} value - Value to compare against
+    @return {boolean}
+  */
+  var lte = legacyMacro(Ember.computed.lte);
+
+  exports.lte = lte;
+  /**
+    Returns an array mapped via the callback.
+  
+    Equivalent to the Ember [map](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/map) macro.
+  
+    ```js
+    export default class ChoresListComponent extends Component {
+      chores = ['clean', 'write more unit tests']);
+  
+      @map('chores')
+      loudChores(chore, index) {
+        return chore.toUpperCase() + '!';
+      } // ['CLEAN!', 'WRITE MORE UNIT TESTS!']
+  
+      // alternative syntax:
+  
+      @map('chores', function(chore, index) {
+        return chore.toUpperCase() + '!';
+      }) loudChores; // ['CLEAN!', 'WRITE MORE UNIT TESTS!']
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey? - Key for the array to map over
+    @param { (item: any, index: number, array: any[]) => any} callback? - Function to map over the array
+    @return {any[]}
+  */
+  var map = legacyMacroWithRequiredMethod(Ember.computed.map);
+
+  exports.map = map;
+  /**
+    Returns an array mapped to the specified key.
+  
+    Equivalent to the Ember [mapBy](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/mapBy) macro.
+  
+    ```js
+    export default class PeopleListComponent extends Component {
+      people = [
+        {name: "George", age: 5},
+        {name: "Stella", age: 10},
+        {name: "Violet", age: 7}
+      ];
+  
+      @mapBy('people', 'age') ages; // [5, 10, 7]
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey - Key for the array to map over
+    @param {string} propertyKey - Property of the array items to map by
+    @return {any[]}
+  */
+  var mapBy = legacyMacro(Ember.computed.mapBy);
+
+  exports.mapBy = mapBy;
+  /**
+    A computed property which matches the original value for the dependent
+    property against a given RegExp, returning `true` if they values matches
+    the RegExp and `false` if it does not.
+  
+    Equivalent to the Ember [match](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/match) macro.
+  
+    ```js
+    export default class IsEmailValidComponent extends Component {
+      email = 'tomster@emberjs.com';
+  
+      @match('email', /^.+@.+\..+$/) validEmail;
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey - The property to match
+    @param {RegExp} pattern - The pattern to match against
+    @return {boolean}
+  */
+  var match = legacyMacro(Ember.computed.match);
+
+  exports.match = match;
+  /**
+    A computed property that calculates the maximum value in the dependent array.
+    This will return `-Infinity` when the dependent array is empty.
+  
+    Equivalent to the Ember [max](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/max) macro.
+  
+    ```js
+    export default class MaxValueComponent extends Component {
+      values = [1, 2, 5, 10];
+  
+      @max('values') maxValue; // 10
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey - Key for the array to find the max value of
+    @return {number}
+  */
+  var max = legacyMacro(Ember.computed.max);
+
+  exports.max = max;
+  /**
+    A computed property that calculates the minimum value in the dependent array.
+    This will return `Infinity` when the dependent array is empty.
+  
+    Equivalent to the Ember [min](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/min) macro.
+  
+    ```js
+    export default class MinValueComponent extends Component {
+      values = [1, 2, 5, 10];
+  
+      @min('values') minValue; // 1
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey - Key for the array to find the max value of
+    @return {number}
+  */
+  var min = legacyMacro(Ember.computed.min);
+
+  exports.min = min;
+  /**
+    A computed property that returns true if the value of the dependent property
+    is null or undefined.
+  
+    Equivalent to the Ember [none](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/none) macro.
+  
+    ```js
+    export default class NameDisplayComponent extends Component {
+      firstName = null;
+  
+      @none('firstName') isNameless; // true unless firstName is defined
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey - Key for the property to check
+    @return {boolean}
+  */
+  var none = legacyMacro(Ember.computed.none);
+
+  exports.none = none;
+  /**
+    A computed property that returns the inverse boolean value of the original
+    value for the dependent property.
+  
+    Equivalent to the Ember [not](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/not) macro.
+  
+    ```js
+    export default class UserInfoComponent extends Component {
+      loggedIn = false;
+  
+      @not('loggedIn') isAnonymous; // true
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey - Key for the property to `not`
+    @return {boolean}
+  */
+  var not = legacyMacro(Ember.computed.not);
+
+  exports.not = not;
+  /**
+    A computed property that returns `true` if the value of the dependent property
+    is NOT null, an empty string, empty array, or empty function.
+  
+    Equivalent to the Ember [notEmpty](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/notEmpty) macro.
+  
+    ```js
+    export default class GroceryBagComponent extends Component {
+      groceryBag = ['milk', 'eggs', 'apples'];
+  
+      @notEmpty('groceryBag') hasGroceriesToPutAway; // true
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey - Key for the property to check
+    @return {boolean}
+  */
+  var notEmpty = legacyMacro(Ember.computed.notEmpty);
+
+  exports.notEmpty = notEmpty;
+  /**
+    Where `computed.alias` aliases `get` and `set`, and allows for bidirectional
+    data flow, `computed.oneWay` only provides an aliased `get`. The `set` will
+    not mutate the upstream property, rather causes the current property to
+    become the value set. This causes the downstream property to permanently
+    diverge from the upstream property.
+  
+    Equivalent to the Ember [oneWay](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/oneWay) macro.
+  
+    ```js
+    export default class UserProfileComponent extends Component {
+      firstName = 'Joe';
+  
+      @oneWay('firstName') originalName; // 'Joe'
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey - Key for the property to alias
+    @return {any}
+  */
+  var oneWay = legacyMacro(Ember.computed.oneWay);
+
+  exports.oneWay = oneWay;
+  /**
+    A computed property which performs a logical or on the original values for the
+    provided dependent properties.
+  
+    Equivalent to the Ember [or](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/or) macro.
+  
+    ```js
+    export default class OutfitFeaturesComponent extends Component {
+      hasJacket = true;
+      hasUmbrella = false;
+  
+      @or('hasJacket', 'hasUmbrella') isReadyForRain; // true
+    }
+    ```
+  
+    @function
+    @param {...string} dependentKey - Key for the properties to `or`
+    @return {boolean}
+  */
+  var or = legacyMacro(Ember.computed.or);
+
+  exports.or = or;
+  /**
+    This is a more semantically meaningful alias of `oneWay`, whose name is
+    somewhat ambiguous as to which direction the data flows.
+  
+    Equivalent to the Ember [reads](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/reads) macro.
+  
+    ```js
+    export default class UserProfileComponent extends Component {
+      first = 'Tomster';
+  
+      @reads('first') firstName;
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey - Key for the property to read
+    @return {any}
+  */
+  var reads = legacyMacro(Ember.computed.reads);
+
+  exports.reads = reads;
+  /**
+    A computed property which creates a one way computed property to the original
+    value for property. Where `@reads` provides a one way bindings, `@readOnly`
+    provides a read only one way binding. Very often when using `@reads` one wants
+    to explicitly prevent users from ever setting the property. This prevents the
+    reverse flow, and also throws an exception when it occurs.
+  
+    Equivalent to the Ember [readOnly](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/readOnly) macro.
+  
+    ```js
+    export default class UserProfileComponent extends Component {
+      first = 'Tomster';
+  
+      @readOnly('first') firstName;
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey - Key for the property to read
+    @return {any}
+  */
+  var readOnly = legacyMacro(Ember.computed.readOnly);
+
+  exports.readOnly = readOnly;
+  /**
+    A computed property which returns a new array with all the properties from the
+    first dependent array that are not in the second dependent array.
+  
+    Equivalent to the Ember [setDiff](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/setDiff) macro.
+  
+    ```js
+    export default class FavoriteThingsComponent extends Component {
+      likes = [ 'tacos', 'puppies', 'pizza' ];
+      foods = ['tacos', 'pizza'];
+  
+      @setDiff('likes', 'foods') favoriteThingsThatArentFood; // ['puppies']
+    }
+    ```
+  
+    @function
+    @param {string} setAProperty - Key for the first set
+    @param {string} setBProperty - Key for the first set
+    @return {any[]}
+  */
+  var setDiff = legacyMacro(Ember.computed.setDiff);
+
+  exports.setDiff = setDiff;
+  /**
+    A computed property which returns a new array with all the properties from
+    the first dependent array sorted based on a property or sort function.
+  
+    If a callback method is provided, it should have the following signature:
+  
+    ```js
+    (itemA: any, itemB: any) => number;
+    ```
+    - `itemA` the first item to compare.
+    - `itemB` the second item to compare.
+  
+    This function should return negative number (e.g. `-1`) when `itemA` should
+    come before `itemB`. It should return positive number (e.g. `1`) when
+    `itemA` should come after `itemB`. If the `itemA` and `itemB` are equal this
+    function should return `0`.
+  
+    Therefore, if this function is comparing some numeric values, you can do
+    `itemA - itemB` or `itemA.foo - itemB.foo` instead of explicit if statements.
+  
+    ```js
+    export default class SortNamesComponent extends Component {
+      names = [{name:'Link'},{name:'Zelda'},{name:'Ganon'},{name:'Navi'}];
+  
+      @sort('names')
+      sortedNames(a, b){
+        if (a.name > b.name) {
+          return 1;
+        } else if (a.name < b.name) {
+          return -1;
+        }
+  
+        return 0;
+      } // [{ name:'Ganon' }, { name:'Link' }, { name:'Navi' }, { name:'Zelda' }]
+  
+      // alternative syntax:
+  
+      @sort('names', function(a, b){
+        if (a.name > b.name) {
+          return 1;
+        } else if (a.name < b.name) {
+          return -1;
+        }
+  
+        return 0;
+      }) sortedNames; // [{ name:'Ganon' }, { name:'Link' }, { name:'Navi' }, { name:'Zelda' }]
+    }
+    ```
+  
+    Equivalent to the Ember [sort](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/sort) macro.
+  
+    @function
+    @param {string} dependentKey - The key for the array that should be sorted
+    @param {string[] | (itemA: any, itemB: any) => number} sortDefinition? - Sorting function or sort descriptor
+    @return {any[]}
+  */
+  var sort = legacyMacro(Ember.computed.sort);
+
+  exports.sort = sort;
+  /**
+    A computed property that returns the sum of the values in the dependent array.
+  
+    Equivalent to the Ember [sum](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/sum) macro.
+  
+    ```js
+    export default class SumValuesComponent extends Component {
+      values = [1, 2, 3];
+  
+      @sum('values') total; // 6
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey - Key of the array to sum up
+    @return {number}
+  */
+  var sum = legacyMacro(Ember.computed.sum);
+
+  exports.sum = sum;
+  /**
+    Alias for [uniq](#uniq).
+  
+    Equivalent to the Ember [union](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/union) macro.
+  
+    ```js
+    export default class LikesAndFoodsComponent extends Component {
+      likes = [ 'tacos', 'puppies', 'pizza' ];
+      foods = ['tacos', 'pizza', 'ramen'];
+  
+      @union('likes', 'foods') favorites; // ['tacos', 'puppies', 'pizza', 'ramen']
+    }
+    ```
+  
+    @function
+    @param {...string} dependentKeys - Keys of the arrays to union
+    @return {any[]}
+  */
+  var union = legacyMacro(Ember.computed.union);
+
+  exports.union = union;
+  /**
+    A computed property which returns a new array with all the unique elements from one or more dependent arrays.
+  
+    Equivalent to the Ember [uniq](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/uniq) macro.
+  
+    ```js
+    export default class FavoriteThingsComponent extends Component {
+      likes = [ 'tacos', 'puppies', 'pizza' ];
+      foods = ['tacos', 'pizza', 'ramen'];
+  
+      @uniq('likes', 'foods') favorites; // ['tacos', 'puppies', 'pizza', 'ramen']
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey - Key of the array to uniq
+    @return {any[]}
+  */
+  var uniq = legacyMacro(Ember.computed.uniq);
+
+  exports.uniq = uniq;
+  /**
+    A computed property which returns a new array with all the unique elements
+    from an array, with uniqueness determined by a specific key.
+  
+    Equivalent to the Ember [uniqBy](https://emberjs.com/api/ember/3.1/functions/@ember%2Fobject%2Fcomputed/uniqBy) macro.
+  
+    ```js
+    export default class FruitBowlComponent extends Component {
+      fruits = [
+        { name: 'banana', color: 'yellow' },
+        { name: 'apple',  color: 'red' },
+        { name: 'kiwi',   color: 'brown' },
+        { name: 'cherry', color: 'red' },
+        { name: 'lemon',  color: 'yellow' }
+      ];
+  
+      @uniqBy('fruits', 'color') oneOfEachColor;
+      // [
+      //  { name: 'banana', color: 'yellow'},
+      //  { name: 'apple',  color: 'red'},
+      //  { name: 'kiwi',   color: 'brown'}
+      // ]
+    }
+    ```
+  
+    @function
+    @param {string} dependentKey - Key of the array to uniq
+    @param {string} propertyKey - Key of the property on the objects of the array to determine uniqueness by
+    @return {any[]}
+  */
+  var uniqBy = true ? legacyMacro(Ember.computed.uniqBy) : function () {
+    true && !false && Ember.assert('uniqBy is only available from Ember.js v2.7 onwards.', false);
+  };
+  exports.uniqBy = uniqBy;
+});
+define('@ember-decorators/object/index', ['exports', '@ember-decorators/utils/collapse-proto', '@ember-decorators/utils/compatibility', '@ember-decorators/utils/computed'], function (exports, _emberDecoratorsUtilsCollapseProto, _emberDecoratorsUtilsCompatibility, _emberDecoratorsUtilsComputed) {
+  'use strict';
+
+  exports.action = action;
+  function _toConsumableArray(arr) {
+    if (Array.isArray(arr)) {
+      for (var i = 0, arr2 = Array(arr.length); i < arr.length; i++) {
+        arr2[i] = arr[i];
+      }return arr2;
+    } else {
+      return Array.from(arr);
+    }
+  }
+
+  /**
+    Decorator that turns the target function into an Action
+  
+    Adds an `actions` object to the target object and creates a passthrough
+    function that calls the original. This means the function still exists
+    on the original object, and can be used directly.
+  
+    ```js
+    export default class ActionDemoComponent extends Component {
+      @action
+      foo() {
+        // do something
+      }
+    }
+    ```
+  
+    ```hbs
+    <!-- template.hbs -->
+    <button onclick={{action "foo"}}>Execute foo action</button>
+    ```
+  
+    @return {Function}
+  */
+
+  function action(target, key, desc) {
+    true && !(desc && typeof desc.value === 'function') && Ember.assert('The @action decorator must be applied to functions', desc && typeof desc.value === 'function');
+
+    (0, _emberDecoratorsUtilsCollapseProto['default'])(target);
+
+    if (false) {
+      if (!target.hasOwnProperty('_actions')) {
+        var parentActions = target._actions;
+        target._actions = parentActions ? Object.create(parentActions) : {};
+      }
+
+      target._actions[key] = desc.value;
+    } else {
+      if (!target.hasOwnProperty('actions')) {
+        var _parentActions = target.actions;
+        target.actions = _parentActions ? Object.create(_parentActions) : {};
+      }
+
+      target.actions[key] = desc.value;
+    }
+
+    return desc;
+  }
+
+  /**
+    Decorator that turns a native getter/setter into a computed property. Note
+    that though they use getters and setters, you must still use the Ember `get`/
+    `set` functions to get and set their values.
+  
+    ```js
+    import Component from '@ember/component';
+    import { computed } from 'ember-decorators/object';
+  
+    export default class UserProfileComponent extends Component {
+      first = 'John';
+      last = 'Smith';
+  
+      @computed('first', 'last')
+      get name() {
+        const first = this.get('first');
+        const last = this.get('last');
+  
+        return `${first} ${last}`; // => 'John Smith'
+      }
+  
+      set name(value) {
+        if (typeof value !== 'string' || !value.test(/^[a-z]+ [a-z]+$/i)) {
+          throw new TypeError('Invalid name');
+        }
+  
+        const [first, last] = value.split(' ');
+        this.setProperties({ first, last });
+  
+        return value;
+      }
+    }
+    ```
+  
+    @function
+    @param {...string} propertyNames - List of property keys this computed is dependent on
+    @return {ComputedProperty}
+  */
+  var computed = (0, _emberDecoratorsUtilsComputed.computedDecoratorWithParams)(function (target, key, desc, params) {
+    true && !!desc.isDescriptor && Ember.assert('ES6 property getters/setters only need to be decorated once, \'' + key + '\' was decorated on both the getter and the setter', !desc.isDescriptor);
+    true && !('get' in desc || 'set' in desc) && Ember.assert('Attempted to apply @computed to ' + key + ', but it is not a native accessor function. Try converting it to `get ' + key + '()`', 'get' in desc || 'set' in desc);
+    true && !('get' in desc && desc.get !== undefined) && Ember.assert('Using @computed for only a setter does not make sense. Add a getter for \'' + key + '\' as well or remove the @computed decorator.', 'get' in desc && desc.get !== undefined);
+    var get = desc.get,
+        set = desc.set;
+
+    // Unset the getter and setter so the descriptor just has a plain value
+
+    desc.get = undefined;
+    desc.set = undefined;
+
+    var setter = void 0;
+
+    if (typeof set === 'function') {
+      setter = function setter(key, value) {
+        var ret = set.call(this, value);
+        return typeof ret === 'undefined' ? get.call(this) : ret;
+      };
+    } else if (true) {
+      setter = function setter() {
+        true && !false && Ember.assert('You must provide a setter in order to set \'' + key + '\' as a computed property.', false);
+      };
+
+      // Set flag to assert on redundant @readOnly
+      setter.isMissingSetter = true;
+    }
+
+    return _emberDecoratorsUtilsCompatibility.computed.apply(undefined, _toConsumableArray(params).concat([{ get: get, set: setter }]));
+  });
+
+  exports.computed = computed;
+  /**
+    Decorator that modifies a computed property to be read only.
+  
+    ```js
+    import Component from '@ember/component';
+    import { computed, readOnly } from 'ember-decorators/object';
+  
+    export default class extends Component {
+      @readOnly
+      @computed('first', 'last')
+      name(first, last) {
+        return `${first} ${last}`;
+      }
+    }
+    ```
+  
+    @deprecated
+    @function
+    @return {ComputedProperty}
+  */
+  var readOnly = (0, _emberDecoratorsUtilsComputed.computedDecorator)(function (target, name, desc) {
+    true && !(desc && desc.isDescriptor) && Ember.assert('Attempted to apply @readOnly to \'' + name + '\', but it was not a computed property. Note that @readOnly must come before computed decorators', desc && desc.isDescriptor);
+    true && !(!desc._setter || !desc._setter.isMissingSetter) && Ember.assert('Attempted to apply @readOnly to a computed property that didn\'t have a setter, which is unnecessary', !desc._setter || !desc._setter.isMissingSetter);
+    true && !false && Ember.deprecate('Used @readOnly decorator on ' + name + '. The @readOnly decorator (imported from \'@ember-decorators/object) has been deprecated and will be removed in future releases. To make a computed property readOnly, remove its \'set\' function', false, { until: '3.0.0', id: 'ember-decorators-read-only-decorator' });
+
+    return desc.readOnly();
+  });
+  exports.readOnly = readOnly;
+});
+define('@ember-decorators/service/index', ['exports', '@ember-decorators/utils/computed'], function (exports, _emberDecoratorsUtilsComputed) {
+  'use strict';
+
+  function _toConsumableArray(arr) {
+    if (Array.isArray(arr)) {
+      for (var i = 0, arr2 = Array(arr.length); i < arr.length; i++) {
+        arr2[i] = arr[i];
+      }return arr2;
+    } else {
+      return Array.from(arr);
+    }
+  }
+
+  /**
+    Decorator that injects a service into the object as the decorated property
+  
+     ```javascript
+    import Component from '@ember/component';
+    import { service } from 'ember-decorators/service';
+  
+    export default class StoreInjectedComponent extends Component
+      @service store;
+    }
+    ```
+  
+    @function
+    @param {string} serviceName? - The name of the service to inject. If not provided, the property name will be used
+    @return {Service}
+  */
+  var service = (0, _emberDecoratorsUtilsComputed.computedDecoratorWithParams)(function (target, key, desc, params) {
+    return params.length > 0 ? Ember.inject.service.apply(undefined, _toConsumableArray(params)) : Ember.inject.service(key);
+  });
+  exports.service = service;
+});
+define("@ember-decorators/utils/-private/descriptor", ["exports"], function (exports) {
+  "use strict";
+
+  exports.isComputedDescriptor = isComputedDescriptor;
+  exports.computedDescriptorFor = computedDescriptorFor;
+  var _typeof = typeof Symbol === "function" && typeof Symbol.iterator === "symbol" ? function (obj) {
+    return typeof obj;
+  } : function (obj) {
+    return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj;
+  };
+
+  var DESCRIPTOR = '__DESCRIPTOR__';
+
+  function isCPGetter(getter) {
+    // Hack for descriptor traps, we want to be able to tell if the function
+    // is a descriptor trap before we call it at all
+    return getter !== null && typeof getter === 'function' && getter.toString().indexOf('CPGETTER_FUNCTION') !== -1;
+  }
+
+  function isDescriptorTrap(possibleDesc) {
+    if (false && true) {
+      return possibleDesc !== null && (typeof possibleDesc === 'undefined' ? 'undefined' : _typeof(possibleDesc)) === 'object' && possibleDesc[DESCRIPTOR] !== undefined;
+    } else {
+      throw new Error('Cannot call `isDescriptorTrap` in production');
+    }
+  }
+
+  function isComputedDescriptor(possibleDesc) {
+    return possibleDesc !== null && (typeof possibleDesc === 'undefined' ? 'undefined' : _typeof(possibleDesc)) === 'object' && possibleDesc.isDescriptor;
+  }
+
+  function computedDescriptorFor(obj, keyName) {
+    true && !(obj !== null) && Ember.assert('Cannot call `descriptorFor` on null', obj !== null);
+    true && !(obj !== undefined) && Ember.assert('Cannot call `descriptorFor` on undefined', obj !== undefined);
+    true && !((typeof obj === 'undefined' ? 'undefined' : _typeof(obj)) === 'object' || typeof obj === 'function') && Ember.assert('Cannot call `descriptorFor` on ' + (typeof obj === 'undefined' ? 'undefined' : _typeof(obj)), (typeof obj === 'undefined' ? 'undefined' : _typeof(obj)) === 'object' || typeof obj === 'function');
+
+    if (false) {
+      var meta = Ember.meta(obj);
+
+      if (meta !== undefined && _typeof(meta._descriptors) === 'object') {
+        // TODO: Just return the standard descriptor
+        return meta._descriptors[keyName];
+      }
+    } else if (Object.hasOwnProperty.call(obj, keyName)) {
+      var _Object$getOwnPropert = Object.getOwnPropertyDescriptor(obj, keyName),
+          possibleDesc = _Object$getOwnPropert.value,
+          possibleCPGetter = _Object$getOwnPropert.get;
+
+      if (true && false && isCPGetter(possibleCPGetter)) {
+        possibleDesc = possibleCPGetter.call(obj);
+
+        if (isDescriptorTrap(possibleDesc)) {
+          return possibleDesc[DESCRIPTOR];
+        }
+      }
+
+      return isComputedDescriptor(possibleDesc) ? possibleDesc : undefined;
+    }
+  }
+});
+define('@ember-decorators/utils/-private/index', ['exports', '@ember-decorators/utils/-private/descriptor'], function (exports, _emberDecoratorsUtilsPrivateDescriptor) {
+  'use strict';
+
+  Object.defineProperty(exports, 'computedDescriptorFor', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsUtilsPrivateDescriptor.computedDescriptorFor;
+    }
+  });
+  Object.defineProperty(exports, 'isComputedDescriptor', {
+    enumerable: true,
+    get: function get() {
+      return _emberDecoratorsUtilsPrivateDescriptor.isComputedDescriptor;
+    }
+  });
+});
+define('@ember-decorators/utils/collapse-proto', ['exports'], function (exports) {
+  'use strict';
+
+  exports['default'] = collapseProto;
+
+  function collapseProto(target) {
+    // We must collapse the superclass prototype to make sure that the `actions`
+    // object will exist. Since collapsing doesn't generally happen until a class is
+    // instantiated, we have to do it manually.
+    var superClass = Object.getPrototypeOf(target.constructor);
+
+    if (superClass.hasOwnProperty('proto') && typeof superClass.proto === 'function') {
+      superClass.proto();
+    }
+  }
+});
+define('@ember-decorators/utils/compatibility', ['exports'], function (exports) {
+  'use strict';
+
+  var computed = void 0;
+
+  if (true) {
+    exports.computed = computed = Ember.computed;
+  } else {
+    exports.computed = computed = function computed() {
+      for (var _len = arguments.length, params = Array(_len), _key = 0; _key < _len; _key++) {
+        params[_key] = arguments[_key];
+      }
+
+      var desc = params.pop();
+
+      if (typeof desc === 'function') {
+        return Ember.computed.apply(undefined, params.concat([desc]));
+      } else if ('set' in desc) {
+        var get = desc.get,
+            set = desc.set;
+
+        return Ember.computed.apply(undefined, params.concat([function (key, value) {
+          if (arguments.length > 1) {
+            return set.call(this, key, value);
+          }
+
+          return get.call(this);
+        }]));
+      } else {
+        return Ember.computed.apply(undefined, params.concat([desc.get]));
+      }
+    };
+  }
+
+  exports.computed = computed;
+});
+define('@ember-decorators/utils/computed', ['exports', '@ember-decorators/utils/decorator', '@ember-decorators/utils/-private'], function (exports, _emberDecoratorsUtilsDecorator, _emberDecoratorsUtilsPrivate) {
+  'use strict';
+
+  exports.computedDecorator = computedDecorator;
+  exports.computedDecoratorWithParams = computedDecoratorWithParams;
+  exports.computedDecoratorWithRequiredParams = computedDecoratorWithRequiredParams;
+
+  /**
+   * A macro that receives a decorator function which returns a ComputedProperty,
+   * and defines that property using `Ember.defineProperty`. Conceptually, CPs
+   * are custom property descriptors that require Ember's intervention to apply
+   * correctly. In the future, we will use finishers to define the CPs rather than
+   * directly defining them in the decorator function.
+   *
+   * @param {Function} fn - decorator function
+   */
+
+  function computedDecorator(fn) {
+    return function (target, key, desc, params) {
+      var previousDesc = (0, _emberDecoratorsUtilsPrivate.computedDescriptorFor)(target, key) || desc;
+      var computedDesc = fn(target, key, previousDesc, params);
+
+      true && !(0, _emberDecoratorsUtilsPrivate.isComputedDescriptor)(computedDesc) && Ember.assert('computed decorators must return an instance of an Ember ComputedProperty descriptor, received ' + computedDesc, (0, _emberDecoratorsUtilsPrivate.isComputedDescriptor)(computedDesc));
+
+      if (!false) {
+        // Until recent versions of Ember, computed properties would be defined
+        // by just setting them. We need to blow away any predefined properties
+        // (getters/setters, etc.) to allow Ember.defineProperty to work correctly.
+        Object.defineProperty(target, key, {
+          configurable: true,
+          writable: true,
+          enumerable: true,
+          value: undefined
+        });
+      }
+
+      Ember.defineProperty(target, key, computedDesc);
+
+      // There's currently no way to disable redefining the property when decorators
+      // are run, so return the property descriptor we just assigned
+      return Object.getOwnPropertyDescriptor(target, key);
+    };
+  }
+
+  function computedDecoratorWithParams(fn) {
+    return (0, _emberDecoratorsUtilsDecorator.decoratorWithParams)(computedDecorator(fn));
+  }
+
+  function computedDecoratorWithRequiredParams(fn) {
+    return (0, _emberDecoratorsUtilsDecorator.decoratorWithRequiredParams)(computedDecorator(fn));
+  }
+});
+define("@ember-decorators/utils/decorator", ["exports"], function (exports) {
+  "use strict";
+
+  exports.decoratorWithParams = decoratorWithParams;
+  exports.decoratorWithRequiredParams = decoratorWithRequiredParams;
+  var _typeof = typeof Symbol === "function" && typeof Symbol.iterator === "symbol" ? function (obj) {
+    return typeof obj;
+  } : function (obj) {
+    return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj;
+  };
+
+  var _slicedToArray = (function () {
+    function sliceIterator(arr, i) {
+      var _arr = [];var _n = true;var _d = false;var _e = undefined;try {
+        for (var _i = arr[Symbol.iterator](), _s; !(_n = (_s = _i.next()).done); _n = true) {
+          _arr.push(_s.value);if (i && _arr.length === i) break;
+        }
+      } catch (err) {
+        _d = true;_e = err;
+      } finally {
+        try {
+          if (!_n && _i["return"]) _i["return"]();
+        } finally {
+          if (_d) throw _e;
+        }
+      }return _arr;
+    }return function (arr, i) {
+      if (Array.isArray(arr)) {
+        return arr;
+      } else if (Symbol.iterator in Object(arr)) {
+        return sliceIterator(arr, i);
+      } else {
+        throw new TypeError("Invalid attempt to destructure non-iterable instance");
+      }
+    };
+  })();
+
+  function isDescriptor(possibleDesc) {
+    if (possibleDesc.length === 3) {
+      var _possibleDesc = _slicedToArray(possibleDesc, 3),
+          target = _possibleDesc[0],
+          key = _possibleDesc[1],
+          desc = _possibleDesc[2];
+
+      return (typeof target === 'undefined' ? 'undefined' : _typeof(target)) === 'object' && target !== null && typeof key === 'string' && ((typeof desc === 'undefined' ? 'undefined' : _typeof(desc)) === 'object' && desc !== null && 'enumerable' in desc && 'configurable' in desc || desc === undefined) // TS compatibility
+      ;
+    }
+
+    return false;
+  }
+
+  /**
+   * A macro that takes a decorator function and allows it to optionally
+   * receive parameters
+   *
+   * ```js
+   * let foo = decoratorWithParams((target, desc, key, params) => {
+   *   console.log(params);
+   * });
+   *
+   * class {
+   *   @foo bar; // undefined
+   *   @foo('bar') baz; // ['bar']
+   * }
+   * ```
+   *
+   * @param {Function} fn - decorator function
+   */
+
+  function decoratorWithParams(fn) {
+    return function () {
+      for (var _len = arguments.length, params = Array(_len), _key = 0; _key < _len; _key++) {
+        params[_key] = arguments[_key];
+      }
+
+      // determine if user called as @computed('blah', 'blah') or @computed
+      if (isDescriptor(params)) {
+        return fn.apply(undefined, params.concat([[]]));
+      } else {
+        return function (target, key, desc) {
+          return fn(target, key, desc, params);
+        };
+      }
+    };
+  }
+
+  /**
+   * A macro that takes a decorator function and requires it to receive
+   * parameters:
+   *
+   * ```js
+   * let foo = decoratorWithRequiredParams((target, desc, key, params) => {
+   *   console.log(params);
+   * });
+   *
+   * class {
+   *   @foo('bar') baz; // ['bar']
+   *   @foo bar; // Error
+   * }
+   * ```
+   *
+   * @param {Function} fn - decorator function
+   */
+
+  function decoratorWithRequiredParams(fn) {
+    return function () {
+      for (var _len2 = arguments.length, params = Array(_len2), _key2 = 0; _key2 < _len2; _key2++) {
+        params[_key2] = arguments[_key2];
+      }
+
+      true && !!isDescriptor(params) && Ember.assert('Cannot decorate member \'' + params[1] + '\' without parameters', !isDescriptor(params));
+
+      return function (target, key, desc) {
+        true && !(params.length > 0) && Ember.assert('Cannot decorate member \'' + key + '\' without parameters', params.length > 0);
+
+        return fn(target, key, desc, params);
+      };
+    };
+  }
+});
+define('active-model-adapter/active-model-adapter', ['exports', 'ember-data', 'ember-inflector'], function (exports, _emberData, _emberInflector) {
   'use strict';
 
   var InvalidError = _emberData['default'].InvalidError,
@@ -66466,6 +72494,14737 @@ define('ember-ajax/utils/url-helpers', ['exports', 'ember-ajax/utils/is-fastboot
 
   exports.RequestURL = RequestURL;
 });
+define('ember-bootstrap/components/base/bs-accordion', ['exports', 'ember-bootstrap/templates/components/bs-accordion', 'ember-bootstrap/utils/listen-to-cp'], function (exports, _emberBootstrapTemplatesComponentsBsAccordion, _emberBootstrapUtilsListenToCp) {
+  'use strict';
+
+  /**
+   Bootstrap-style [accordion group](http://getbootstrap.com/javascript/#collapse-example-accordion),
+   with collapsible/expandable items.
+  
+   ### Usage
+  
+   Use as a block level component with any number of yielded [Components.AccordionItem](Components.AccordionItem.html)
+   components as children:
+  
+   ```handlebars
+    {{#bs-accordion as |acc|}}
+        {{#acc.item value=1 title="First item"}}
+          <p>Lorem ipsum...</p>
+          <button {{action acc.change 2}}>Next</button>
+        {{/acc.item}}
+        {{#acc.item value=2 title="Second item"}}
+          <p>Lorem ipsum...</p>
+        {{/acc.item}}
+        {{#acc.item value=3 title="Third item"}}
+          <p>Lorem ipsum...</p>
+        {{/acc.item}}
+    {{/bs-accordion}}
+   ```
+  
+   In the example above the first accordion item utilizes the yielded `change` action to add some custom behaviour.
+  
+   @class Accordion
+   @namespace Components
+   @extends Ember.Component
+   @public
+   */
+  exports['default'] = Ember.Component.extend({
+    layout: _emberBootstrapTemplatesComponentsBsAccordion['default'],
+    ariaRole: 'tablist',
+
+    /**
+     * The value of the currently selected accordion item. Set this to change selection programmatically.
+     *
+     * When the selection is changed by user interaction this property will not update by using two-way bindings in order
+     * to follow DDAU best practices. If you want to react to such changes, subscribe to the `onChange` action
+     *
+     * @property selected
+     * @public
+     */
+    selected: null,
+
+    /**
+     * The value of the currently selected accordion item
+     *
+     * @property isSelected
+     * @private
+     */
+    isSelected: (0, _emberBootstrapUtilsListenToCp['default'])('selected'),
+
+    /**
+     * Action when the selected accordion item is about to be changed.
+     *
+     * You can return false to prevent changing the active item, and do that in your action by
+     * setting the `selected` accordingly.
+     *
+     * @event onChange
+     * @param newValue
+     * @param oldValue
+     * @public
+     */
+    onChange: function onChange(newValue, oldValue) {},
+    // eslint-disable-line no-unused-vars
+
+    actions: {
+      change: function change(newValue) {
+        var oldValue = this.get('isSelected');
+        if (oldValue === newValue) {
+          newValue = null;
+        }
+        if (this.get('onChange')(newValue, oldValue) !== false) {
+          this.set('isSelected', newValue);
+        }
+      }
+    }
+
+  });
+});
+define('ember-bootstrap/components/base/bs-accordion/item', ['exports', 'ember-bootstrap/mixins/type-class', 'ember-bootstrap/templates/components/bs-accordion/item'], function (exports, _emberBootstrapMixinsTypeClass, _emberBootstrapTemplatesComponentsBsAccordionItem) {
+  'use strict';
+
+  /**
+   A collapsible/expandable item within an accordion
+  
+   See [Components.Accordion](Components.Accordion.html) for examples.
+  
+   @class AccordionItem
+   @namespace Components
+   @extends Ember.Component
+   @uses Mixins.TypeClass
+   @public
+   */
+  exports['default'] = Ember.Component.extend(_emberBootstrapMixinsTypeClass['default'], {
+    layout: _emberBootstrapTemplatesComponentsBsAccordionItem['default'],
+
+    /**
+     * The title of the accordion item, displayed as a .panel-title element
+     *
+     * @property title
+     * @type string
+     * @public
+     */
+    title: null,
+
+    /**
+     * The value of the accordion item, which is used as the value of the `selected` property of the parent [Components.Accordion](Components.Accordion.html) component
+     *
+     * @property value
+     * @public
+     */
+    value: Ember.computed.oneWay('elementId'),
+
+    /**
+     * @property selected
+     * @private
+     */
+    selected: null,
+
+    /**
+     * @property collapsed
+     * @type boolean
+     * @readonly
+     * @private
+     */
+    collapsed: Ember.computed('value', 'selected', function () {
+      return this.get('value') !== this.get('selected');
+    }).readOnly(),
+
+    /**
+     * @property active
+     * @type boolean
+     * @readonly
+     * @private
+     */
+    active: Ember.computed.not('collapsed'),
+
+    /**
+     * Reference to the parent `Components.Accordion` class.
+     *
+     * @property accordion
+     * @private
+     */
+    accordion: null,
+
+    /**
+     * @event onClick
+     * @public
+     */
+    onClick: function onClick() {}
+  });
+});
+define('ember-bootstrap/components/base/bs-accordion/item/body', ['exports', 'ember-bootstrap/templates/components/bs-accordion/body'], function (exports, _emberBootstrapTemplatesComponentsBsAccordionBody) {
+  'use strict';
+
+  /**
+   Component for an accordion item body.
+  
+   See [Components.Accordion](Components.Accordion.html) for examples.
+  
+   @class AccordionBody
+   @namespace Components
+   @extends Ember.Component
+   @public
+   */
+  exports['default'] = Ember.Component.extend({
+    layout: _emberBootstrapTemplatesComponentsBsAccordionBody['default'],
+    tagName: '',
+
+    /**
+     * @property collapsed
+     * @type boolean
+     * @public
+     */
+    collapsed: null
+
+  });
+});
+define('ember-bootstrap/components/base/bs-accordion/item/title', ['exports', 'ember-bootstrap/templates/components/bs-accordion/title'], function (exports, _emberBootstrapTemplatesComponentsBsAccordionTitle) {
+  'use strict';
+
+  /**
+   Component for an accordion item title.
+  
+   See [Components.Accordion](Components.Accordion.html) for examples.
+  
+   @class AccordionTitle
+   @namespace Components
+   @extends Ember.Component
+   @public
+   */
+  exports['default'] = Ember.Component.extend({
+    layout: _emberBootstrapTemplatesComponentsBsAccordionTitle['default'],
+    ariaRole: 'tab',
+    classNameBindings: ['collapsed:collapsed:expanded'],
+
+    /**
+     * @property collapsed
+     * @type boolean
+     * @public
+     */
+    collapsed: null,
+
+    /**
+     * @event onClick
+     * @public
+     */
+    onClick: function onClick() {},
+    click: function click(e) {
+      e.preventDefault();
+      this.get('onClick')();
+    }
+  });
+});
+define('ember-bootstrap/components/base/bs-alert', ['exports', 'ember-bootstrap/mixins/transition-support', 'ember-bootstrap/templates/components/bs-alert', 'ember-bootstrap/mixins/type-class', 'ember-bootstrap/utils/listen-to-cp'], function (exports, _emberBootstrapMixinsTransitionSupport, _emberBootstrapTemplatesComponentsBsAlert, _emberBootstrapMixinsTypeClass, _emberBootstrapUtilsListenToCp) {
+  'use strict';
+
+  /**
+   Implements [Bootstrap alerts](http://getbootstrap.com/components/#alerts)
+  
+   ### Usage
+  
+   By default it is a user dismissible alert with a fade out animation, both of which can be disabled. Be sure to set the
+   `type` property for proper styling.
+  
+   ```hbs
+   {{#bs-alert type="success"}}
+   <strong>Well done!</strong> You successfully read this important alert message.
+   {{/bs-alert}}
+   ```
+  
+   @class Alert
+   @namespace Components
+   @extends Ember.Component
+   @uses Mixins.TypeClass
+   @uses Mixins.TransitionSupport
+   @public
+   */
+  exports['default'] = Ember.Component.extend(_emberBootstrapMixinsTypeClass['default'], _emberBootstrapMixinsTransitionSupport['default'], {
+    layout: _emberBootstrapTemplatesComponentsBsAlert['default'],
+    classNameBindings: ['alert', 'fade', 'dismissible:alert-dismissible'],
+
+    /**
+     * A dismissible alert will have a close button in the upper right corner, that the user can click to dismiss
+     * the alert.
+     *
+     * @property dismissible
+     * @type boolean
+     * @default true
+     * @public
+     */
+    dismissible: true,
+
+    /**
+     * If true the alert is completely hidden. Will be set when the fade animation has finished.
+     *
+     * @property hidden
+     * @type boolean
+     * @default false
+     * @readonly
+     * @private
+     */
+    hidden: false,
+
+    /**
+     * This property controls if the alert should be visible. If false it might still be in the DOM until the fade animation
+     * has completed.
+     *
+     * When the alert is dismissed by user interaction this property will not update by using two-way bindings in order
+     * to follow DDAU best practices. If you want to react to such changes, subscribe to the `onDismiss` action
+     *
+     * @property visible
+     * @type boolean
+     * @default true
+     * @public
+     */
+    visible: true,
+
+    /**
+     * @property _visible
+     * @private
+     */
+    _visible: (0, _emberBootstrapUtilsListenToCp['default'])('visible'),
+
+    /**
+     * @property notVisible
+     * @private
+     */
+    notVisible: Ember.computed.not('_visible'),
+
+    /**
+     * Set to false to disable the fade out animation when hiding the alert.
+     *
+     * @property fade
+     * @type boolean
+     * @default true
+     * @public
+     */
+    fade: true,
+
+    /**
+     * Computed property to set the alert class to the component div. Will be false when dismissed to have the component
+     * div (which cannot be removed form DOM by the component itself) without any markup.
+     *
+     * @property alert
+     * @type boolean
+     * @private
+     */
+    alert: Ember.computed.not('hidden'),
+    showAlert: Ember.computed.and('_visible', 'fade'),
+
+    /**
+     * @property classTypePrefix
+     * @type String
+     * @default 'alert'
+     * @private
+     */
+    classTypePrefix: 'alert',
+
+    /**
+     * The duration of the fade out animation
+     *
+     * @property fadeDuration
+     * @type number
+     * @default 150
+     * @public
+     */
+    fadeDuration: 150,
+
+    /**
+     * The action to be sent after the alert has been dismissed (including the CSS transition).
+     *
+     * @event onDismissed
+     * @public
+     */
+    onDismissed: function onDismissed() {},
+
+    /**
+     * The action is called when the close button is clicked.
+     *
+     * You can return false to prevent closing the alert automatically, and do that in your action by
+     * setting `visible` to false.
+     *
+     * @event onDismiss
+     * @public
+     */
+    onDismiss: function onDismiss() {},
+
+    actions: {
+      dismiss: function dismiss() {
+        if (this.get('onDismiss')() !== false) {
+          this.set('_visible', false);
+        }
+      }
+    },
+
+    /**
+     * Call to make the alert visible again after it has been hidden
+     *
+     * @method show
+     * @private
+     */
+    show: function show() {
+      this.set('hidden', false);
+    },
+
+    /**
+     * Call to hide the alert. If the `fade` property is true, this will fade out the alert before being finally
+     * dismissed.
+     *
+     * @method hide
+     * @private
+     */
+    hide: function hide() {
+      if (this.get('usesTransition')) {
+        Ember.run.later(this, function () {
+          if (!this.get('isDestroyed')) {
+            this.set('hidden', true);
+            this.get('onDismissed')();
+          }
+        }, this.get('fadeDuration'));
+      } else {
+        this.set('hidden', true);
+        this.get('onDismissed')();
+      }
+    },
+    init: function init() {
+      this._super.apply(this, arguments);
+      this.set('hidden', !this.get('_visible'));
+    },
+
+    _observeIsVisible: Ember.observer('_visible', function () {
+      if (this.get('_visible')) {
+        this.show();
+      } else {
+        this.hide();
+      }
+    })
+  });
+});
+define('ember-bootstrap/components/base/bs-button-group', ['exports', 'ember-bootstrap/templates/components/bs-button-group', 'ember-bootstrap/mixins/size-class'], function (exports, _emberBootstrapTemplatesComponentsBsButtonGroup, _emberBootstrapMixinsSizeClass) {
+  'use strict';
+
+  /**
+   Bootstrap-style button group, that visually groups buttons, and optionally adds radio/checkbox like behaviour.
+   See http://getbootstrap.com/components/#btn-groups
+  
+   Use as a block level component with any number of [Components.Button](Components.Button.html) components provided as
+   a yielded pre-configured contextual component:
+  
+   ```handlebars
+   {{#bs-button-group as |bg|}}
+     {{#bg.button}}1{{/bg.button}}
+     {{#bg.button}}2{{/s-bg.button}}
+     {{#bg.button}}3{{/bg.button}}
+   {{/bs-button-group}}
+   ```
+  
+   ### Radio-like behaviour
+  
+   Use the `type` property set to "radio" to make the child buttons toggle like radio buttons, i.e. only one button can be active.
+   Set the `value` property of the buttons to something meaningful. The `value` property of the button group will then reflect
+   the value of the active button:
+  
+   ```handlebars
+   {{#bs-button-group value=buttonGroupValue type="radio" onChange=(action (mut buttonGroupValue)) as |bg|}}
+     {{#bg.button type="default" value=1}}1{{/bg.button}}
+     {{#bg.button type="default" value=2}}2{{/bg.button}}
+     {{#bg.button type="default" value=3}}3{{/bg.button}}
+   {{/bs-button-group}}
+  
+   You selected: {{buttonGroupValue}}!
+   ```
+  
+   ### Checkbox-like behaviour
+  
+   Set `type` to "checkbox" to make any number of child buttons selectable. The `value` property will be an array
+   of all the values of the active buttons:
+  
+   ```handlebars
+   {{#bs-button-group value=buttonGroupValue type="checkbox" onChange=(action (mut buttonGroupValue)) as |bg|}}
+     {{#bg.button type="default" value=1}}1{{/bg.button}}
+     {{#bg.button type="default" value=2}}2{{/bg.button}}
+     {{#bg.button type="default" value=3}}3{{/bg.button}}
+   {{/bs-button-group}}
+  
+   You selected:
+   <ul>
+   {{#each value in buttonGroupValue}}
+     <li>{{value}}</li>
+   {{/each}}
+   </ul>
+   ```
+  
+   @class ButtonGroup
+   @namespace Components
+   @extends Ember.Component
+   @uses Mixins.SizeClass
+   @public
+   */
+  exports['default'] = Ember.Component.extend(_emberBootstrapMixinsSizeClass['default'], {
+    layout: _emberBootstrapTemplatesComponentsBsButtonGroup['default'],
+    ariaRole: 'group',
+    classNameBindings: ['vertical:btn-group-vertical:btn-group', 'justified:btn-group-justified'],
+
+    /**
+     * @property classTypePrefix
+     * @type String
+     * @default 'btn-group'
+     * @protected
+     */
+    classTypePrefix: 'btn-group',
+
+    /**
+     * Set to true for a vertically stacked button group, see http://getbootstrap.com/components/#btn-groups-vertical
+     *
+     * @property vertical
+     * @type boolean
+     * @default false
+     * @public
+     */
+    vertical: false,
+
+    /**
+     * Set to true for the buttons to stretch at equal sizes to span the entire width of its parent.
+     *
+     * *Important*: You have to wrap every button component in a `div class="btn-group">`:
+     *
+     * ```handlebars
+     * <div class="btn-group" role="group">
+     * {{#bs-button}}My Button{{/bs-button}}
+     * </div>
+     * ```
+     *
+     * See http://getbootstrap.com/components/#btn-groups-justified
+     *
+     * @property justified
+     * @type boolean
+     * @default false
+     * @public
+     */
+    justified: false,
+
+    /**
+     * The type of the button group specifies how child buttons behave and how the `value` property will be computed:
+     *
+     * ### null
+     * If `type` is not set (null), the button group will add no functionality besides Bootstrap styling
+     *
+     * ### radio
+     * if `type` is set to "radio", the buttons will behave like radio buttons:
+     * * the `value` property of the button group will reflect the `value` property of the active button
+     * * thus only one button may be active
+     *
+     * ### checkbox
+     * if `type` is set to "checkbox", the buttons will behave like checkboxes:
+     * * any number of buttons may be active
+     * * the `value` property of the button group will be an array containing the `value` properties of all active buttons
+     *
+     * @property type
+     * @type string
+     * @default null
+     * @public
+     */
+    type: null,
+
+    /**
+     * The value of the button group, computed by its child buttons.
+     * See the `type` property for how the value property is constructed.
+     *
+     * When you set the value, the corresponding buttons will be activated:
+     * * use a single value for a radio button group to activate the button with the same value
+     * * use an array of values for a checkbox button group to activate all the buttons with values contained in the array
+     *
+     * @property value
+     * @type array
+     * @public
+     */
+    value: undefined,
+
+    /**
+     * @property isRadio
+     * @type boolean
+     * @private
+     */
+    isRadio: Ember.computed.equal('type', 'radio').readOnly(),
+
+    /**
+     * This action is called whenever the button group's value should be changed because the user clicked a button.
+     * You will receive the new value of the button group (based on the `type` property), which you should use to update the
+     * `value` property.
+     *
+     * @event onChange
+     * @param {*} value
+     * @public
+     */
+    onChange: function onChange() {},
+
+    actions: {
+      buttonPressed: function buttonPressed(pressedValue) {
+        var newValue = Ember.copy(this.get('value'));
+
+        if (this.get('isRadio')) {
+          if (newValue !== pressedValue) {
+            newValue = pressedValue;
+          }
+        } else {
+          if (!Ember.isArray(newValue)) {
+            newValue = Ember.A([pressedValue]);
+          } else {
+            newValue = Ember.A(newValue);
+            if (newValue.includes(pressedValue)) {
+              newValue.removeObject(pressedValue);
+            } else {
+              newValue.pushObject(pressedValue);
+            }
+          }
+        }
+
+        this.get('onChange')(newValue);
+      }
+    }
+  });
+});
+define('ember-bootstrap/components/base/bs-button-group/button', ['exports', 'ember-bootstrap/components/bs-button'], function (exports, _emberBootstrapComponentsBsButton) {
+  'use strict';
+
+  /**
+   Internal component for button-group buttons
+  
+   @class ButtonGroupButton
+   @namespace Components
+   @extends Components.Button
+   @private
+   */
+  exports['default'] = _emberBootstrapComponentsBsButton['default'].extend({
+
+    /**
+     * @property groupValue
+     * @private
+     */
+    groupValue: null,
+
+    /**
+     * @property buttonGroupType
+     * @type string
+     * @private
+     */
+    buttonGroupType: false,
+
+    /**
+     * @property active
+     * @type boolean
+     * @readonly
+     * @private
+     */
+    active: Ember.computed('buttonGroupType', 'groupValue.[]', 'value', function () {
+      var _getProperties = this.getProperties('value', 'groupValue'),
+          value = _getProperties.value,
+          groupValue = _getProperties.groupValue;
+
+      if (this.get('buttonGroupType') === 'radio') {
+        return value === groupValue;
+      } else {
+        if (Ember.isArray(groupValue)) {
+          return groupValue.indexOf(value) !== -1;
+        }
+      }
+      return false;
+    }).readOnly()
+
+  });
+});
+define('ember-bootstrap/components/base/bs-button', ['exports', 'ember-bootstrap/templates/components/bs-button', 'ember-bootstrap/mixins/type-class', 'ember-bootstrap/mixins/size-class'], function (exports, _emberBootstrapTemplatesComponentsBsButton, _emberBootstrapMixinsTypeClass, _emberBootstrapMixinsSizeClass) {
+  'use strict';
+
+  /**
+   Implements a HTML button element, with support for all [Bootstrap button CSS styles](http://getbootstrap.com/css/#buttons)
+   as well as advanced functionality such as button states.
+  
+   ### Basic Usage
+  
+   ```hbs
+   {{#bs-button type="primary" icon="glyphicon glyphicon-download"}}
+     Downloads
+   {{/bs-button}}
+   ```
+  
+   ### Actions
+  
+   Use the `onClick` property of the component to send an action to your controller. It will receive the button's value
+   (see the `value` property) as an argument.
+  
+   ```hbs
+   {{#bs-button type="primary" icon="glyphicon glyphicon-download" onClick=(action "download")}}
+     Download
+   {{/bs-button}}
+   ```
+  
+   ### States
+  
+   Use the `textState` property to change the label of the button. You can bind it to a controller property to set a "loading" state for example.
+   The label of the button will be taken from the `<state>Text` property.
+  
+   ```hbs
+   {{bs-button type="primary" icon="glyphicon glyphicon-download" textState=buttonState defaultText="Download" loadingText="Loading..." onClick="download"}}
+   ```
+  
+   ```js
+   App.ApplicationController = Ember.Controller.extend({
+     buttonState: "default"
+     actions: {
+       download: function() {
+         this.set("buttonState", "loading");
+       }
+     }
+   });
+   ```
+  
+   ### Promise support for automatic state change
+  
+   When returning a Promise for any asynchronous operation from the `onClick` closure action the button will
+   manage an internal state ("default" > "pending" > "resolved"/"rejected") automatically, changing its label according to the state of the promise:
+  
+   ```hbs
+   {{bs-button type="primary" icon="glyphicon glyphicon-download" defaultText="Download" pendingText="Loading..." resolvedText="Completed!" rejectedText="Oups!?" onClick=(action "download")}}
+   ```
+  
+   ```js
+   // controller.js
+   export default Ember.Controller.extend({
+     actions: {
+       download(value) {
+         return new Ember.RSVP.Promise(...);
+       }
+     }
+   });
+   ```
+  
+   @class Button
+   @namespace Components
+   @extends Ember.Component
+   @uses Mixins.TypeClass
+   @uses Mixins.SizeClass
+   @public
+   */
+  exports['default'] = Ember.Component.extend(_emberBootstrapMixinsTypeClass['default'], _emberBootstrapMixinsSizeClass['default'], {
+    layout: _emberBootstrapTemplatesComponentsBsButton['default'],
+    tagName: 'button',
+    classNames: ['btn'],
+    classNameBindings: ['active', 'block:btn-block'],
+
+    /**
+     * @property classTypePrefix
+     * @type String
+     * @default 'btn'
+     * @private
+     */
+    classTypePrefix: 'btn',
+
+    attributeBindings: ['disabled', 'buttonType:type', 'title'],
+
+    /**
+     * Default label of the button. Not need if used as a block component
+     *
+     * @property defaultText
+     * @type string
+     * @public
+     */
+    defaultText: null,
+
+    /**
+     * Property to disable the button
+     *
+     * @property disabled
+     * @type boolean
+     * @default false
+     * @public
+     */
+    disabled: false,
+
+    /**
+     * Set the type of the button, either 'button' or 'submit'
+     *
+     * @property buttonType
+     * @type String
+     * @default 'button'
+     * @public
+     */
+    buttonType: 'button',
+
+    /**
+     * Set the 'active' class to apply active/pressed CSS styling
+     *
+     * @property active
+     * @type boolean
+     * @default false
+     * @public
+     */
+    active: false,
+
+    /**
+     * Property for block level buttons
+     *
+     * See the [Bootstrap docs](http://getbootstrap.com/css/#buttons-sizes)
+     * @property block
+     * @type boolean
+     * @default false
+     * @public
+     */
+    block: false,
+
+    /**
+     * A click event on a button will not bubble up the DOM tree if it has an `onClick` action handler. Set to true to
+     * enable the event to bubble
+     *
+     * @property bubble
+     * @type boolean
+     * @default false
+     * @public
+     */
+    bubble: false,
+
+    /**
+     * If button is active and this is set, the icon property will match this property
+     *
+     * @property iconActive
+     * @type String
+     * @public
+     */
+    iconActive: null,
+
+    /**
+     * If button is inactive and this is set, the icon property will match this property
+     *
+     * @property iconInactive
+     * @type String
+     * @public
+     */
+    iconInactive: null,
+
+    /**
+     * Class(es) (e.g. glyphicons or font awesome) to use as a button icon
+     * This will render a <i class="{{icon}}"></i> element in front of the button's label
+     *
+     * @property icon
+     * @type String
+     * @readonly
+     * @protected
+     */
+    icon: Ember.computed('active', function () {
+      if (this.get('active')) {
+        return this.get('iconActive');
+      } else {
+        return this.get('iconInactive');
+      }
+    }),
+
+    /**
+     * Supply a value that will be associated with this button. This will be send
+     * as a parameter of the default action triggered when clicking the button
+     *
+     * @property value
+     * @type any
+     * @public
+     */
+    value: null,
+
+    /**
+     * State of the button. The button's label (if not used as a block component) will be set to the
+     * `<state>Text` property.
+     * This property will automatically be set when using a click action that supplies the callback with an promise
+     *
+     * @property textState
+     * @type String
+     * @default 'default'
+     * @protected
+     */
+    textState: 'default',
+
+    /**
+     * Set this to true to reset the state. A typical use case is to bind this attribute with ember-data isDirty flag.
+     *
+     * @property reset
+     * @type boolean
+     * @public
+     */
+    reset: null,
+
+    /**
+     * The HTML title attribute
+     *
+     * @property title
+     * @type string
+     * @public
+     */
+    title: null,
+
+    /**
+     * When clicking the button this action is called with the value of the button (that is the value of the "value" property).
+     * Return a promise object, and the buttons state will automatically set to "pending", "resolved" and/or "rejected".
+     *
+     * The click event will not bubble up, unless you set `bubble` to true.
+     *
+     * @event onClick
+     * @param {*} value
+     * @public
+     */
+    onClick: null,
+
+    /**
+     * This will reset the state property to 'default', and with that the button's label to defaultText
+     *
+     * @method resetState
+     * @protected
+     */
+    resetState: function resetState() {
+      this.set('textState', 'default');
+    },
+
+    resetObserver: Ember.observer('reset', function () {
+      if (this.get('reset')) {
+        Ember.run.scheduleOnce('actions', this, function () {
+          this.set('textState', 'default');
+        });
+      }
+    }),
+
+    text: Ember.computed('textState', 'defaultText', 'pendingText', 'resolvedText', 'rejectedText', function () {
+      return this.getWithDefault(this.get('textState') + 'Text', this.get('defaultText'));
+    }),
+
+    /**
+     * @method click
+     * @private
+     */
+    click: function click() {
+      var _this = this;
+
+      var action = this.get('onClick');
+      if (action !== null) {
+        var promise = action(this.get('value'));
+        if (promise && typeof promise.then === 'function' && !this.get('isDestroyed')) {
+          this.set('textState', 'pending');
+          promise.then(function () {
+            if (!_this.get('isDestroyed')) {
+              _this.set('textState', 'resolved');
+            }
+          }, function () {
+            if (!_this.get('isDestroyed')) {
+              _this.set('textState', 'rejected');
+            }
+          });
+        }
+        return this.get('bubble');
+      }
+    },
+    init: function init() {
+      this._super.apply(this, arguments);
+      this.get('reset');
+    }
+  });
+});
+define('ember-bootstrap/components/base/bs-carousel', ['exports', 'ember-bootstrap/components/bs-carousel/slide', 'ember-bootstrap/mixins/component-parent', 'ember-bootstrap/templates/components/bs-carousel', 'ember-concurrency'], function (exports, _emberBootstrapComponentsBsCarouselSlide, _emberBootstrapMixinsComponentParent, _emberBootstrapTemplatesComponentsBsCarousel, _emberConcurrency) {
+  'use strict';
+
+  function _toConsumableArray(arr) {
+    if (Array.isArray(arr)) {
+      for (var i = 0, arr2 = Array(arr.length); i < arr.length; i++) {
+        arr2[i] = arr[i];
+      }return arr2;
+    } else {
+      return Array.from(arr);
+    }
+  }
+
+  /**
+    Ember implementation of Bootstrap's Carousel. Supports all original features but API is partially different:
+  
+    | Description | Original | Component |
+    | ------ | ------ | ------ |
+    | Autoplays after first user event or on page load. | ride='carousel'\|false | autoPlay=false\|true |
+    | Disable automatic cycle. | interval=false | interval=0 |
+    | If first slide should follow last slide on "previous" event, the opposite will also be true for "next" event. | wrap=false\|true | wrap=false\|true |
+    | Jumps into specific slide index | data-slide-to=n | index=n |
+    | Keyboard events. | keyboard=false\|true | keyboard=false\|true |
+    | Left-to-right or right-to-left sliding. | N/A |  ltr=false\|true |
+    | Pause current cycle on mouse enter. | pause='hover'\|null | pauseOnMouseEnter=false\|true |
+    | Show or hide controls  | Tag manipulation. | showControls=false\|true |
+    | Show or hide indicators  | Tag manipulation. | showIndicators=false\|true |
+    | Waiting time of slides in a automatic cycle. | interval=n | interval=n |
+  
+    Default settings are the same as the original so you don't have to worry about changing parameters.
+  
+   ```hbs
+    {{#bs-carousel as |car|}}
+      {{#car.slide}}
+        <img alt="First slide" src="slide1.jpg">
+      {{/car.slide}}
+      {{#car.slide}}
+        <img alt="Second slide" src="slide2.jpg">
+      {{/car.slide}}
+      {{#car.slide}}
+        <img alt="Third slide" src="slide3.jpg">
+      {{/car.slide}}
+    {{/bs-carousel}}
+   ```
+  
+    To better understand the whole documentation, you should be aware of the following operations:
+  
+    | Operation | Description |
+    | ------ | ------ |
+    | Transition | Swaps two slides. |
+    | Interval | Waiting time after a transition. |
+    | Presentation | Represents a single transition, or a single interval, or the union of both. |
+    | Cycle | Presents all slides until it reaches first or last slide. |
+    | Wrap | wrap slides, cycles without stopping at first or last slide. |
+    ```
+  
+    @class Carousel
+    @namespace Components
+    @extends Ember.Component
+    @public
+   */
+  exports['default'] = Ember.Component.extend(_emberBootstrapMixinsComponentParent['default'], {
+    attributeBindings: ['tabindex'],
+    classNames: ['carousel', 'slide'],
+    layout: _emberBootstrapTemplatesComponentsBsCarousel['default'],
+    tabindex: '1',
+
+    /**
+     * If a slide can turn to left, including corners.
+     *
+     * @private
+     * @property canTurnToLeft
+     */
+    canTurnToLeft: Ember.computed('wrap', 'currentIndex', function () {
+      return this.get('wrap') || this.get('currentIndex') > 0;
+    }),
+
+    /**
+     * If a slide can turn to right, including corners.
+     *
+     * @private
+     * @property canTurnToRight
+     */
+    canTurnToRight: Ember.computed('childSlides.length', 'wrap', 'currentIndex', function () {
+      return this.get('wrap') || this.get('currentIndex') < this.get('childSlides.length') - 1;
+    }),
+
+    /**
+     * All `CarouselSlide` child components.
+     *
+     * @private
+     * @property childSlides
+     * @readonly
+     * @type array
+     */
+    childSlides: Ember.computed.filter('children', function (view) {
+      return view instanceof _emberBootstrapComponentsBsCarouselSlide['default'];
+    }).readOnly(),
+
+    /**
+     * This observer is the entry point for real time insertion and removing of slides.
+     *
+     * @private
+     * @property childSlidesObserver
+     */
+    childSlidesObserver: Ember.observer('childSlides.[]', 'autoPlay', function () {
+      var _this = this;
+
+      Ember.run.scheduleOnce('actions', function () {
+        var childSlides = _this.get('childSlides');
+        if (childSlides.length === 0) {
+          return;
+        }
+        // Sets new current index
+        var currentIndex = _this.get('currentIndex');
+        if (currentIndex >= childSlides.length) {
+          currentIndex = childSlides.length - 1;
+          _this.set('currentIndex', currentIndex);
+        }
+        // Automatic sliding
+        if (_this.get('autoPlay')) {
+          _this.get('waitIntervalToInitCycle').perform();
+        }
+        // Initial slide state
+        _this.set('presentationState', null);
+      });
+    }),
+
+    /**
+     * Indicates the current index of the current slide.
+     *
+     * @property currentIndex
+     * @private
+     */
+    currentIndex: null,
+
+    /**
+     * The current slide object that is going to be used by the nested slides components.
+     *
+     * @property currentSlide
+     * @private
+     *
+     */
+    currentSlide: Ember.computed('childSlides', 'currentIndex', function () {
+      return this.get('childSlides').objectAt(this.get('currentIndex'));
+    }).readOnly(),
+
+    /**
+     * Bootstrap style to indicate that a given slide should be moving to left/right.
+     *
+     * @property directionalClassName
+     * @private
+     * @type string
+     */
+    directionalClassName: null,
+
+    /**
+     * Indicates the next slide index to move into.
+     *
+     * @property followingIndex
+     * @private
+     * @type number
+     */
+    followingIndex: null,
+
+    /**
+     * The following slide object that is going to be used by the nested slides components.
+     *
+     * @property followingIndex
+     * @private
+     */
+    followingSlide: Ember.computed('childSlides', 'followingIndex', function () {
+      return this.get('childSlides').objectAt(this.get('followingIndex'));
+    }).readOnly(),
+
+    /**
+     * @private
+     * @property hasInterval
+     * @type boolean
+     */
+    hasInterval: Ember.computed.gt('interval', 0).readOnly(),
+
+    /**
+     * This observer is the entry point for programmatically slide changing.
+     *
+     * @property indexObserver
+     * @private
+     */
+    indexObserver: Ember.observer('index', function () {
+      this.send('toSlide', this.get('index'));
+    }),
+
+    /**
+     * @property indicators
+     * @private
+     */
+    indicators: Ember.computed('childSlides.length', function () {
+      return [].concat(_toConsumableArray(Array(this.get('childSlides.length'))));
+    }),
+
+    /**
+     * If user is hovering its cursor on component.
+     * This property is only manipulated when 'pauseOnMouseEnter' is true.
+     *
+     * @property isMouseHovering
+     * @private
+     * @type boolean
+     */
+    isMouseHovering: false,
+
+    /**
+     * The class name to append to the next control link element.
+     *
+     * @property nextControlClassName
+     * @type string
+     * @private
+     */
+    nextControlClassName: null,
+
+    /**
+     * Bootstrap style to indicate the next/previous slide.
+     *
+     * @property orderClassName
+     * @private
+     * @type string
+     */
+    orderClassName: null,
+
+    /**
+     * The current state of the current presentation, can be either "didTransition"
+     * or "willTransit".
+     *
+     * @private
+     * @property presentationState
+     * @type string
+     */
+    presentationState: null,
+
+    /**
+     * The class name to append to the previous control link element.
+     *
+     * @property prevControlClassName
+     * @type string
+     * @private
+     */
+    prevControlClassName: null,
+
+    /**
+     * @private
+     * @property shouldNotDoPresentation
+     * @type boolean
+     */
+    shouldNotDoPresentation: Ember.computed.lte('childSlides.length', 1),
+
+    /**
+     * @private
+     * @property shouldRunAutomatically
+     * @type boolean
+     */
+    shouldRunAutomatically: Ember.computed.readOnly('hasInterval'),
+
+    /**
+     * Starts automatic sliding on page load.
+     * This parameter has no effect if interval is less than or equal to zero.
+     *
+     * @default false
+     * @property autoPlay
+     * @public
+     * @type boolean
+     */
+    autoPlay: false,
+
+    /**
+     * If false will hard stop on corners, i.e., first slide won't make a transition to the
+     * last slide and vice versa.
+     *
+     * @default true
+     * @property wrap
+     * @public
+     * @type boolean
+     */
+    wrap: true,
+
+    /**
+     * Index of starting slide.
+     *
+     * @default 0
+     * @property index
+     * @public
+     * @type number
+     */
+    index: 0,
+
+    /**
+     * Waiting time before automatically show another slide.
+     * Automatic sliding is canceled if interval is less than or equal to zero.
+     *
+     * @default 5000
+     * @property interval
+     * @public
+     * @type number
+     */
+    interval: 5000,
+
+    /**
+     * Should bind keyboard events into sliding.
+     *
+     * @default true
+     * @property keyboard
+     * @public
+     * @type boolean
+     */
+    keyboard: true,
+
+    /**
+     * If automatic sliding should be left-to-right or right-to-left.
+     * This parameter has no effect if interval is less than or equal to zero.
+     *
+     * @default true
+     * @property ltr
+     * @public
+     * @type boolean
+     */
+    ltr: true,
+
+    /**
+     * The next control icon to be displayed.
+     *
+     * @default null
+     * @property nextControlIcon
+     * @type string
+     * @public
+     */
+    nextControlIcon: null,
+
+    /**
+     * Label for screen readers, defaults to 'Next'.
+     *
+     * @default 'Next'
+     * @property nextControlLabel
+     * @type string
+     * @public
+     */
+    nextControlLabel: 'Next',
+
+    /**
+     * Pauses automatic sliding if mouse cursor is hovering the component.
+     * This parameter has no effect if interval is less than or equal to zero.
+     *
+     * @default true
+     * @property pauseOnMouseEnter
+     * @public
+     * @type boolean
+     */
+    pauseOnMouseEnter: true,
+
+    /**
+     * The previous control icon to be displayed.
+     *
+     * @default null
+     * @property prevControlIcon
+     * @type string
+     * @public
+     */
+    prevControlIcon: null,
+
+    /**
+     * Label for screen readers, defaults to 'Previous'.
+     *
+     * @default 'Previous'
+     * @property prevControlLabel
+     * @type string
+     * @public
+     */
+    prevControlLabel: 'Previous',
+
+    /**
+     * Show or hide controls.
+     *
+     * @default true
+     * @property showControls
+     * @public
+     * @type boolean
+     */
+    showControls: true,
+
+    /**
+     * Show or hide indicators.
+     *
+     * @default true
+     * @property showIndicators
+     * @public
+     * @type boolean
+     */
+    showIndicators: true,
+
+    /**
+     * The duration of the slide transition.
+     * You should also change this parameter in Bootstrap CSS file.
+     *
+     * @default 600
+     * @property transitionDuration
+     * @public
+     * @type number
+     */
+    transitionDuration: 600,
+
+    /**
+     * Do a presentation and calls itself to perform a cycle.
+     *
+     * @method cycle
+     * @private
+     */
+    cycle: (0, _emberConcurrency.task)( /*#__PURE__*/regeneratorRuntime.mark(function _callee() {
+      return regeneratorRuntime.wrap(function _callee$(_context) {
+        while (1) {
+          switch (_context.prev = _context.next) {
+            case 0:
+              _context.next = 2;
+              return this.get('transition').perform();
+
+            case 2:
+              _context.next = 4;
+              return (0, _emberConcurrency.timeout)(this.get('interval'));
+
+            case 4:
+              this.toAppropriateSlide();
+
+            case 5:
+            case 'end':
+              return _context.stop();
+          }
+        }
+      }, _callee, this);
+    })).restartable(),
+
+    /**
+     * @method transition
+     * @private
+     */
+    transition: (0, _emberConcurrency.task)( /*#__PURE__*/regeneratorRuntime.mark(function _callee2() {
+      var _this2 = this;
+
+      return regeneratorRuntime.wrap(function _callee2$(_context2) {
+        while (1) {
+          switch (_context2.prev = _context2.next) {
+            case 0:
+              this.set('presentationState', 'willTransit');
+              _context2.next = 3;
+              return (0, _emberConcurrency.timeout)(this.get('transitionDuration'));
+
+            case 3:
+              this.set('presentationState', 'didTransition');
+              // Must change current index after execution of 'presentationStateObserver' method
+              // from child components.
+              _context2.next = 6;
+              return new Ember.RSVP.Promise(function (resolve) {
+                Ember.run.schedule('afterRender', _this2, function () {
+                  this.set('currentIndex', this.get('followingIndex'));
+                  resolve();
+                });
+              });
+
+            case 6:
+            case 'end':
+              return _context2.stop();
+          }
+        }
+      }, _callee2, this);
+    })).drop(),
+
+    /**
+     * Waits an interval time to start a cycle.
+     *
+     * @method waitIntervalToInitCycle
+     * @private
+     */
+    waitIntervalToInitCycle: (0, _emberConcurrency.task)( /*#__PURE__*/regeneratorRuntime.mark(function _callee3() {
+      return regeneratorRuntime.wrap(function _callee3$(_context3) {
+        while (1) {
+          switch (_context3.prev = _context3.next) {
+            case 0:
+              if (!(this.get('shouldRunAutomatically') === false)) {
+                _context3.next = 2;
+                break;
+              }
+
+              return _context3.abrupt('return');
+
+            case 2:
+              _context3.next = 4;
+              return (0, _emberConcurrency.timeout)(this.get('interval'));
+
+            case 4:
+              this.toAppropriateSlide();
+
+            case 5:
+            case 'end':
+              return _context3.stop();
+          }
+        }
+      }, _callee3, this);
+    })).restartable(),
+
+    actions: {
+      toSlide: function toSlide(toIndex) {
+        if (this.get('currentIndex') === toIndex || this.get('shouldNotDoPresentation')) {
+          return;
+        }
+        this.assignClassNameControls(toIndex);
+        this.setFollowingIndex(toIndex);
+        if (this.get('shouldRunAutomatically') === false || this.get('isMouseHovering')) {
+          this.get('transition').perform();
+        } else {
+          this.get('cycle').perform();
+        }
+      },
+      toNextSlide: function toNextSlide() {
+        if (this.get('canTurnToRight')) {
+          this.send('toSlide', this.get('currentIndex') + 1);
+        }
+      },
+      toPrevSlide: function toPrevSlide() {
+        if (this.get('canTurnToLeft')) {
+          this.send('toSlide', this.get('currentIndex') - 1);
+        }
+      }
+    },
+
+    /**
+     * Indicates what class names should be applicable to the current transition slides.
+     *
+     * @method assignClassNameControls
+     * @private
+     */
+    assignClassNameControls: function assignClassNameControls(toIndex) {
+      if (toIndex < this.get('currentIndex')) {
+        this.set('directionalClassName', 'right');
+        this.set('orderClassName', 'prev');
+      } else {
+        this.set('directionalClassName', 'left');
+        this.set('orderClassName', 'next');
+      }
+    },
+
+    /**
+     * Initial page loading configuration.
+     */
+    didInsertElement: function didInsertElement() {
+      this._super.apply(this, arguments);
+      this.registerEvents();
+      this.set('currentIndex', this.get('index'));
+      this.triggerChildSlidesObserver();
+    },
+
+    /**
+     * mouseEnter() and mouseLeave() doesn't work with ember-native-dom-event-dispatcher.
+     *
+     * @method registerEvents
+     * @private
+     */
+    registerEvents: function registerEvents() {
+      var self = this;
+      this.element.addEventListener('mouseenter', function () {
+        if (self.get('pauseOnMouseEnter')) {
+          self.set('isMouseHovering', true);
+          self.get('cycle').cancelAll();
+          self.get('waitIntervalToInitCycle').cancelAll();
+        }
+      });
+      this.element.addEventListener('mouseleave', function () {
+        if (self.get('pauseOnMouseEnter') && (self.get('transition.last') !== null || self.get('waitIntervalToInitCycle.last') !== null)) {
+          self.set('isMouseHovering', false);
+          self.get('waitIntervalToInitCycle').perform();
+        }
+      });
+    },
+
+    keyDown: function keyDown(e) {
+      var code = e.keyCode || e.which;
+      if (this.get('keyboard') === false || /input|textarea/i.test(e.target.tagName)) {
+        return;
+      }
+      switch (code) {
+        case 37:
+          this.send('toPrevSlide');
+          break;
+        case 39:
+          this.send('toNextSlide');
+          break;
+        default:
+          break;
+      }
+    },
+
+    /**
+     * Sets the following slide index within the lower and upper bounds.
+     *
+     * @method setFollowingIndex
+     * @private
+     */
+    setFollowingIndex: function setFollowingIndex(toIndex) {
+      var slidesLengthMinusOne = this.get('childSlides').length - 1;
+      if (toIndex > slidesLengthMinusOne) {
+        this.set('followingIndex', 0);
+      } else if (toIndex < 0) {
+        this.set('followingIndex', slidesLengthMinusOne);
+      } else {
+        this.set('followingIndex', toIndex);
+      }
+    },
+
+    /**
+     * Coordinates the correct slide movement direction.
+     *
+     * @method toAppropriateSlide
+     * @private
+     */
+    toAppropriateSlide: function toAppropriateSlide() {
+      if (this.get('ltr')) {
+        this.send('toNextSlide');
+      } else {
+        this.send('toPrevSlide');
+      }
+    },
+
+    /**
+     * @method triggerChildSlidesObserver
+     * @private
+     */
+    triggerChildSlidesObserver: function triggerChildSlidesObserver() {
+      this.get('childSlides');
+    }
+  });
+});
+define('ember-bootstrap/components/base/bs-carousel/slide', ['exports', 'ember-bootstrap/mixins/component-child', 'ember-bootstrap/templates/components/bs-carousel/slide'], function (exports, _emberBootstrapMixinsComponentChild, _emberBootstrapTemplatesComponentsBsCarouselSlide) {
+  'use strict';
+
+  /**
+    A visible user-defined slide.
+  
+    See [Components.Carousel](Components.Carousel.html) for examples.
+  
+    @class CarouselSlide
+    @namespace Components
+    @extends Ember.Component
+    @public
+   */
+  exports['default'] = Ember.Component.extend(_emberBootstrapMixinsComponentChild['default'], {
+    classNameBindings: ['active'],
+    layout: _emberBootstrapTemplatesComponentsBsCarouselSlide['default'],
+
+    /**
+     * Defines slide visibility.
+     *
+     * @property active
+     * @type boolean
+     * @private
+     */
+    active: Ember.computed('isCurrentSlide', 'presentationState', function () {
+      return this.get('isCurrentSlide') && this.get('presentationState') === null;
+    }),
+
+    /**
+     * @private
+     * @property isCurrentSlide
+     * @type boolean
+     */
+    isCurrentSlide: Ember.computed('currentSlide', function () {
+      return this.get('currentSlide') === this;
+    }).readOnly(),
+
+    /**
+     * @private
+     * @property isFollowingSlide
+     * @type boolean
+     */
+    isFollowingSlide: Ember.computed('followingSlide', function () {
+      return this.get('followingSlide') === this;
+    }).readOnly(),
+
+    /**
+     * Slide is moving to the left.
+     *
+     * @property left
+     * @type boolean
+     * @private
+     */
+    left: false,
+
+    /**
+     * Next to appear in a left sliding.
+     *
+     * @property next
+     * @type boolean
+     * @private
+     */
+    next: false,
+
+    /**
+     * Next to appear in a right sliding.
+     *
+     * @property prev
+     * @type boolean
+     * @private
+     */
+    prev: false,
+
+    /**
+     * Slide is moving to the right.
+     *
+     * @property right
+     * @type boolean
+     * @private
+     */
+    right: false,
+
+    /**
+     * Coordinates the execution of a presentation.
+     *
+     * @method presentationStateObserver
+     * @private
+     */
+    presentationStateObserver: Ember.observer('presentationState', function () {
+      var presentationState = this.get('presentationState');
+      if (this.get('isCurrentSlide')) {
+        switch (presentationState) {
+          case 'didTransition':
+            this.currentSlideDidTransition();
+            break;
+          case 'willTransit':
+            this.currentSlideWillTransit();
+            break;
+        }
+      }
+      if (this.get('isFollowingSlide')) {
+        switch (presentationState) {
+          case 'didTransition':
+            this.followingSlideDidTransition();
+            break;
+          case 'willTransit':
+            this.followingSlideWillTransit();
+            break;
+        }
+      }
+    }),
+
+    /**
+     * @method currentSlideDidTransition
+     * @private
+     */
+    currentSlideDidTransition: function currentSlideDidTransition() {
+      this.set(this.get('directionalClassName'), false);
+      this.set('active', false);
+    },
+
+    /**
+     * @method currentSlideWillTransit
+     * @private
+     */
+    currentSlideWillTransit: function currentSlideWillTransit() {
+      this.set('active', true);
+      Ember.run.next(this, function () {
+        this.set(this.get('directionalClassName'), true);
+      });
+    },
+
+    /**
+     * @method followingSlideDidTransition
+     * @private
+     */
+    followingSlideDidTransition: function followingSlideDidTransition() {
+      this.set('active', true);
+      this.set(this.get('directionalClassName'), false);
+      this.set(this.get('orderClassName'), false);
+    },
+
+    /**
+     * @method followingSlideWillTransit
+     * @private
+     */
+    followingSlideWillTransit: function followingSlideWillTransit() {
+      this.set(this.get('orderClassName'), true);
+      Ember.run.next(this, function () {
+        this.reflow();
+        this.set(this.get('directionalClassName'), true);
+      });
+    },
+
+    /**
+     * Makes things more stable, especially when fast changing.
+     */
+    reflow: function reflow() {
+      this.element.offsetHeight;
+    }
+  });
+});
+define('ember-bootstrap/components/base/bs-collapse', ['exports', 'ember-bootstrap/utils/transition-end'], function (exports, _emberBootstrapUtilsTransitionEnd) {
+  'use strict';
+
+  /**
+   An Ember component that mimics the behaviour of [Bootstrap's collapse.js plugin](http://getbootstrap.com/javascript/#collapse)
+  
+   ### Usage
+  
+   ```hbs
+   {{#bs-collapse collapsed=collapsed}}
+     <div class="well">
+       <h2>Collapse</h2>
+       <p>This is collapsible content</p>
+     </div>
+   {{/bs-collapse}}
+   ```
+  
+   @class Collapse
+   @namespace Components
+   @extends Ember.Component
+   @public
+   */
+  exports['default'] = Ember.Component.extend({
+
+    classNameBindings: ['collapse', 'collapsing'],
+    attributeBindings: ['style'],
+
+    /**
+     * Collapsed/expanded state
+     *
+     * @property collapsed
+     * @type boolean
+     * @default true
+     * @public
+     */
+    collapsed: true,
+
+    /**
+     * True if this item is expanded
+     *
+     * @property active
+     * @private
+     */
+    active: false,
+
+    collapse: Ember.computed.not('transitioning'),
+    collapsing: Ember.computed.alias('transitioning'),
+    showContent: Ember.computed.and('collapse', 'active'),
+
+    /**
+     * true if the component is currently transitioning
+     *
+     * @property transitioning
+     * @type boolean
+     * @private
+     */
+    transitioning: false,
+
+    /**
+     * @property collapseSize
+     * @type number
+     * @private
+     */
+    collapseSize: null,
+
+    /**
+     * The size of the element when collapsed. Defaults to 0.
+     *
+     * @property collapsedSize
+     * @type number
+     * @default 0
+     * @public
+     */
+    collapsedSize: 0,
+
+    /**
+     * The size of the element when expanded. When null the value is calculated automatically to fit the containing elements.
+     *
+     * @property expandedSize
+     * @type number
+     * @default null
+     * @public
+     */
+    expandedSize: null,
+
+    /**
+     * Usually the size (height) of the element is only set while transitioning, and reseted afterwards. Set to true to always set a size.
+     *
+     * @property resetSizeWhenNotCollapsing
+     * @type boolean
+     * @default true
+     * @private
+     */
+    resetSizeWhenNotCollapsing: true,
+
+    /**
+     * The direction (height/width) of the collapse animation.
+     * When setting this to 'width' you should also define custom CSS transitions for the width property, as the Bootstrap
+     * CSS does only support collapsible elements for the height direction.
+     *
+     * @property collapseDimension
+     * @type string
+     * @default 'height'
+     * @public
+     */
+    collapseDimension: 'height',
+
+    /**
+     * The duration of the fade transition
+     *
+     * @property transitionDuration
+     * @type number
+     * @default 350
+     * @public
+     */
+    transitionDuration: 350,
+
+    style: Ember.computed('collapseSize', function () {
+      var size = this.get('collapseSize');
+      var dimension = this.get('collapseDimension');
+      if (Ember.isEmpty(size)) {
+        return Ember.String.htmlSafe('');
+      }
+      return Ember.String.htmlSafe(dimension + ': ' + size + 'px');
+    }),
+
+    /**
+     * The action to be sent when the element is about to be hidden.
+     *
+     * @event onHide
+     * @public
+     */
+    onHide: function onHide() {},
+
+    /**
+     * The action to be sent after the element has been completely hidden (including the CSS transition).
+     *
+     * @event onHidden
+     * @public
+     */
+    onHidden: function onHidden() {},
+
+    /**
+     * The action to be sent when the element is about to be shown.
+     *
+     * @event onShow
+     * @public
+     */
+    onShow: function onShow() {},
+
+    /**
+     * The action to be sent after the element has been completely shown (including the CSS transition).
+     *
+     * @event onShown
+     * @public
+     */
+    onShown: function onShown() {},
+
+    /**
+     * Triggers the show transition
+     *
+     * @method show
+     * @protected
+     */
+    show: function show() {
+      var complete = function complete() {
+        if (this.get('isDestroyed')) {
+          return;
+        }
+        this.set('transitioning', false);
+        if (this.get('resetSizeWhenNotCollapsing')) {
+          this.set('collapseSize', null);
+        }
+        this.get('onShown')();
+      };
+
+      this.get('onShow')();
+
+      this.setProperties({
+        transitioning: true,
+        collapseSize: this.get('collapsedSize'),
+        active: true
+      });
+
+      (0, _emberBootstrapUtilsTransitionEnd['default'])(this.get('element'), complete, this, this.get('transitionDuration'));
+
+      Ember.run.next(this, function () {
+        if (!this.get('isDestroyed')) {
+          this.set('collapseSize', this.getExpandedSize('show'));
+        }
+      });
+    },
+
+    /**
+     * Get the size of the element when expanded
+     *
+     * @method getExpandedSize
+     * @param action
+     * @return {Number}
+     * @private
+     */
+    getExpandedSize: function getExpandedSize(action) {
+      var expandedSize = this.get('expandedSize');
+      if (Ember.isPresent(expandedSize)) {
+        return expandedSize;
+      }
+
+      var collapseElement = this.get('element');
+      var prefix = action === 'show' ? 'scroll' : 'offset';
+      var measureProperty = Ember.String.camelize(prefix + '-' + this.get('collapseDimension'));
+      return collapseElement[measureProperty];
+    },
+
+    /**
+     * Triggers the hide transition
+     *
+     * @method hide
+     * @protected
+     */
+    hide: function hide() {
+
+      var complete = function complete() {
+        if (this.get('isDestroyed')) {
+          return;
+        }
+        this.set('transitioning', false);
+        if (this.get('resetSizeWhenNotCollapsing')) {
+          this.set('collapseSize', null);
+        }
+        this.get('onHidden')();
+      };
+
+      this.get('onHide')();
+
+      this.setProperties({
+        transitioning: true,
+        collapseSize: this.getExpandedSize('hide'),
+        active: false
+      });
+
+      (0, _emberBootstrapUtilsTransitionEnd['default'])(this.get('element'), complete, this, this.get('transitionDuration'));
+
+      Ember.run.next(this, function () {
+        if (!this.get('isDestroyed')) {
+          this.set('collapseSize', this.get('collapsedSize'));
+        }
+      });
+    },
+
+    _onCollapsedChange: Ember.observer('collapsed', function () {
+      var collapsed = this.get('collapsed');
+      var active = this.get('active');
+      if (collapsed !== active) {
+        return;
+      }
+      if (collapsed === false) {
+        this.show();
+      } else {
+        this.hide();
+      }
+    }),
+
+    init: function init() {
+      this._super.apply(this, arguments);
+      this.set('active', !this.get('collapsed'));
+    },
+
+    _updateCollapsedSize: Ember.observer('collapsedSize', function () {
+      if (!this.get('resetSizeWhenNotCollapsing') && this.get('collapsed') && !this.get('collapsing')) {
+        this.set('collapseSize', this.get('collapsedSize'));
+      }
+    }),
+
+    _updateExpandedSize: Ember.observer('expandedSize', function () {
+      if (!this.get('resetSizeWhenNotCollapsing') && !this.get('collapsed') && !this.get('collapsing')) {
+        this.set('collapseSize', this.get('expandedSize'));
+      }
+    })
+  });
+});
+define("ember-bootstrap/components/base/bs-contextual-help", ["exports", "ember-bootstrap/mixins/transition-support", "ember-bootstrap/utils/get-parent", "ember-bootstrap/utils/transition-end"], function (exports, _emberBootstrapMixinsTransitionSupport, _emberBootstrapUtilsGetParent, _emberBootstrapUtilsTransitionEnd) {
+  "use strict";
+
+  var _slicedToArray = (function () {
+    function sliceIterator(arr, i) {
+      var _arr = [];var _n = true;var _d = false;var _e = undefined;try {
+        for (var _i = arr[Symbol.iterator](), _s; !(_n = (_s = _i.next()).done); _n = true) {
+          _arr.push(_s.value);if (i && _arr.length === i) break;
+        }
+      } catch (err) {
+        _d = true;_e = err;
+      } finally {
+        try {
+          if (!_n && _i["return"]) _i["return"]();
+        } finally {
+          if (_d) throw _e;
+        }
+      }return _arr;
+    }return function (arr, i) {
+      if (Array.isArray(arr)) {
+        return arr;
+      } else if (Symbol.iterator in Object(arr)) {
+        return sliceIterator(arr, i);
+      } else {
+        throw new TypeError("Invalid attempt to destructure non-iterable instance");
+      }
+    };
+  })();
+
+  var InState = Ember.Object.extend({
+    hover: false,
+    focus: false,
+    click: false,
+    showHelp: Ember.computed.or('hover', 'focus', 'click')
+  });
+
+  function noop() {}
+
+  /**
+  
+   @class Components.ContextualHelp
+   @namespace Components
+   @extends Ember.Component
+   @uses Mixins.TransitionSupport
+   @private
+   */
+  exports["default"] = Ember.Component.extend(_emberBootstrapMixinsTransitionSupport["default"], {
+    tagName: '',
+
+    /**
+     * @property title
+     * @type string
+     * @public
+     */
+    title: null,
+
+    /**
+     * How to position the tooltip/popover - top | bottom | left | right
+     *
+     * @property title
+     * @type string
+     * @default 'top'
+     * @public
+     */
+    placement: 'top',
+
+    /**
+     * By default it will dynamically reorient the tooltip/popover based on the available space in the viewport. For
+     * example, if `placement` is "left", the tooltip/popover will display to the left when possible, otherwise it will
+     * display right. Set to `false` to force placement according to the `placement` property
+     *
+     * @property autoPlacement
+     * @type boolean
+     * @default true
+     * @public
+     */
+    autoPlacement: true,
+
+    /**
+     * You can programmatically show the tooltip/popover by setting this to `true`
+     *
+     * @property visible
+     * @type boolean
+     * @default false
+     * @public
+     */
+    visible: false,
+
+    /**
+     * @property inDom
+     * @type boolean
+     * @private
+     */
+    inDom: Ember.computed.and('visible', 'triggerTargetElement'),
+
+    /**
+     * Set to false to disable fade animations.
+     *
+     * @property fade
+     * @type boolean
+     * @default true
+     * @public
+     */
+    fade: true,
+
+    /**
+     * Used to apply Bootstrap's visibility class
+     *
+     * @property showHelp
+     * @type boolean
+     * @default false
+     * @private
+     */
+    showHelp: Ember.computed.reads('visible'),
+
+    /**
+     * Delay showing and hiding the tooltip/popover (ms). Individual delays for showing and hiding can be specified by using the
+     * `delayShow` and `delayHide` properties.
+     *
+     * @property delay
+     * @type number
+     * @default 0
+     * @public
+     */
+    delay: 0,
+
+    /**
+     * Delay showing the tooltip/popover. This property overrides the general delay set with the `delay` property.
+     *
+     * @property delayShow
+     * @type number
+     * @default 0
+     * @public
+     */
+    delayShow: Ember.computed.reads('delay'),
+
+    /**
+     * Delay hiding the tooltip/popover. This property overrides the general delay set with the `delay` property.
+     *
+     * @property delayHide
+     * @type number
+     * @default 0
+     * @public
+     */
+    delayHide: Ember.computed.reads('delay'),
+
+    hasDelayShow: Ember.computed.gt('delayShow', 0),
+    hasDelayHide: Ember.computed.gt('delayHide', 0),
+
+    /**
+     * The duration of the fade transition
+     *
+     * @property transitionDuration
+     * @type number
+     * @default 150
+     * @public
+     */
+    transitionDuration: 150,
+
+    /**
+     * Keeps the tooltip/popover within the bounds of this element when `autoPlacement` is true. Can be any valid CSS selector.
+     *
+     * @property viewportSelector
+     * @type string
+     * @default 'body'
+     * @see viewportPadding
+     * @see autoPlacement
+     * @public
+     */
+    viewportSelector: 'body',
+
+    /**
+     * Take a padding into account for keeping the tooltip/popover within the bounds of the element given by `viewportSelector`.
+     *
+     * @property viewportPadding
+     * @type number
+     * @default 0
+     * @see viewportSelector
+     * @see autoPlacement
+     * @public
+     */
+    viewportPadding: 0,
+
+    /**
+     * The id of the overlay element.
+     *
+     * @property overlayId
+     * @type string
+     * @readonly
+     * @private
+     */
+    overlayId: Ember.computed(function () {
+      return 'overlay-' + Ember.guidFor(this);
+    }),
+
+    /**
+     * The DOM element of the overlay element.
+     *
+     * @property overlayElement
+     * @type object
+     * @readonly
+     * @private
+     */
+    overlayElement: Ember.computed('overlayId', function () {
+      return document.getElementById(this.get('overlayId'));
+    }).volatile(),
+
+    /**
+     * The DOM element of the arrow element.
+     *
+     * @property arrowElement
+     * @type object
+     * @readonly
+     * @private
+     */
+    arrowElement: null,
+
+    /**
+     * The DOM element of the viewport element.
+     *
+     * @property viewportElement
+     * @type object
+     * @readonly
+     * @private
+     */
+    viewportElement: Ember.computed('viewportSelector', function () {
+      return document.querySelector(this.get('viewportSelector'));
+    }),
+
+    /**
+     * The DOM element that triggers the tooltip/popover. By default it is the parent element of this component.
+     * You can set this to any CSS selector to have any other element trigger the tooltip/popover.
+     * With the special value of "parentView" you can attach the tooltip/popover to the parent component's element.
+     *
+     * @property triggerElement
+     * @type string
+     * @public
+     */
+    triggerElement: null,
+
+    /**
+     * @property triggerTargetElement
+     * @type {object}
+     * @private
+     */
+    triggerTargetElement: Ember.computed('triggerElement', function () {
+      var triggerElement = this.get('triggerElement');
+      var el = void 0;
+
+      if (Ember.isBlank(triggerElement)) {
+        try {
+          el = (0, _emberBootstrapUtilsGetParent["default"])(this);
+        } catch (e) {
+          return null;
+        }
+      } else if (triggerElement === 'parentView') {
+        el = this.get('parentView.element');
+      } else {
+        el = document.querySelector(triggerElement);
+      }
+      return el;
+    }).volatile(),
+
+    /**
+     * The event(s) that should trigger the tooltip/popover - click | hover | focus.
+     * You can set this to a single event or multiple events, given as an array or a string separated by spaces.
+     *
+     * @property triggerEvents
+     * @type array|string
+     * @default 'hover focus'
+     * @public
+     */
+    triggerEvents: 'hover focus',
+
+    _triggerEvents: Ember.computed('triggerEvents', function () {
+      var events = this.get('triggerEvents');
+      if (!Ember.isArray(events)) {
+        events = events.split(' ');
+      }
+
+      return events.map(function (event) {
+        switch (event) {
+          case 'hover':
+            return ['mouseenter', 'mouseleave'];
+          case 'focus':
+            return ['focusin', 'focusout'];
+          default:
+            return event;
+        }
+      });
+    }),
+
+    /**
+     * If true component will render in place, rather than be wormholed.
+     *
+     * @property renderInPlace
+     * @type boolean
+     * @default false
+     * @public
+     */
+    renderInPlace: false,
+
+    /**
+     * @property _renderInPlace
+     * @type boolean
+     * @private
+     */
+    _renderInPlace: Ember.computed('renderInPlace', function () {
+      return this.get('renderInPlace') || typeof document === 'undefined' || !document.getElementById('ember-bootstrap-wormhole');
+    }),
+
+    /**
+     * Current hover state, 'in', 'out' or null
+     *
+     * @property hoverState
+     * @type string
+     * @private
+     */
+    hoverState: null,
+
+    /**
+     * Current state for events
+     *
+     * @property inState
+     * @type {InState}
+     * @private
+     */
+    inState: Ember.computed(function () {
+      return InState.create();
+    }),
+
+    /**
+     * Ember.run timer
+     *
+     * @property timer
+     * @private
+     */
+    timer: null,
+
+    /**
+     * This action is called immediately when the tooltip/popover is about to be shown.
+     *
+     * @event onShow
+     * @public
+     */
+    onShow: function onShow() {},
+
+    /**
+     * This action will be called when the tooltip/popover has been made visible to the user (will wait for CSS transitions to complete).
+     *
+     * @event onShown
+     * @public
+     */
+    onShown: function onShown() {},
+
+    /**
+     * This action is called immediately when the tooltip/popover is about to be hidden.
+     *
+     * @event onHide
+     * @public
+     */
+    onHide: function onHide() {},
+
+    /**
+     * This action is called when the tooltip/popover has finished being hidden from the user (will wait for CSS transitions to complete).
+     *
+     * @event onHidden
+     * @public
+     */
+    onHidden: function onHidden() {},
+
+    /**
+     * Called when a show event has been received
+     *
+     * @method enter
+     * @param e
+     * @private
+     */
+    enter: function enter(e) {
+      if (e) {
+        var eventType = e.type === 'focusin' ? 'focus' : 'hover';
+        this.get('inState').set(eventType, true);
+      }
+
+      if (this.get('showHelp') || this.get('hoverState') === 'in') {
+        this.set('hoverState', 'in');
+        return;
+      }
+
+      Ember.run.cancel(this.timer);
+
+      this.set('hoverState', 'in');
+
+      if (!this.get('hasDelayShow')) {
+        return this.show();
+      }
+
+      this.timer = Ember.run.later(this, function () {
+        if (this.get('hoverState') === 'in') {
+          this.show();
+        }
+      }, this.get('delayShow'));
+    },
+
+    /**
+     * Called when a hide event has been received
+     *
+     * @method leave
+     * @param e
+     * @private
+     */
+    leave: function leave(e) {
+      if (e) {
+        var eventType = e.type === 'focusout' ? 'focus' : 'hover';
+        this.get('inState').set(eventType, false);
+      }
+
+      if (this.get('inState.showHelp')) {
+        return;
+      }
+
+      Ember.run.cancel(this.timer);
+
+      this.set('hoverState', 'out');
+
+      if (!this.get('hasDelayHide')) {
+        return this.hide();
+      }
+
+      this.timer = Ember.run.later(this, function () {
+        if (this.get('hoverState') === 'out') {
+          this.hide();
+        }
+      }, this.get('delayHide'));
+    },
+
+    /**
+     * Called for a click event
+     *
+     * @method toggle
+     * @param e
+     * @private
+     */
+    toggle: function toggle(e) {
+      if (e) {
+        this.get('inState').toggleProperty('click');
+        if (this.get('inState.showHelp')) {
+          this.enter();
+        } else {
+          this.leave();
+        }
+      } else {
+        if (this.get('showHelp')) {
+          this.leave();
+        } else {
+          this.enter();
+        }
+      }
+    },
+
+    /**
+     * Show the tooltip/popover
+     *
+     * @method show
+     * @private
+     */
+    show: function show() {
+      if (this.get('isDestroyed')) {
+        return;
+      }
+
+      if (false === this.get('onShow')(this)) {
+        return;
+      }
+
+      // this waits for the tooltip/popover element to be created. when animating a wormholed tooltip/popover we need to wait until
+      // ember-wormhole has moved things in the DOM for the animation to be correct, so use Ember.run.next in this case
+      var delayFn = !this.get('_renderInPlace') && this.get('fade') ? Ember.run.next : function (target, fn) {
+        Ember.run.schedule('afterRender', target, fn);
+      };
+
+      this.set('inDom', true);
+      delayFn(this, this._show);
+    },
+    _show: function _show() {
+      var skipTransition = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : false;
+
+      this.set('showHelp', true);
+
+      // If this is a touch-enabled device we add extra
+      // empty mouseover listeners to the body's immediate children;
+      // only needed because of broken event delegation on iOS
+      // https://www.quirksmode.org/blog/archives/2014/02/mouse_event_bub.html
+
+      // See https://github.com/twbs/bootstrap/pull/22481
+      if ('ontouchstart' in document.documentElement) {
+        var children = document.body.children;
+
+        for (var i = 0; i < children.length; i++) {
+          children[i].addEventListener('mouseover', noop);
+        }
+      }
+
+      function tooltipShowComplete() {
+        if (this.get('isDestroyed')) {
+          return;
+        }
+        var prevHoverState = this.get('hoverState');
+
+        this.get('onShown')(this);
+        this.set('hoverState', null);
+
+        if (prevHoverState === 'out') {
+          this.leave();
+        }
+      }
+
+      if (skipTransition === false && this.get('usesTransition')) {
+        (0, _emberBootstrapUtilsTransitionEnd["default"])(this.get('overlayElement'), tooltipShowComplete, this, this.get('transitionDuration'));
+      } else {
+        tooltipShowComplete.call(this);
+      }
+    },
+
+    /**
+     * Position the tooltip/popover's arrow
+     *
+     * @method replaceArrow
+     * @param delta
+     * @param dimension
+     * @param isVertical
+     * @private
+     */
+    replaceArrow: function replaceArrow(delta, dimension, isVertical) {
+      var el = this.get('arrowElement');
+      el.style[isVertical ? 'left' : 'top'] = 50 * (1 - delta / dimension) + '%';
+      el.style[isVertical ? 'top' : 'left'] = null;
+    },
+
+    /**
+     * Hide the tooltip/popover
+     *
+     * @method hide
+     * @private
+     */
+    hide: function hide() {
+      if (this.get('isDestroyed')) {
+        return;
+      }
+
+      if (false === this.get('onHide')(this)) {
+        return;
+      }
+
+      function tooltipHideComplete() {
+        if (this.get('isDestroyed')) {
+          return;
+        }
+        if (this.get('hoverState') !== 'in') {
+          this.set('inDom', false);
+        }
+        this.get('onHidden')(this);
+      }
+
+      this.set('showHelp', false);
+
+      // if this is a touch-enabled device we remove the extra
+      // empty mouseover listeners we added for iOS support
+      if ('ontouchstart' in document.documentElement) {
+        var children = document.body.children;
+
+        for (var i = 0; i < children.length; i++) {
+          children[i].removeEventListener('mouseover', noop);
+        }
+      }
+
+      if (this.get('usesTransition')) {
+        (0, _emberBootstrapUtilsTransitionEnd["default"])(this.get('overlayElement'), tooltipHideComplete, this, this.get('transitionDuration'));
+      } else {
+        tooltipHideComplete.call(this);
+      }
+
+      this.set('hoverState', null);
+    },
+
+    /**
+     * @method addListeners
+     * @private
+     */
+    addListeners: function addListeners() {
+      var _this = this;
+
+      var target = this.get('triggerTargetElement');
+
+      this.get('_triggerEvents').forEach(function (event) {
+        if (Ember.isArray(event)) {
+          var _event = _slicedToArray(event, 2),
+              inEvent = _event[0],
+              outEvent = _event[1];
+
+          target.addEventListener(inEvent, _this._handleEnter);
+          target.addEventListener(outEvent, _this._handleLeave);
+        } else {
+          target.addEventListener(event, _this._handleToggle);
+        }
+      });
+    },
+
+    /**
+     * @method removeListeners
+     * @private
+     */
+    removeListeners: function removeListeners() {
+      var _this2 = this;
+
+      try {
+        var target = this.get('triggerTargetElement');
+        this.get('_triggerEvents').forEach(function (event) {
+          if (Ember.isArray(event)) {
+            var _event2 = _slicedToArray(event, 2),
+                inEvent = _event2[0],
+                outEvent = _event2[1];
+
+            target.removeEventListener(inEvent, _this2._handleEnter);
+            target.removeEventListener(outEvent, _this2._handleLeave);
+          } else {
+            target.removeEventListener(event, _this2._handleToggle);
+          }
+        });
+      } catch (e) {} // eslint-disable-line no-empty
+    },
+    init: function init() {
+      this._super.apply(this, arguments);
+      this._handleEnter = Ember.run.bind(this, this.enter);
+      this._handleLeave = Ember.run.bind(this, this.leave);
+      this._handleToggle = Ember.run.bind(this, this.toggle);
+    },
+    didInsertElement: function didInsertElement() {
+      this._super.apply(this, arguments);
+      this.addListeners();
+      if (this.get('visible')) {
+        Ember.run.next(this, this.show, true);
+      }
+    },
+    willDestroyElement: function willDestroyElement() {
+      this._super.apply(this, arguments);
+      this.removeListeners();
+    },
+
+    _watchVisible: Ember.observer('visible', function () {
+      if (this.get('visible')) {
+        this.show();
+      } else {
+        this.hide();
+      }
+    })
+
+  });
+});
+define('ember-bootstrap/components/base/bs-contextual-help/element', ['exports', 'ember-bootstrap/templates/components/bs-tooltip/element'], function (exports, _emberBootstrapTemplatesComponentsBsTooltipElement) {
+  'use strict';
+
+  /**
+   Internal (abstract) component for contextual help markup. Should not be used directly.
+  
+   @class ContextualHelpElement
+   @namespace Components
+   @extends Ember.Component
+   @private
+   */
+  exports['default'] = Ember.Component.extend({
+    layout: _emberBootstrapTemplatesComponentsBsTooltipElement['default'],
+    tagName: '',
+    ariaRole: 'tooltip',
+
+    /**
+     * @property placement
+     * @type string
+     * @default 'top'
+     * @public
+     */
+    placement: 'top',
+
+    actualPlacement: Ember.computed.reads('placement'),
+
+    /**
+     * @property fade
+     * @type boolean
+     * @default true
+     * @public
+     */
+    fade: true,
+
+    /**
+     * @property showHelp
+     * @type boolean
+     * @default false
+     * @public
+     */
+    showHelp: false,
+
+    /**
+     * If true component will render in place, rather than be wormholed.
+     *
+     * @property renderInPlace
+     * @type boolean
+     * @default true
+     * @public
+     */
+    renderInPlace: true,
+
+    /**
+     * Which element to align to
+     *
+     * @property popperTarget
+     * @type {string|HTMLElement}
+     * @public
+     */
+    popperTarget: null,
+
+    /**
+     * @property autoPlacement
+     * @type boolean
+     * @default true
+     * @public
+     */
+    autoPlacement: true,
+
+    /**
+     * The DOM element of the viewport element.
+     *
+     * @property viewportElement
+     * @type object
+     * @public
+     */
+    viewportElement: null,
+
+    /**
+     * Take a padding into account for keeping the tooltip/popover within the bounds of the element given by `viewportElement`.
+     *
+     * @property viewportPadding
+     * @type number
+     * @default 0
+     * @public
+     */
+    viewportPadding: 0,
+
+    /**
+     * @property arrowClass
+     * @private
+     */
+    arrowClass: 'arrow',
+
+    /**
+     * @property popperClassNames
+     * @type {array}
+     * @private
+     */
+    popperClassNames: null,
+
+    /**
+     * @property popperClass
+     * @type {string}
+     * @private
+     */
+    popperClass: Ember.computed('popperClassNames.[]', 'class', function () {
+      var classes = this.get('popperClassNames');
+      var classProperty = this.get('class');
+      if (typeof classProperty === 'string') {
+        classes = classes.concat(classProperty.split(' '));
+      }
+      return classes.join(' ');
+    }),
+
+    /**
+     * popper.js modifier config
+     *
+     * @property popperModifiers
+     * @type {object}
+     * @private
+     */
+    popperModifiers: Ember.computed('arrowClass', 'autoPlacement', 'viewportElement', 'viewportPadding', function () {
+      var self = this;
+      return {
+        arrow: {
+          element: '.' + this.get('arrowClass')
+        },
+        offset: {
+          fn: function fn(data) {
+            var tip = document.getElementById(self.get('id'));
+            true && !tip && Ember.assert('Contextual help element needs existing popper element', tip);
+
+            // manually read margins because getBoundingClientRect includes difference
+
+            var marginTop = parseInt(window.getComputedStyle(tip).marginTop, 10);
+            var marginLeft = parseInt(window.getComputedStyle(tip).marginLeft, 10);
+
+            // we must check for NaN for ie 8/9
+            if (isNaN(marginTop) || marginTop > 0) {
+              marginTop = 0;
+            }
+            if (isNaN(marginLeft) || marginLeft > 0) {
+              marginLeft = 0;
+            }
+
+            data.offsets.popper.top += marginTop;
+            data.offsets.popper.left += marginLeft;
+
+            return window.Popper.Defaults.modifiers.offset.fn.apply(this, arguments);
+          }
+        },
+        preventOverflow: {
+          enabled: this.get('autoPlacement'),
+          boundariesElement: this.get('viewportElement'),
+          padding: this.get('viewportPadding')
+        },
+        hide: {
+          enabled: this.get('autoPlacement')
+        },
+        flip: {
+          enabled: this.get('autoPlacement')
+        }
+      };
+    }),
+
+    didReceiveAttrs: function didReceiveAttrs() {
+      true && !this.get('id') && Ember.assert('Contextual help element needs id for popper element', this.get('id'));
+    },
+
+    actions: {
+      updatePlacement: function updatePlacement(popperDataObject) {
+        if (this.get('actualPlacement') === popperDataObject.placement) {
+          return;
+        }
+        this.set('actualPlacement', popperDataObject.placement);
+        Ember.run.scheduleOnce('afterRender', popperDataObject.instance, popperDataObject.instance.scheduleUpdate);
+      }
+    }
+  });
+});
+define('ember-bootstrap/components/base/bs-dropdown', ['exports', 'ember-bootstrap/templates/components/bs-dropdown'], function (exports, _emberBootstrapTemplatesComponentsBsDropdown) {
+  'use strict';
+
+  /**
+   Bootstrap style [dropdown menus](http://getbootstrap.com/components/#dropdowns), consisting
+   of a toggle element, and the dropdown menu itself.
+  
+   ### Usage
+  
+   Use this component together with the yielded contextual components:
+   * [Components.DropdownToggle](Components.DropdownToggle.html)
+   * [Components.DropdownButton](Components.DropdownButton.html)
+   * [Components.DropdownMenu](Components.DropdownMenu.html)
+     * [Components.DropdownMenuItem](Components.DropdownMenuItem.html)
+     * [Components.DropdownMenuDivider](Components.DropdownMenuDivider.html)
+     * [Components.DropdownMenuLinkTo](Components.DropdownMenuLinkTo.html)
+  
+   ```hbs
+   {{#bs-dropdown as |dd|}}
+     {{#dd.toggle}}Dropdown <span class="caret"></span>{{/dd.toggle}}
+     {{#dd.menu as |ddm|}}
+       {{#ddm.item}}
+         {{#ddm.link-to "index"}}Something{{/ddm.link-to}}
+       {{/ddm.item}}
+       {{ddm.divider}}
+       {{#ddm.item}}
+         {{#ddm.link-to "index"}}Something different{{/ddm.link-to}}
+       {{/ddm.item}}
+     {{/dd.menu}}
+   {{/bs-dropdown}}
+   ```
+  
+   If you need to use dropdowns in a [nav](Components.Nav.html), use the `bs-nav.dropdown`
+   contextual component rather than a standalone dropdown to ensure the correct styling
+   regardless of your Bootstrap version.
+  
+   ### Button dropdowns
+  
+   To use a button as the dropdown toggle element (see http://getbootstrap.com/components/#btn-dropdowns), use the
+   `Components.DropdownButton` component as the toggle:
+  
+   ```hbs
+   {{#bs-dropdown as |dd|}}
+     {{#dd.button}}Dropdown <span class="caret"></span>{{/dd.button}}
+     {{#dd.menu as |ddm|}}
+         {{#ddm.item}}{{#ddm.link-to "index"}}Something{{/ddm.link-to}}{{/ddm.item}}
+         {{#ddm.item}}{{#ddm.link-to "index"}}Something different{{/ddm.link-to}}{{/ddm.item}}
+       {{/dd.menu}}
+   {{/bs-dropdown}}
+   ```
+  
+   It has all the functionality of a `Components.Button` with additional dropdown support.
+  
+   ### Split button dropdowns
+  
+   To have a regular button with a dropdown button as in http://getbootstrap.com/components/#btn-dropdowns-split, use a
+   `Components.Button` component and a `Components.DropdownButton`:
+  
+   ```hbs
+   {{#bs-dropdown as |dd|}}
+     {{#bs-button}}Dropdown{{/bs-button}}
+     {{#dd.button}}Dropdown <span class="caret"></span>{{/dd.button}}
+     {{#dd.menu as |ddm|}}
+       {{#ddm.item}}{{#ddm.link-to "index"}}Something{{/ddm.link-to}}{{/ddm.item}}
+       {{#ddm.item}}{{#ddm.link-to "index"}}Something different{{/ddm.link-to}}{{/ddm.item}}
+     {{/dd.menu}}
+     {{/bs-dropdown}}
+   ```
+  
+   ### Dropup style
+  
+   Set the `direction` property to "up" to switch to a "dropup" style:
+  
+   ```hbs
+   {{#bs-dropdown direction="up" as |dd|}}
+   ...
+   {{/bs-dropdown}}
+   ```
+  
+   ### Bootstrap 3/4 Notes
+  
+   If you need to use dropdowns in a [nav](Components.Nav.html), use the `bs-nav.dropdown`
+   contextual component rather than a standalone dropdown to ensure the correct styling
+   regardless of your Bootstrap version.
+  
+   If you use the [dropdown divider](Component.DropdownMenuDivider), you don't have to worry
+   about differences in the markup between versions.
+  
+   Be sure to use the [dropdown menu link-to](Component.DropdownMenuLinkTo), for in-application
+   links as dropdown menu items. This is essential for proper styling regardless of Bootstrap
+   version and will also provide automatic `active` highlighting on dropdown menu items. If you
+   wish to have a dropdown menu item refer to an external link, be sure to apply the `dropdown-item`
+   class to the `<a>` tag for Bootstrap 4 compatibility.
+  
+   In Bootstrap 4 the dropdown menu will be positioned using the `popper.js` library, just as the original Bootstrap
+   version does. This also allows you to set `renderInPlace=false` on the menu component to render it in a wormhole,
+   which you might want to do if you experience clipping issues by an outer `overflow: hidden` element.
+  
+   @class Dropdown
+   @namespace Components
+   @extends Ember.Component
+   @public
+   */
+  exports['default'] = Ember.Component.extend({
+    layout: _emberBootstrapTemplatesComponentsBsDropdown['default'],
+    classNameBindings: ['containerClass'],
+
+    /**
+     * This property reflects the state of the dropdown, whether it is open or closed.
+     *
+     * @property isOpen
+     * @default false
+     * @type boolean
+     * @private
+     */
+    isOpen: false,
+
+    /**
+     * By default clicking on an open dropdown menu will close it. Set this property to false for the menu to stay open.
+     *
+     * @property closeOnMenuClick
+     * @default true
+     * @type boolean
+     * @public
+     */
+    closeOnMenuClick: true,
+
+    /**
+     * By default the dropdown menu will expand downwards. Set to 'up' to expand upwards.
+     * BS4 also allows 'left' and 'right'
+     *
+     * @property direction
+     * @type string
+     * @default 'down'
+     * @public
+     */
+    direction: 'down',
+
+    /**
+     * Indicates the dropdown is being used as a navigation item dropdown.
+     *
+     * @property inNav
+     * @type boolean
+     * @default false
+     * @private
+     */
+    inNav: false,
+
+    /**
+     * A computed property to generate the suiting class for the dropdown container, either "dropdown", "dropup" or "btn-group".
+     * BS4 only: "dropleft", "dropright"
+     *
+     * @property containerClass
+     * @type string
+     * @readonly
+     * @private
+     */
+    containerClass: Ember.computed('toggle.tagName', 'direction', function () {
+      if (this.get('toggle.tagName') === 'button' && !this.get('toggle.block')) {
+        return this.get('direction') !== 'down' ? 'btn-group drop' + this.get('direction') : 'btn-group';
+      } else {
+        return 'drop' + this.get('direction');
+      }
+    }),
+
+    /**
+     * @property menuElement
+     * @private
+     */
+    menuElement: Ember.computed(function () {
+      return this.get('element').querySelector('.dropdown-menu');
+    }).volatile(),
+
+    /**
+     * @property toggleElement
+     * @private
+     */
+    toggleElement: Ember.computed('toggle', function () {
+      return typeof FastBoot === 'undefined' ? this.get('toggle.element') || null : null;
+    }),
+
+    /**
+     * Reference to the child toggle (Toggle or Button)
+     *
+     * @property toggle
+     * @private
+     */
+    toggle: null,
+
+    /**
+     * Action is called when dropdown is about to be shown
+     *
+     * @event onShow
+     * @param {*} value
+     * @public
+     */
+    onShow: function onShow(value) {},
+    // eslint-disable-line no-unused-vars
+
+    /**
+     * Action is called when dropdown is about to be hidden
+     *
+     * @event onHide
+     * @param {*} value
+     * @public
+     */
+    onHide: function onHide(value) {},
+    // eslint-disable-line no-unused-vars
+
+    actions: {
+      toggleDropdown: function toggleDropdown() {
+        if (this.get('isOpen')) {
+          this.send('closeDropdown');
+        } else {
+          this.send('openDropdown');
+        }
+      },
+      openDropdown: function openDropdown() {
+        this.set('isOpen', true);
+        this.addClickListener();
+        this.get('onShow')();
+      },
+      closeDropdown: function closeDropdown() {
+        this.set('isOpen', false);
+        this.removeClickListener();
+        this.get('onHide')();
+      }
+    },
+
+    addClickListener: function addClickListener() {
+      if (!this.clickListener) {
+        this.clickListener = Ember.run.bind(this, this.closeOnClickHandler);
+        document.addEventListener('click', this.clickListener, true);
+      }
+    },
+    removeClickListener: function removeClickListener() {
+      if (this.clickListener) {
+        document.removeEventListener('click', this.clickListener, true);
+        this.clickListener = null;
+      }
+    },
+    willDestroyElement: function willDestroyElement() {
+      this._super.apply(this, arguments);
+      this.removeClickListener();
+    },
+
+    /**
+     * Handler for click events to close the dropdown
+     *
+     * @method closeOnClickHandler
+     * @param e
+     * @protected
+     */
+    closeOnClickHandler: function closeOnClickHandler(e) {
+      var target = e.target;
+
+      var _getProperties = this.getProperties('toggleElement', 'menuElement'),
+          toggleElement = _getProperties.toggleElement,
+          menuElement = _getProperties.menuElement;
+
+      if (!this.get('isDestroyed') && toggleElement && !toggleElement.contains(target) && (menuElement && !menuElement.contains(target) || this.get('closeOnMenuClick'))) {
+        this.send('closeDropdown');
+      }
+    }
+  });
+});
+define('ember-bootstrap/components/base/bs-dropdown/button', ['exports', 'ember-bootstrap/components/bs-button', 'ember-bootstrap/mixins/dropdown-toggle'], function (exports, _emberBootstrapComponentsBsButton, _emberBootstrapMixinsDropdownToggle) {
+  'use strict';
+
+  /**
+   Button component with that can act as a dropdown toggler.
+  
+   See [Components.Dropdown](Components.Dropdown.html) for examples.
+  
+   @class DropdownButton
+   @namespace Components
+   @extends Components.Button
+   @uses Mixins.DropdownToggle
+   @public
+   */
+  exports['default'] = _emberBootstrapComponentsBsButton['default'].extend(_emberBootstrapMixinsDropdownToggle['default']);
+});
+define('ember-bootstrap/components/base/bs-dropdown/menu', ['exports', 'ember-bootstrap/templates/components/bs-dropdown/menu'], function (exports, _emberBootstrapTemplatesComponentsBsDropdownMenu) {
+  'use strict';
+
+  /**
+   Component for the dropdown menu.
+  
+   See [Components.Dropdown](Components.Dropdown.html) for examples.
+  
+   @class DropdownMenu
+   @namespace Components
+   @extends Ember.Component
+   @public
+   */
+  exports['default'] = Ember.Component.extend({
+    layout: _emberBootstrapTemplatesComponentsBsDropdownMenu['default'],
+
+    /**
+     * Defaults to a `<ul>` tag in BS3 and a '<div>' tag in BS4. Change for other types of dropdown menus.
+     *
+     * @property tagName
+     * @type string
+     * @default ul
+     * @public
+     */
+
+    /**
+     * @property ariaRole
+     * @default menu
+     * @type string
+     * @protected
+     */
+    ariaRole: 'menu',
+
+    /**
+     * Alignment of the menu, either "left" or "right"
+     *
+     * @property align
+     * @type string
+     * @default left
+     * @public
+     */
+    align: 'left',
+
+    /**
+     * @property direction
+     * @default 'down'
+     * @type string
+     * @private
+     */
+    direction: 'down',
+
+    /**
+     * @property inNav
+     * @type {boolean}
+     * @private
+     */
+    inNav: false,
+
+    /**
+     * Applies only to BS4: by default the menu is rendered in the same place the dropdown. If you experience clipping
+     * issues, you can set this to false to render the menu in a wormhole at the top of the DOM.
+     *
+     * @property renderInPlace
+     * @type boolean
+     * @default true
+     * @public
+     */
+    renderInPlace: true,
+
+    alignClass: Ember.computed('align', function () {
+      if (this.get('align') !== 'left') {
+        return 'dropdown-menu-' + this.get('align');
+      }
+    })
+  });
+});
+define("ember-bootstrap/components/base/bs-dropdown/menu/divider", ["exports"], function (exports) {
+
+  /**
+   Component for a dropdown menu divider.
+  
+   See [Components.Dropdown](Components.Dropdown.html) for examples.
+  
+   @class DropdownMenuDivider
+   @namespace Components
+   @extends Ember.Component
+   @public
+   */
+  "use strict";
+
+  exports["default"] = Ember.Component.extend({});
+});
+define("ember-bootstrap/components/base/bs-dropdown/menu/item", ["exports"], function (exports) {
+
+  /**
+   Component for a dropdown menu item.
+  
+   See [Components.Dropdown](Components.Dropdown.html) for examples.
+  
+   @class DropdownMenuItem
+   @namespace Components
+   @extends Ember.Component
+   @public
+   */
+  "use strict";
+
+  exports["default"] = Ember.Component.extend({});
+});
+define("ember-bootstrap/components/base/bs-dropdown/menu/link-to", ["exports"], function (exports) {
+
+  /**
+  
+   Extended `{{link-to}}` component for use within Dropdowns.
+  
+   @class DropdownMenuLinkTo
+   @namespace Components
+   @extends Ember.LinkComponent
+   @public
+   */
+  "use strict";
+
+  exports["default"] = Ember.LinkComponent.extend({});
+});
+define('ember-bootstrap/components/base/bs-dropdown/toggle', ['exports', 'ember-bootstrap/mixins/dropdown-toggle'], function (exports, _emberBootstrapMixinsDropdownToggle) {
+  'use strict';
+
+  /**
+   Anchor element that triggers the parent dropdown to open.
+   Use [Components.DropdownButton](Components.DropdownButton.html) if you want a button instead of an anchor tag.
+  
+   See [Components.Dropdown](Components.Dropdown.html) for examples.
+  
+   @class DropdownToggle
+   @namespace Components
+   @extends Ember.Component
+   @uses Mixins.DropdownToggle
+   @public
+   */
+  exports['default'] = Ember.Component.extend(_emberBootstrapMixinsDropdownToggle['default'], {
+    /**
+     * Defaults to a `<a>` tag. Change for other types of dropdown toggles.
+     *
+     * @property tagName
+     * @type string
+     * @default a
+     * @public
+     */
+    tagName: 'a',
+
+    attributeBindings: ['href'],
+
+    /**
+     * @property inNav
+     * @type {boolean}
+     * @private
+     */
+    inNav: false,
+
+    /**
+     * Computed property to generate a `href="#"` attribute when `tagName` is "a".
+     *
+     * @property href
+     * @type string
+     * @readonly
+     * @private
+     */
+    href: Ember.computed('tagName', function () {
+      if (this.get('tagName').toUpperCase() === 'A') {
+        return '#';
+      }
+    }),
+
+    /**
+     * When clicking the toggle this action is called.
+     *
+     * @event onClick
+     * @param {*} value
+     * @public
+     */
+    onClick: function onClick() {},
+    click: function click(e) {
+      e.preventDefault();
+      this.get('onClick')();
+    }
+  });
+});
+define('ember-bootstrap/components/base/bs-form', ['exports', 'ember-bootstrap/templates/components/bs-form'], function (exports, _emberBootstrapTemplatesComponentsBsForm) {
+  'use strict';
+
+  /**
+    Render a form with the appropriate Bootstrap layout class (see `formLayout`).
+    Allows setting a `model` that nested `Components.FormElement`s can access, and that can provide form validation (see below)
+  
+    You can use whatever markup you like within the form. The following shows Bootstrap 3 usage for the internal markup.
+  
+   ```handlebars
+     {{#bs-form onSubmit=(action "submit") as |form|}}
+       {{#form.group validation=firstNameValidation}}
+         <label class="control-label">First name</label>
+         <input value={{firstname}} class="form-control" oninput={{action (mut firstname) value="target.value"}} type="text">
+      {{/form.group}}
+    {{/bs-form}}
+    ```
+  
+    However to benefit from features such as automatic form markup, validations and validation markup, use `Components.FormElement`
+    as nested components. See below for an example.
+  
+    ### Submitting the form
+  
+    When the form is submitted (e.g. by clicking a submit button), the event will be intercepted and the `onSubmit` action
+    will be sent to the controller or parent component.
+    In case the form supports validation (see "Form validation" below), the `onBefore` action is called (which allows you to
+    do e.g. model data normalization), then the available validation rules are evaluated, and if those fail, the `onInvalid`
+    action is sent instead of `onSubmit`.
+  
+    ### Use with Components.FormElement
+  
+    When using `Components.FormElement`s with their `property` set to property names of the form's validation enabled
+    `model`, you gain some additional powerful features:
+    * the appropriate Bootstrap markup for the given `formLayout` and the form element's `controlType` is automatically generated
+    * markup for validation states and error messages is generated based on the model's validation (if available), when submitting the form
+    with an invalid validation, or when focusing out of invalid inputs
+  
+    ```handlebars
+    {{#bs-form formLayout="horizontal" model=this onSubmit=(action "submit") as |form|}}
+      {{form.element controlType="email" label="Email" placeholder="Email" property="email"}}
+      {{form.element controlType="password" label="Password" placeholder="Password" property="password"}}
+      {{form.element controlType="checkbox" label="Remember me" property="rememberMe"}}
+      {{bs-button defaultText="Submit" type="primary" buttonType="submit"}}
+    {{/bs-form}}
+    ```
+  
+    See the [Components.FormElement](Components.FormElement.html) API docs for further information.
+  
+    ### Form validation
+  
+    All version of ember-bootstrap beginning from 0.7.0 do not come with built-in support for validation engines anymore.
+    Instead support is added usually by additional Ember addons, for example:
+  
+    * [ember-bootstrap-validations](https://github.com/kaliber5/ember-bootstrap-validations): adds support for [ember-validations](https://github.com/DockYard/ember-validations)
+    * [ember-bootstrap-cp-validations](https://github.com/offirgolan/ember-bootstrap-cp-validations): adds support for [ember-cp-validations](https://github.com/offirgolan/ember-cp-validations)
+    * [ember-bootstrap-changeset-validations](https://github.com/kaliber5/ember-bootstrap-changeset-validations): adds support for [ember-changeset](https://github.com/poteto/ember-changeset)
+  
+    To add your own validation support, you have to:
+  
+    * extend this component, setting `hasValidator` to true if validations are available (by means of a computed property for example), and implementing the `validate` method
+    * extend the [Components.FormElement](Components.FormElement.html) component and implement the `setupValidations` hook or simply override the `errors` property to add the validation error messages to be displayed
+  
+    When validation fails, the appropriate Bootstrap markup is added automatically, i.e. the error classes are applied and
+    the validation messages are shown for each form element. In case the validation library supports it, also warning messages
+    are shown. See the [Components.FormElement](Components.FormElement.html) documentation for further details.
+  
+    See the above mentioned addons for examples.
+  
+    @class Form
+    @namespace Components
+    @extends Ember.Component
+    @public
+   */
+  exports['default'] = Ember.Component.extend({
+    layout: _emberBootstrapTemplatesComponentsBsForm['default'],
+    tagName: 'form',
+    classNameBindings: ['layoutClass'],
+    attributeBindings: ['_novalidate:novalidate'],
+    ariaRole: 'form',
+
+    /**
+     * Bootstrap form class name (computed)
+     *
+     * @property layoutClass
+     * @type string
+     * @readonly
+     * @protected
+     *
+     */
+
+    /**
+     * Set a model that this form should represent. This serves several purposes:
+     *
+     * * child `Components.FormElement`s can access and bind to this model by their `property`
+     * * when the model supports validation by using the [ember-validations](https://github.com/dockyard/ember-validations) mixin,
+     * child `Components.FormElement`s will look at the validation information of their `property` and render their form group accordingly.
+     * Moreover the form's `submit` event handler will validate the model and deny submitting if the model is not validated successfully.
+     *
+     * @property model
+     * @type Ember.Object
+     * @public
+     */
+    model: null,
+
+    /**
+     * Set the layout of the form to either "vertical", "horizontal" or "inline". See http://getbootstrap.com/css/#forms-inline and http://getbootstrap.com/css/#forms-horizontal
+     *
+     * @property formLayout
+     * @type string
+     * @public
+     */
+    formLayout: 'vertical',
+
+    /**
+     * Check if validating the model is supported. This needs to be implemented by another addon.
+     *
+     * @property hasValidator
+     * @type boolean
+     * @readonly
+     * @protected
+     */
+    hasValidator: false,
+
+    /**
+     * The Bootstrap grid class for form labels. This is used by the `Components.FormElement` class as a default for the
+     * whole form.
+     *
+     * @property horizontalLabelGridClass
+     * @type string
+     * @default 'col-md-4'
+     * @public
+     */
+    horizontalLabelGridClass: 'col-md-4',
+
+    /**
+     * If set to true pressing enter will submit the form, even if no submit button is present
+     *
+     * @property submitOnEnter
+     * @type boolean
+     * @default false
+     * @public
+     */
+    submitOnEnter: false,
+
+    /**
+     * If set to true novalidate attribute is present on form element
+     *
+     * @property novalidate
+     * @type boolean
+     * @default null
+     * @public
+     */
+    novalidate: false,
+
+    _novalidate: Ember.computed('novalidate', function () {
+      return this.get('novalidate') === true ? '' : undefined;
+    }),
+
+    /**
+     * Validate hook which will return a promise that will either resolve if the model is valid
+     * or reject if it's not. This should be overridden to add validation support.
+     *
+     * @method validate
+     * @param {Object} model
+     * @return {Promise}
+     * @public
+     */
+    validate: function validate(model) {},
+    // eslint-disable-line no-unused-vars
+
+    /**
+     * @property showAllValidations
+     * @type boolean
+     * @default false
+     * @private
+     */
+    showAllValidations: false,
+
+    /**
+     * Action is called before the form is validated (if possible) and submitted.
+     *
+     * @event onBefore
+     * @param { Object } model  The form's `model`
+     * @public
+     */
+    onBefore: function onBefore(model) {},
+    // eslint-disable-line no-unused-vars
+
+    /**
+     * Action is called when submit has been triggered and the model has passed all validations (if present).
+     *
+     * @event onSubmit
+     * @param { Object } model  The form's `model`
+     * @param { Object } result The returned result from the validate method, if validation is available
+     * @public
+     */
+    onSubmit: function onSubmit(model, result) {},
+    // eslint-disable-line no-unused-vars
+
+    /**
+     * Action is called when validation of the model has failed.
+     *
+     * @event onInvalid
+     * @param { Object } model  The form's `model`
+     * @param { Object } error
+     * @public
+     */
+    onInvalid: function onInvalid(model, error) {},
+    // eslint-disable-line no-unused-vars
+
+    /**
+     * Submit handler that will send the default action ("action") to the controller when submitting the form.
+     *
+     * If there is a supplied `model` that supports validation (`hasValidator`) the model will be validated before, and
+     * only if validation is successful the default action will be sent. Otherwise an "invalid" action will be sent, and
+     * all the `showValidation` property of all child `Components.FormElement`s will be set to true, so error state and
+     * messages will be shown automatically.
+     *
+     * @method submit
+     * @private
+     */
+    submit: function submit(e) {
+      var _this = this;
+
+      if (e) {
+        e.preventDefault();
+      }
+      var model = this.get('model');
+
+      this.get('onBefore')(model);
+
+      if (!this.get('hasValidator')) {
+        return this.get('onSubmit')(model);
+      } else {
+        var validationPromise = this.validate(this.get('model'));
+        if (validationPromise && validationPromise instanceof Ember.RSVP.Promise) {
+          validationPromise.then(function (r) {
+            return _this.get('onSubmit')(model, r);
+          })['catch'](function (err) {
+            _this.set('showAllValidations', true);
+            return _this.get('onInvalid')(model, err);
+          });
+        }
+      }
+    },
+    keyPress: function keyPress(e) {
+      var code = e.keyCode || e.which;
+      if (code === 13 && this.get('submitOnEnter')) {
+        this.triggerSubmit();
+      }
+    },
+    triggerSubmit: function triggerSubmit() {
+      var event = document.createEvent('Event');
+      event.initEvent('submit', true, true);
+      this.get('element').dispatchEvent(event);
+    },
+
+    actions: {
+      change: function change(value, model, property) {
+        true && !(Ember.isPresent(model) && Ember.isPresent(property)) && Ember.assert('You cannot use the form element\'s default onChange action for form elements if not using a model or setting the value directly on a form element. You must add your own onChange action to the form element in this case!', Ember.isPresent(model) && Ember.isPresent(property));
+
+        Ember.set(model, property, value);
+      }
+    }
+  });
+});
+define('ember-bootstrap/components/base/bs-form/element', ['exports', 'ember-bootstrap/templates/components/bs-form/element', 'ember-bootstrap/components/bs-form/group'], function (exports, _emberBootstrapTemplatesComponentsBsFormElement, _emberBootstrapComponentsBsFormGroup) {
+  'use strict';
+
+  var nonDefaultLayouts = Ember.A(['checkbox']);
+
+  /**
+   Sub class of `Components.FormGroup` that adds automatic form layout markup and form validation features.
+  
+   ### Form layout
+  
+   The appropriate Bootstrap markup for the given `formLayout` and `controlType` is automatically generated to easily
+   create forms without coding the default Bootstrap form markup by hand:
+  
+   ```hbs
+   {{#bs-form formLayout="horizontal" onSubmit=(action "submit") as |form|}}
+   {{form.element controlType="email" label="Email" placeholder="Email" value=email}}
+   {{form.element controlType="password" label="Password" placeholder="Password" value=password}}
+   {{form.element controlType="checkbox" label="Remember me" value=rememberMe}}
+   {{bs-button defaultText="Submit" type="primary" buttonType="submit"}}
+   {{/bs-form}}
+   ```
+  
+   ### Form validation
+  
+   In the following example the control elements of the three form elements value will be bound to the properties
+   (given by `property`) of the form's `model`, which in this case is its controller (see `model=this`):
+  
+   ```hbs
+   {{#bs-form formLayout="horizontal" model=this onSubmit=(action "submit") as |form|}}
+   {{form.element controlType="email" label="Email" placeholder="Email" property="email"}}
+   {{form.element controlType="password" label="Password" placeholder="Password" property="password"}}
+   {{form.element controlType="checkbox" label="Remember me" property="rememberMe"}}
+   {{bs-button defaultText="Submit" type="primary" buttonType="submit"}}
+   {{/bs-form}}
+   ```
+  
+   By using this indirection in comparison to directly binding the `value` property, you get the benefit of automatic
+   form validation, given that your `model` has a supported means of validating itself.
+   See [Components.Form](Components.Form.html) for details on how to enable form validation.
+  
+   In the example above the `model` was our controller itself, so the control elements were bound to the appropriate
+   properties of our controller. A controller implementing validations on those properties could look like this:
+  
+   ```js
+   import Ember from 'ember';
+   import EmberValidations from 'ember-validations';
+  
+   export default Ember.Controller.extend(EmberValidations,{
+     email: null,
+     password: null,
+     rememberMe: false,
+     validations: {
+       email: {
+         presence: true,
+         format: {
+           with: /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,4}$/
+         }
+       },
+       password: {
+         presence: true,
+         length: { minimum: 6, maximum: 10}
+       },
+       comments: {
+         length: { minimum: 5, maximum: 20}
+       }
+     }
+   });
+   ```
+  
+   If the `showValidation` property is `true` (which is automatically the case if a `focusOut` event is captured from the
+   control element or the containing `Components.Form` was submitted with its `model` failing validation) and there are
+   validation errors for the `model`'s `property`, the appropriate Bootstrap validation markup (see
+   http://getbootstrap.com/css/#forms-control-validation) is applied:
+  
+   * `validation` is set to 'error', which will set the `has-error` CSS class
+   * the `errorIcon` feedback icon is displayed if `controlType` is a text field
+   * the validation messages are displayed as Bootstrap `help-block`s in BS3 and `form-control-feedback` in BS4
+  
+   The same applies for warning messages, if the used validation library supports this. (Currently only
+   [ember-cp-validations](https://github.com/offirgolan/ember-cp-validations))
+  
+   As soon as the validation is successful again...
+  
+   * `validation` is set to 'success', which will set the `has-success` CSS class
+   * the `successIcon` feedback icon is displayed if `controlType` is a text field
+   * the validation messages are removed
+  
+   In case you want to display some error or warning message that is independent of the model's validation, for
+   example to display a failure message on a login form after a failed authentication attempt (so not coming from
+   the validation library), you can use the `customError` or `customWarning` properties to do so.
+  
+   ### Custom controls
+  
+   Apart from the standard built-in browser controls (see the `controlType` property), you can use any custom control simply
+   by invoking the component with a block template. Use whatever control you might want, for example a select-2 component
+   (from the [ember-select-2 addon](https://istefo.github.io/ember-select-2)):
+  
+   ```hbs
+   {{#bs-form model=this onSubmit=(action "submit") as |form|}}
+     {{#form.element label="Select-2" property="gender" useIcons=false as |el|}}
+       {{select-2 id=el.id content=genderChoices optionLabelPath="label" value=el.value searchEnabled=false}}
+     {{/form.element}}
+   {{/bs-form}}
+   ```
+  
+   The component yields a hash with the following properties:
+   * `control`: the component that would be used for rendering the form control based on the given `controlType`
+   * `id`: id to be used for the form control, so it matches the labels `for` attribute
+   * `value`: the value of the form element
+   * `validation`: the validation state of the element, `null` if no validation is to be shown, otherwise 'success', 'error' or 'warning'
+  
+   If your custom control does not render an input element, you should set `useIcons` to `false` since bootstrap only supports
+   feedback icons with textual `<input class="form-control">` elements.
+  
+   If you just want to customize the existing control component, you can use the aforementioned yielded `control` component
+   to customize that existing component:
+  
+   ```hbs
+   {{#bs-form model=this onSubmit=(action "submit") as |form|}}
+     {{#form.element label="Email" placeholder="Email" property="email" as |el|}}
+       {{el.control class="input-lg"}}
+     {{/form.element}}
+   {{/bs-form}}
+   ```
+  
+   ### HTML attributes
+  
+   To set HTML attributes on the control element provided by this component, set them as properties of this component:
+  
+   ```hbs
+   {{#bs-form formLayout="horizontal" model=this onSubmit=(action "submit") as |form|}}
+   {{form.element controlType="email" label="Email" property="email"
+     placeholder="Email"
+     required=true
+     multiple=true
+     tabIndex=5
+   }}
+   ...
+   {{/bs-form}}
+   ```
+  
+   The following attributes are supported depending on the `controlType`:
+  
+   <table class="table table-striped">
+   <thead>
+   <tr>
+   <th></th>
+   <th>textarea</th>
+   <th>checkbox</th>
+   <th>all others</th>
+   </tr>
+   </thead>
+   <tbody>
+   <tr>
+   <td>accept</td>
+   <td></td>
+   <td></td>
+   <td>✔︎</td>
+   </tr>
+   <tr>
+   <td>autocomplete</td>
+   <td>✔︎</td>
+   <td></td>
+   <td>✔︎</td>
+   </tr>
+   <tr>
+   <td>autofocus</td>
+   <td>✔︎</td>
+   <td>✔︎</td>
+   <td>✔︎</td>
+   </tr>
+   <tr>
+   <td>autosave</td>
+   <td></td>
+   <td></td>
+   <td>✔︎</td>
+   </tr>
+   <tr>
+   <td>cols</td>
+   <td>✔︎</td>
+   <td></td>
+   <td></td>
+   </tr>
+   <tr>
+   <td>disabled</td>
+   <td></td>
+   <td>✔︎</td>
+   <td>✔︎</td>
+   </tr>
+   <tr>
+   <td>form</td>
+   <td>✔︎</td>
+   <td>✔︎</td>
+   <td>✔︎</td>
+   </tr>
+   <tr>
+   <td>inputmode</td>
+   <td></td>
+   <td></td>
+   <td>✔︎</td>
+   </tr>
+   <tr>
+   <td>max</td>
+   <td></td>
+   <td></td>
+   <td>✔︎</td>
+   </tr>
+   <tr>
+   <td>maxlength</td>
+   <td>✔︎</td>
+   <td></td>
+   <td>✔︎</td>
+   </tr>
+   <tr>
+   <td>min</td>
+   <td></td>
+   <td></td>
+   <td>✔︎</td>
+   </tr>
+   <tr>
+   <td>minlength</td>
+   <td>✔︎</td>
+   <td></td>
+   <td>✔︎</td>
+   </tr>
+   <tr>
+   <td>multiple</td>
+   <td></td>
+   <td></td>
+   <td>✔︎</td>
+   </tr>
+   <tr>
+   <td>name</td>
+   <td>✔︎</td>
+   <td>✔︎</td>
+   <td>✔︎</td>
+   </tr>
+   <tr>
+   <td>pattern</td>
+   <td></td>
+   <td></td>
+   <td>✔︎</td>
+   </tr>
+   <tr>
+   <td>placeholder</td>
+   <td>✔︎</td>
+   <td></td>
+   <td>✔︎</td>
+   </tr>
+   <tr>
+   <td>readonly</td>
+   <td>✔︎</td>
+   <td>✔︎</td>
+   <td>✔︎</td>
+   </tr>
+   <tr>
+   <td>required</td>
+   <td>✔︎</td>
+   <td>✔︎</td>
+   <td>✔︎</td>
+   </tr>
+   <tr>
+   <td>rows</td>
+   <td>✔︎</td>
+   <td></td>
+   <td></td>
+   </tr>
+   <tr>
+   <td>size<br>via <code>controlSize</code> property</td>
+   <td></td>
+   <td></td>
+   <td>✔︎</td>
+   </tr>
+   <tr>
+   <td>spellcheck</td>
+   <td>✔︎</td>
+   <td></td>
+   <td>✔︎</td>
+   </tr>
+   <tr>
+   <td>step</td>
+   <td></td>
+   <td></td>
+   <td>✔︎</td>
+   </tr>
+   <tr>
+   <td>tabindex</td>
+   <td>✔︎</td>
+   <td>✔︎</td>
+   <td>✔︎</td>
+   </tr>
+   <tr>
+   <td>title</td>
+   <td>✔︎</td>
+   <td>✔︎</td>
+   <td>✔︎</td>
+   </tr>
+   <tr>
+   <td>wrap</td>
+   <td>✔︎</td>
+   <td></td>
+   <td></td>
+   </tr>
+   </tbody>
+   </table>
+  
+   @class FormElement
+   @namespace Components
+   @extends Components.FormGroup
+   @public
+   */
+  exports['default'] = _emberBootstrapComponentsBsFormGroup['default'].extend({
+    layout: _emberBootstrapTemplatesComponentsBsFormElement['default'],
+    classNameBindings: ['disabled:disabled', 'required:is-required', 'isValidating'],
+
+    /**
+     * Text to display within a `<label>` tag.
+     *
+     * You should include a label for every form input cause otherwise screen readers
+     * will have trouble with your forms. Use `invisibleLabel` property if you want
+     * to hide them.
+     *
+     * @property label
+     * @type string
+     * @public
+     */
+    label: null,
+
+    /**
+     * Controls label visibility by adding 'sr-only' class.
+     *
+     * @property invisibleLabel
+     * @type boolean
+     * @default false
+     * @public
+     */
+    invisibleLabel: false,
+
+    /**
+     * @property hasLabel
+     * @type boolean
+     * @readonly
+     * @private
+     */
+    hasLabel: Ember.computed.notEmpty('label'),
+
+    /**
+     * The type of the control widget.
+     * Supported types:
+     *
+     * * 'text'
+     * * 'checkbox'
+     * * 'textarea'
+     * * any other type will use an input tag with the `controlType` value as the type attribute (for e.g. HTML5 input
+     * types like 'email'), and the same layout as the 'text' type
+     *
+     * @property controlType
+     * @type string
+     * @default 'text'
+     * @public
+     */
+    controlType: 'text',
+
+    /**
+     * The value of the control element is bound to this property. You can bind it to some controller property to
+     * get/set the control element's value:
+     *
+     * ```hbs
+     * {{form.element controlType="email" label="Email" placeholder="Email" value=email}}
+     * ```
+     *
+     * Note: you lose the ability to validate this form element by directly binding to its value. It is recommended
+     * to use the `property` feature instead.
+     *
+     *
+     * @property value
+     * @public
+     */
+    value: null,
+
+    /**
+     The property name of the form element's `model` (by default the `model` of its parent `Components.Form`) that this
+     form element should represent. The control element's value will automatically be bound to the model property's
+     value.
+      Using this property enables form validation on this element.
+      @property property
+     @type string
+     @public
+     */
+    property: null,
+
+    /**
+     * The model used for validation. Defaults to the parent `Components.Form`'s `model`
+     *
+     * @property model
+     * @public
+     */
+    model: null,
+
+    /**
+     * Show a help text next to the control
+     *
+     * @property helpText
+     * @type {string}
+     * @public
+     */
+    helpText: null,
+
+    /**
+     * Only if there is a validator, this property makes all errors to be displayed at once
+     * inside a scrollable container.
+     *
+     * @default false
+     * @property showMultipleErrors
+     * @public
+     * @type {Boolean}
+     */
+    showMultipleErrors: false,
+
+    /**
+     * @property hasHelpText
+     * @type boolean
+     * @readonly
+     * @private
+     */
+    hasHelpText: Ember.computed.notEmpty('helpText').readOnly(),
+
+    /**
+     * The array of error messages from the `model`'s validation.
+     *
+     * @property errors
+     * @type array
+     * @protected
+     */
+    errors: null,
+
+    /**
+     * @property hasErrors
+     * @type boolean
+     * @readonly
+     * @private
+     */
+    hasErrors: Ember.computed.gt('errors.length', 0),
+
+    /**
+     * The array of warning messages from the `model`'s validation.
+     *
+     * @property errors
+     * @type array
+     * @protected
+     */
+    warnings: null,
+
+    /**
+     * @property hasWarnings
+     * @type boolean
+     * @readonly
+     * @private
+     */
+    hasWarnings: Ember.computed.gt('warnings.length', 0),
+
+    /**
+     * Show a custom error message that does not come from the model's validation. Will be immediately shown, regardless
+     * of any user interaction (i.e. no `focusOut` event required)
+     *
+     * @property customError
+     * @type string
+     * @public
+     */
+    customError: null,
+
+    /**
+     * @property hasCustomError
+     * @type boolean
+     * @readonly
+     * @private
+     */
+    hasCustomError: Ember.computed.notEmpty('customError'),
+
+    /**
+     * Show a custom warning message that does not come from the model's validation. Will be immediately shown, regardless
+     * of any user interaction (i.e. no `focusOut` event required). If the model's validation has an error then the error
+     * will be shown in place of this warning.
+     *
+     * @property customWarning
+     * @type string
+     * @public
+     */
+    customWarning: null,
+
+    /**
+     * @property hasCustomWarning
+     * @type boolean
+     * @readonly
+     * @private
+     */
+    hasCustomWarning: Ember.computed.notEmpty('customWarning'),
+
+    /**
+     * Property for size styling, set to 'lg', 'sm' or 'xs' (the latter only for BS3)
+     *
+     * @property size
+     * @type String
+     * @public
+     */
+    size: null,
+
+    /**
+     * The array of validation messages (either errors or warnings) from either custom error/warnings or , if we are showing model validation messages, the model's validation
+     *
+     * @property validationMessages
+     * @type array
+     * @private
+     */
+    validationMessages: Ember.computed('hasCustomError', 'customError', 'hasErrors', 'hasCustomWarning', 'customWarning', 'hasWarnings', 'errors.[]', 'warnings.[]', 'showModelValidation', function () {
+      if (this.get('hasCustomError')) {
+        return Ember.A([this.get('customError')]);
+      }
+      if (this.get('hasErrors') && this.get('showModelValidation')) {
+        return Ember.A(this.get('errors'));
+      }
+      if (this.get('hasCustomWarning')) {
+        return Ember.A([this.get('customWarning')]);
+      }
+      if (this.get('hasWarnings') && this.get('showModelValidation')) {
+        return Ember.A(this.get('warnings'));
+      }
+      return null;
+    }),
+
+    /**
+     * @property hasValidationMessages
+     * @type boolean
+     * @readonly
+     * @private
+     */
+    hasValidationMessages: Ember.computed.gt('validationMessages.length', 0),
+
+    /**
+     * @property hasValidator
+     * @type boolean
+     * @default false
+     * @protected
+     */
+    hasValidator: false,
+
+    /**
+     * Set a validating state for async validations
+     *
+     * @property isValidating
+     * @type boolean
+     * @default false
+     * @protected
+     */
+    isValidating: false,
+
+    /**
+     * If `true` form validation markup is rendered (requires a validatable `model`).
+     *
+     * @property showValidation
+     * @type boolean
+     * @default false
+     * @private
+     */
+    showValidation: Ember.computed.or('showOwnValidation', 'showAllValidations', 'hasCustomError', 'hasCustomWarning'),
+
+    /**
+     * @property showOwnValidation
+     * @type boolean
+     * @default false
+     * @private
+     */
+    showOwnValidation: false,
+
+    /**
+     * @property showAllValidations
+     * @type boolean
+     * @default false
+     * @private
+     */
+    showAllValidations: false,
+
+    /**
+     * @property showModelValidations
+     * @type boolean
+     * @readonly
+     * @private
+     */
+    showModelValidation: Ember.computed.or('showOwnValidation', 'showAllValidations'),
+
+    /**
+     * @property showValidationMessages
+     * @type boolean
+     * @readonly
+     * @private
+     */
+    showValidationMessages: Ember.computed.and('showValidation', 'hasValidationMessages'),
+
+    /**
+     * Event or list of events which enable form validation markup rendering.
+     * Supported events: ['focusOut', 'change', 'input']
+     *
+     * @property showValidationOn
+     * @type string|array
+     * @default ['focusOut']
+     * @public
+     */
+    showValidationOn: null,
+
+    /**
+     * @property _showValidationOn
+     * @type array
+     * @readonly
+     * @private
+     */
+    _showValidationOn: Ember.computed('showValidationOn.[]', function () {
+      var showValidationOn = this.get('showValidationOn');
+
+      true && !(Ember.isArray(showValidationOn) || Ember.typeOf(showValidationOn) === 'string') && Ember.assert('showValidationOn must be a String or an Array', Ember.isArray(showValidationOn) || Ember.typeOf(showValidationOn) === 'string');
+
+      if (Ember.isArray(showValidationOn)) {
+        return showValidationOn;
+      }
+
+      if (typeof showValidationOn.toString === 'function') {
+        return [showValidationOn];
+      }
+      return [];
+    }),
+
+    /**
+     * @method showValidationOnHandler
+     * @private
+     */
+    showValidationOnHandler: function showValidationOnHandler(event) {
+      if (this.get('_showValidationOn').indexOf(event) !== -1) {
+        this.set('showOwnValidation', true);
+      }
+    },
+
+    /**
+     * The validation ("error" (BS3)/"danger" (BS4), "warning", or "success") or null if no validation is to be shown. Automatically computed from the
+     * models validation state.
+     *
+     * @property validation
+     * @readonly
+     * @type string
+     * @private
+     */
+    validation: Ember.computed('hasCustomError', 'hasErrors', 'hasCustomWarning', 'hasWarnings', 'hasValidator', 'showValidation', 'showModelValidation', 'isValidating', 'disabled', function () {
+      if (!this.get('showValidation') || !this.get('hasValidator') || this.get('isValidating') || this.get('disabled')) {
+        return null;
+      } else if (this.get('showModelValidation')) {
+        /* The display of model validation messages has been triggered */
+        return this.get('hasErrors') || this.get('hasCustomError') ? 'error' : this.get('hasWarnings') || this.get('hasCustomWarning') ? 'warning' : 'success';
+      } else {
+        /* If there are custom errors or warnings these should always be shown */
+        return this.get('hasCustomError') ? 'error' : 'warning';
+      }
+    }),
+
+    /**
+     * True for text field `controlType`s
+     *
+     * @property useIcons
+     * @type boolean
+     * @readonly
+     * @public
+     */
+    useIcons: Ember.computed.equal('controlComponent', 'bs-form/element/control/input'),
+
+    /**
+     * The form layout used for the markup generation (see http://getbootstrap.com/css/#forms):
+     *
+     * * 'horizontal'
+     * * 'vertical'
+     * * 'inline'
+     *
+     * Defaults to the parent `form`'s `formLayout` property.
+     *
+     * @property formLayout
+     * @type string
+     * @default 'vertical'
+     * @public
+     */
+    formLayout: 'vertical',
+
+    /**
+     * The Bootstrap grid class for form labels within a horizontal layout form. Defaults to the value of the same
+     * property of the parent form. The corresponding grid class for form controls is automatically computed.
+     *
+     * @property horizontalLabelGridClass
+     * @type string
+     * @public
+     */
+    horizontalLabelGridClass: null,
+
+    /**
+     * ID for input field and the corresponding label's "for" attribute
+     *
+     * @property formElementId
+     * @type string
+     * @private
+     */
+    formElementId: Ember.computed('elementId', function () {
+      return this.get('elementId') + '-field';
+    }),
+
+    /**
+     * ID of the helpText, used for aria-describedby attribute of the control element
+     *
+     * @property ariaDescribedBy
+     * @type string
+     * @private
+     */
+    ariaDescribedBy: Ember.computed('elementId', function () {
+      return this.get('elementId') + '-help';
+    }),
+
+    /**
+     * @property layoutComponent
+     * @type {String}
+     * @private
+     */
+    layoutComponent: Ember.computed('formLayout', 'controlType', function () {
+      var formLayout = this.get('formLayout');
+      var controlType = this.get('controlType');
+
+      if (nonDefaultLayouts.includes(controlType)) {
+        return 'bs-form/element/layout/' + formLayout + '/' + controlType;
+      } else {
+        return 'bs-form/element/layout/' + formLayout;
+      }
+    }),
+
+    /**
+     * @property controlComponent
+     * @type {String}
+     * @private
+     */
+    controlComponent: Ember.computed('controlType', function () {
+      var controlType = this.get('controlType');
+      var componentName = 'bs-form/element/control/' + controlType;
+
+      if (Ember.getOwner(this).hasRegistration('component:' + componentName)) {
+        return componentName;
+      }
+
+      return 'bs-form/element/control/input';
+    }),
+
+    /**
+     * @property errorsComponent
+     * @type {String}
+     * @private
+     */
+    errorsComponent: 'bs-form/element/errors',
+
+    /**
+     * @property feedbackIconComponent
+     * @type {String}
+     * @private
+     */
+    feedbackIconComponent: 'bs-form/element/feedback-icon',
+
+    /**
+     * @property labelComponent
+     * @type {String}
+     * @private
+     */
+    labelComponent: 'bs-form/element/label',
+
+    /**
+     * @property helpTextComponent
+     * @type {String}
+     * @private
+     */
+    helpTextComponent: 'bs-form/element/help-text',
+
+    /**
+     * Setup validation properties. This method acts as a hook for external validation
+     * libraries to overwrite. In case of failed validations the `errors` property should contain an array of error messages.
+     *
+     * @method setupValidations
+     * @private
+     */
+    setupValidations: function setupValidations() {},
+
+    /**
+     * Listen for focusOut events from the control element to automatically set `showOwnValidation` to true to enable
+     * form validation markup rendering if `showValidationsOn` contains `focusOut`.
+     *
+     * @event focusOut
+     * @private
+     */
+    focusOut: function focusOut() {
+      this.showValidationOnHandler('focusOut');
+    },
+
+    /**
+     * Listen for change events from the control element to automatically set `showOwnValidation` to true to enable
+     * form validation markup rendering if `showValidationsOn` contains `change`.
+     *
+     * @event change
+     * @private
+     */
+    change: function change() {
+      this.showValidationOnHandler('change');
+    },
+
+    /**
+     * Listen for input events from the control element to automatically set `showOwnValidation` to true to enable
+     * form validation markup rendering if `showValidationsOn` contains `input`.
+     *
+     * @event input
+     * @private
+     */
+    input: function input() {
+      this.showValidationOnHandler('input');
+    },
+
+    /**
+     * The action is called whenever the input value is changed, e.g. by typing text
+     *
+     * @event onChange
+     * @param {String} value The new value of the form control
+     * @param {Object} model The form element's model
+     * @param {String} property The value of `property`
+     * @public
+     */
+    onChange: function onChange() {},
+    init: function init() {
+      this._super.apply(this, arguments);
+      if (this.get('showValidationOn') === null) {
+        this.set('showValidationOn', ['focusOut']);
+      }
+      if (!Ember.isBlank(this.get('property'))) {
+        Ember.defineProperty(this, 'value', Ember.computed.alias('model.' + this.get('property')));
+        this.setupValidations();
+      }
+    },
+
+    /*
+     * adjust feedback icon position
+     *
+     * Bootstrap documentation:
+     *  Manual positioning of feedback icons is required for [...] input groups
+     *  with an add-on on the right. [...] For input groups, adjust the right
+     *  value to an appropriate pixel value depending on the width of your addon.
+     */
+    adjustFeedbackIcons: Ember.observer('hasFeedback', 'formLayout', function () {
+      var _this = this;
+
+      Ember.run.scheduleOnce('afterRender', function () {
+        var el = _this.get('element');
+        var feedbackIcon = void 0;
+        // validation state icons are only shown if form element has feedback
+        if (_this.get('hasFeedback') && !_this.get('isDestroying')
+        // and form group element has
+        // an input-group
+         && el.querySelector('.input-group')
+        // an addon or button on right side
+         && el.querySelector('.input-group input + .input-group-addon, .input-group input + .input-group-btn')
+        // an icon showing validation state
+         && (feedbackIcon = el.querySelector('.form-control-feedback'))) {
+          // clear existing adjustment
+          feedbackIcon.style.right = '';
+
+          var defaultPosition = 0;
+          var match = getComputedStyle(feedbackIcon).right.match(/^(\d+)px$/);
+          if (match) {
+            defaultPosition = parseInt(match[1]);
+          }
+          // Bootstrap documentation:
+          //  We do not support multiple add-ons (.input-group-addon or .input-group-btn) on a single side.
+          // therefore we could rely on having only one input-group-addon or input-group-btn
+          var inputGroupWidth = el.querySelector('input + .input-group-addon, input + .input-group-btn').offsetWidth;
+          var adjustedPosition = defaultPosition + inputGroupWidth;
+
+          feedbackIcon.style.right = adjustedPosition + 'px';
+        }
+      });
+    }),
+
+    didInsertElement: function didInsertElement() {
+      this._super.apply(this, arguments);
+      this.adjustFeedbackIcons();
+    },
+
+    actions: {
+      change: function change(value) {
+        var _getProperties = this.getProperties('onChange', 'model', 'property'),
+            onChange = _getProperties.onChange,
+            model = _getProperties.model,
+            property = _getProperties.property;
+
+        onChange(value, model, property);
+      }
+    }
+  });
+});
+define("ember-bootstrap/components/base/bs-form/element/control", ["exports"], function (exports) {
+
+  /**
+  
+   @class FormElementControl
+   @namespace Components
+   @extends Ember.Component
+   @private
+   */
+  "use strict";
+
+  exports["default"] = Ember.Component.extend({
+
+    /**
+     * @property value
+     * @public
+     */
+    value: null,
+
+    /**
+     * @property ariaDescribedBy
+     * @type {string}
+     * @public
+     */
+    ariaDescribedBy: null,
+
+    /**
+     * This action is called whenever the `value` changes
+     *
+     * @event onChange
+     * @param {*} value
+     * @public
+     */
+    onChange: function onChange() {}
+  });
+});
+define('ember-bootstrap/components/base/bs-form/element/control/checkbox', ['exports', 'ember-bootstrap/components/base/bs-form/element/control', 'ember-bootstrap/mixins/control-attributes'], function (exports, _emberBootstrapComponentsBaseBsFormElementControl, _emberBootstrapMixinsControlAttributes) {
+  'use strict';
+
+  /**
+  
+   @class FormElementControlCheckbox
+   @namespace Components
+   @extends Components.FormElementControl
+   @private
+   */
+  exports['default'] = _emberBootstrapComponentsBaseBsFormElementControl['default'].extend(_emberBootstrapMixinsControlAttributes['default'], {
+    attributeBindings: ['value:checked', 'type'],
+
+    /**
+     * @property type
+     * @type {String}
+     * @readonly
+     * @private
+     */
+    type: 'checkbox',
+
+    click: function click(event) {
+      this.get('onChange')(event.target.checked);
+    }
+  });
+});
+define('ember-bootstrap/components/base/bs-form/element/control/input', ['exports', 'ember-bootstrap/components/base/bs-form/element/control', 'ember-bootstrap/mixins/control-attributes'], function (exports, _emberBootstrapComponentsBaseBsFormElementControl, _emberBootstrapMixinsControlAttributes) {
+  'use strict';
+
+  /**
+  
+   @class FormElementControlInput
+   @namespace Components
+   @extends Components.FormElementControl
+   @private
+   */
+  exports['default'] = _emberBootstrapComponentsBaseBsFormElementControl['default'].extend(_emberBootstrapMixinsControlAttributes['default'], {
+    attributeBindings: ['value', 'type', 'placeholder', 'controlSize:size', 'minlength', 'maxlength', 'min', 'max', 'pattern', 'accept', 'autocomplete', 'autosave', 'inputmode', 'multiple', 'step', 'spellcheck'],
+    classNames: ['form-control'],
+
+    /**
+     * @property type
+     * @type {String}
+     * @public
+     */
+    type: 'text',
+
+    change: function change(event) {
+      this.get('onChange')(event.target.value);
+    },
+    input: function input(event) {
+      this.get('onChange')(event.target.value);
+    }
+  });
+});
+define('ember-bootstrap/components/base/bs-form/element/control/textarea', ['exports', 'ember-bootstrap/components/base/bs-form/element/control', 'ember-bootstrap/mixins/control-attributes'], function (exports, _emberBootstrapComponentsBaseBsFormElementControl, _emberBootstrapMixinsControlAttributes) {
+  'use strict';
+
+  /**
+  
+   @class FormElementControlTextarea
+   @namespace Components
+   @extends Components.FormElementControl
+   @private
+   */
+  exports['default'] = _emberBootstrapComponentsBaseBsFormElementControl['default'].extend(_emberBootstrapMixinsControlAttributes['default'], {
+    attributeBindings: ['value', 'placeholder', 'minlength', 'maxlength', 'autocomplete', 'spellcheck', 'rows', 'cols', 'wrap'],
+    tagName: 'textarea',
+    classNames: ['form-control'],
+
+    change: function change(event) {
+      this.get('onChange')(event.target.value);
+    },
+    input: function input(event) {
+      this.get('onChange')(event.target.value);
+    }
+  });
+});
+define('ember-bootstrap/components/base/bs-form/element/errors', ['exports', 'ember-bootstrap/templates/components/bs-form/element/errors'], function (exports, _emberBootstrapTemplatesComponentsBsFormElementErrors) {
+  'use strict';
+
+  /**
+   @class FormElementErrors
+   @namespace Components
+   @extends Ember.Component
+   @private
+   */
+  exports['default'] = Ember.Component.extend({
+    layout: _emberBootstrapTemplatesComponentsBsFormElementErrors['default'],
+    tagName: '',
+
+    /**
+     * @property show
+     * @type {Boolean}
+     * @public
+     */
+    show: false,
+
+    /**
+     * @property messages
+     * @type {Ember.Array}
+     * @public
+     */
+    messages: null,
+
+    /**
+     * Whether or not should display several errors at the same time.
+     *
+     * @default false
+     * @property showMultipleErrors
+     * @public
+     * @type {Boolean}
+     */
+    showMultipleErrors: false
+  });
+});
+define('ember-bootstrap/components/base/bs-form/element/feedback-icon', ['exports', 'ember-bootstrap/templates/components/bs-form/element/feedback-icon'], function (exports, _emberBootstrapTemplatesComponentsBsFormElementFeedbackIcon) {
+  'use strict';
+
+  /**
+  
+   @class FormElementFeedbackIcon
+   @namespace Components
+   @extends Ember.Component
+   @private
+   */
+  exports['default'] = Ember.Component.extend({
+    layout: _emberBootstrapTemplatesComponentsBsFormElementFeedbackIcon['default'],
+    tagName: '',
+
+    /**
+     * @property show
+     * @type {Boolean}
+     * @public
+     */
+    show: false,
+
+    /**
+     * @property iconName
+     * @type {String}
+     * @public
+     */
+    iconName: null
+  });
+});
+define('ember-bootstrap/components/base/bs-form/element/help-text', ['exports', 'ember-bootstrap/templates/components/bs-form/element/help-text'], function (exports, _emberBootstrapTemplatesComponentsBsFormElementHelpText) {
+  'use strict';
+
+  /**
+  
+   @class FormElementHelpText
+   @namespace Components
+   @extends Ember.Component
+   @private
+   */
+  exports['default'] = Ember.Component.extend({
+    layout: _emberBootstrapTemplatesComponentsBsFormElementHelpText['default'],
+
+    /**
+     * @property text
+     * @type {string}
+     * @public
+     */
+    text: null
+  });
+});
+define('ember-bootstrap/components/base/bs-form/element/label', ['exports', 'ember-bootstrap/templates/components/bs-form/element/label'], function (exports, _emberBootstrapTemplatesComponentsBsFormElementLabel) {
+  'use strict';
+
+  /**
+  
+   @class FormElementLabel
+   @namespace Components
+   @extends Ember.Component
+   @private
+   */
+  exports['default'] = Ember.Component.extend({
+    layout: _emberBootstrapTemplatesComponentsBsFormElementLabel['default'],
+    tagName: '',
+
+    /**
+     * @property label
+     * @type string
+     * @public
+     */
+    label: null,
+
+    /**
+     * @property invisibleLabel
+     * @type boolean
+     * @public
+     */
+    invisibleLabel: false,
+
+    /**
+     * @property formElementId
+     * @type {String}
+     * @public
+     */
+    formElementId: null,
+
+    /**
+     * @property labelClass
+     * @type {String}
+     * @public
+     */
+    labelClass: null,
+
+    /**
+     * The form layout used for the markup generation (see http://getbootstrap.com/css/#forms):
+     *
+     * * 'horizontal'
+     * * 'vertical'
+     * * 'inline'
+     *
+     * Defaults to the parent `form`'s `formLayout` property.
+     *
+     * @property formLayout
+     * @type string
+     * @default 'vertical'
+     * @public
+     */
+    formLayout: 'vertical',
+
+    /**
+     * The type of the control widget.
+     * Supported types:
+     *
+     * * 'text'
+     * * 'checkbox'
+     * * 'textarea'
+     * * any other type will use an input tag with the `controlType` value as the type attribute (for e.g. HTML5 input
+     * types like 'email'), and the same layout as the 'text' type
+     *
+     * @property controlType
+     * @type string
+     * @default 'text'
+     * @public
+     */
+    controlType: 'text',
+
+    /**
+     * Indicates whether the type of the control widget equals `checkbox`
+     *
+     * @property isCheckbox
+     * @type boolean
+     * @private
+     */
+    isCheckbox: Ember.computed.equal('controlType', 'checkbox').readOnly(),
+
+    /**
+     * Indicates whether the form type equals `horizontal`
+     *
+     * @property isHorizontal
+     * @type boolean
+     * @private
+     */
+    isHorizontal: Ember.computed.equal('formLayout', 'horizontal').readOnly()
+  });
+});
+define('ember-bootstrap/components/base/bs-form/element/layout', ['exports'], function (exports) {
+
+  /**
+  
+   @class FormElementLayout
+   @namespace Components
+   @extends Ember.Component
+   @private
+   */
+  'use strict';
+
+  exports['default'] = Ember.Component.extend({
+    tagName: '',
+
+    /**
+     * @property formElementId
+     * @type {String}
+     * @public
+     */
+    formElementId: null,
+
+    /**
+     * @property hasLabel
+     * @type boolean
+     * @public
+     */
+    hasLabel: true,
+
+    /**
+     * @property errorsComponent
+     * @type {Ember.Component}
+     * @public
+     */
+    errorsComponent: null,
+
+    /**
+     * @property feedbackIconComponent
+     * @type {Ember.Component}
+     * @public
+     */
+    feedbackIconComponent: null,
+
+    /**
+     * @property labelComponent
+     * @type {Ember.Component}
+     * @public
+     */
+    labelComponent: null,
+
+    /**
+     * @property helpTextComponent
+     * @type {Ember.Component}
+     * @public
+     */
+    helpTextComponent: null
+  });
+});
+define('ember-bootstrap/components/base/bs-form/element/layout/horizontal', ['exports', 'ember-bootstrap/components/base/bs-form/element/layout', 'ember-bootstrap/templates/components/bs-form/element/layout/horizontal'], function (exports, _emberBootstrapComponentsBaseBsFormElementLayout, _emberBootstrapTemplatesComponentsBsFormElementLayoutHorizontal) {
+  'use strict';
+
+  /**
+  
+   @class FormElementLayoutHorizontal
+   @namespace Components
+   @extends Components.FormElementLayout
+   @private
+   */
+  exports['default'] = _emberBootstrapComponentsBaseBsFormElementLayout['default'].extend({
+    layout: _emberBootstrapTemplatesComponentsBsFormElementLayoutHorizontal['default'],
+
+    /**
+     * The Bootstrap grid class for form labels within a horizontal layout form.
+     *
+     * @property horizontalLabelGridClass
+     * @type string
+     * @public
+     */
+    horizontalLabelGridClass: null,
+
+    /**
+     * Computed property that specifies the Bootstrap grid class for form controls within a horizontal layout form.
+     *
+     * @property horizontalInputGridClass
+     * @type string
+     * @readonly
+     * @private
+     */
+    horizontalInputGridClass: Ember.computed('horizontalLabelGridClass', function () {
+      if (Ember.isBlank(this.get('horizontalLabelGridClass'))) {
+        return;
+      }
+      var parts = this.get('horizontalLabelGridClass').split('-');
+      true && !(parts.length === 3) && Ember.assert('horizontalInputGridClass must match format bootstrap grid column class', parts.length === 3);
+
+      parts[2] = 12 - parts[2];
+      return parts.join('-');
+    }).readOnly(),
+
+    /**
+     * Computed property that specifies the Bootstrap offset grid class for form controls within a horizontal layout
+     * form, that have no label.
+     *
+     * @property horizontalInputOffsetGridClass
+     * @type string
+     * @readonly
+     * @private
+     */
+    horizontalInputOffsetGridClass: Ember.computed('horizontalLabelGridClass', function () {
+      if (Ember.isBlank(this.get('horizontalLabelGridClass'))) {
+        return;
+      }
+      var parts = this.get('horizontalLabelGridClass').split('-');
+      parts.splice(2, 0, 'offset');
+      return parts.join('-');
+    })
+
+  });
+});
+define('ember-bootstrap/components/base/bs-form/element/layout/horizontal/checkbox', ['exports', 'ember-bootstrap/components/base/bs-form/element/layout/horizontal', 'ember-bootstrap/templates/components/bs-form/element/layout/horizontal/checkbox'], function (exports, _emberBootstrapComponentsBaseBsFormElementLayoutHorizontal, _emberBootstrapTemplatesComponentsBsFormElementLayoutHorizontalCheckbox) {
+  'use strict';
+
+  /**
+  
+   @class FormElementLayoutHorizontalCheckbox
+   @namespace Components
+   @extends Components.FormElementLayout
+   @private
+   */
+  exports['default'] = _emberBootstrapComponentsBaseBsFormElementLayoutHorizontal['default'].extend({
+    layout: _emberBootstrapTemplatesComponentsBsFormElementLayoutHorizontalCheckbox['default']
+  });
+});
+define('ember-bootstrap/components/base/bs-form/element/layout/inline', ['exports', 'ember-bootstrap/components/base/bs-form/element/layout', 'ember-bootstrap/templates/components/bs-form/element/layout/vertical'], function (exports, _emberBootstrapComponentsBaseBsFormElementLayout, _emberBootstrapTemplatesComponentsBsFormElementLayoutVertical) {
+  'use strict';
+
+  /**
+  
+   @class FormElementLayoutInline
+   @namespace Components
+   @extends Components.FormElementLayout
+   @private
+   */
+  exports['default'] = _emberBootstrapComponentsBaseBsFormElementLayout['default'].extend({
+    layout: _emberBootstrapTemplatesComponentsBsFormElementLayoutVertical['default']
+  });
+});
+define('ember-bootstrap/components/base/bs-form/element/layout/inline/checkbox', ['exports', 'ember-bootstrap/components/base/bs-form/element/layout/inline', 'ember-bootstrap/templates/components/bs-form/element/layout/vertical/checkbox'], function (exports, _emberBootstrapComponentsBaseBsFormElementLayoutInline, _emberBootstrapTemplatesComponentsBsFormElementLayoutVerticalCheckbox) {
+  'use strict';
+
+  /**
+  
+   @class FormElementLayoutInlineCheckbox
+   @namespace Components
+   @extends Components.FormElementLayout
+   @private
+   */
+  exports['default'] = _emberBootstrapComponentsBaseBsFormElementLayoutInline['default'].extend({
+    layout: _emberBootstrapTemplatesComponentsBsFormElementLayoutVerticalCheckbox['default']
+  });
+});
+define('ember-bootstrap/components/base/bs-form/element/layout/vertical', ['exports', 'ember-bootstrap/components/base/bs-form/element/layout', 'ember-bootstrap/templates/components/bs-form/element/layout/vertical'], function (exports, _emberBootstrapComponentsBaseBsFormElementLayout, _emberBootstrapTemplatesComponentsBsFormElementLayoutVertical) {
+  'use strict';
+
+  /**
+  
+   @class FormElementLayoutVertical
+   @namespace Components
+   @extends Components.FormElementLayout
+   @private
+   */
+  exports['default'] = _emberBootstrapComponentsBaseBsFormElementLayout['default'].extend({
+    layout: _emberBootstrapTemplatesComponentsBsFormElementLayoutVertical['default']
+  });
+});
+define('ember-bootstrap/components/base/bs-form/element/layout/vertical/checkbox', ['exports', 'ember-bootstrap/components/base/bs-form/element/layout/vertical', 'ember-bootstrap/templates/components/bs-form/element/layout/vertical/checkbox'], function (exports, _emberBootstrapComponentsBaseBsFormElementLayoutVertical, _emberBootstrapTemplatesComponentsBsFormElementLayoutVerticalCheckbox) {
+  'use strict';
+
+  /**
+  
+   @class FormElementLayoutVerticalCheckbox
+   @namespace Components
+   @extends Components.FormElementLayout
+   @private
+   */
+  exports['default'] = _emberBootstrapComponentsBaseBsFormElementLayoutVertical['default'].extend({
+    layout: _emberBootstrapTemplatesComponentsBsFormElementLayoutVerticalCheckbox['default']
+  });
+});
+define('ember-bootstrap/components/base/bs-form/group', ['exports', 'ember-bootstrap/templates/components/bs-form/group'], function (exports, _emberBootstrapTemplatesComponentsBsFormGroup) {
+  'use strict';
+
+  /**
+   This component renders a `<div class="form-group">` element, with support for validation states and feedback icons (only for BS3).
+   You can use it as a block level component. The following shows Bootstrap 3 usage for the internal markup.
+  
+   ```hbs
+   {{#bs-form as |form|}}
+     {{#form.group validation=firstNameValidation}}
+       <label class="control-label">First name</label>
+       <input value={{firstname}} class="form-control" oninput={{action (mut firstname) value="target.value"}} type="text">
+     {{/form.group}}
+   {{/bs-form}}
+   ```
+  
+   If the `validation` property is set to some state (usually Bootstrap's predefined states "success",
+   "warning" or "error"), the appropriate styles will be added, together with a feedback icon.
+   See http://getbootstrap.com/css/#forms-control-validation
+  
+   @class FormGroup
+   @namespace Components
+   @extends Ember.Component
+   @public
+   */
+  exports['default'] = Ember.Component.extend({
+    layout: _emberBootstrapTemplatesComponentsBsFormGroup['default'],
+
+    /**
+     * @property classTypePrefix
+     * @type String
+     * @default 'form-group' (BS3) or 'form-control' (BS4)
+     * @private
+     */
+
+    /**
+     * Computed property which is true if the form group is in a validation state
+     *
+     * @property hasValidation
+     * @type boolean
+     * @private
+     * @readonly
+     */
+    hasValidation: Ember.computed.notEmpty('validation').readOnly(),
+
+    /**
+     * Set to a validation state to render the form-group with a validation style (only for BS3).
+     * See http://getbootstrap.com/css/#forms-control-validation
+     *
+     * The default states of "success", "warning" and "error" are supported by Bootstrap out-of-the-box.
+     * But you can use custom states as well. This will set a has-<state> class, and (if `useIcons`is true)
+     * a feedback whose class is taken from the <state>Icon property
+     *
+     * @property validation
+     * @type string
+     * @public
+     */
+    validation: null
+  });
+});
+define('ember-bootstrap/components/base/bs-modal-simple', ['exports', 'ember-bootstrap/components/bs-modal', 'ember-bootstrap/templates/components/bs-modal-simple'], function (exports, _emberBootstrapComponentsBsModal, _emberBootstrapTemplatesComponentsBsModalSimple) {
+  'use strict';
+
+  /**
+  
+   Component for creating [Bootstrap modals](http://getbootstrap.com/javascript/#modals) with a some common default markup
+   including a header, footer and body. Creating a simple modal is easy:
+  
+   ```hbs
+   {{#bs-modal-simple title="Simple Dialog"}}
+     Hello world!
+   {{/bs-modal-simple}}
+   ```
+  
+   This will automatically create the appropriate markup, with a modal header containing the title, and a footer containing
+   a default "Ok" button, that will close the modal automatically (unless you return false from `onHide`).
+  
+   A modal created this way will be visible at once. You can use the `{{#if ...}}` helper to hide all modal elements from
+   the DOM until needed. Or you can bind the `open` property to trigger showing and hiding the modal:
+  
+   ```hbs
+   {{#bs-modal-simple open=openModal title="Simple Dialog"}}
+     Hello world!
+   {{/bs-modal-simple}}
+   ```
+  
+   ### Custom Markup
+  
+   To customize the markup within the modal you can use the [bs-modal](Components.Modal.html) component.
+  
+   ### Modals with forms
+  
+   There is a special case when you have a form inside your modals body: you probably do not want to have a submit button
+   within your form but instead in your modal footer. Hover pressing the submit button outside of your form would not
+   trigger the form data to be submitted. In the example below this would not trigger the submit action of the form, an
+   thus bypass the form validation feature of the form component.
+  
+   ```hbs
+   {{#bs-modal-simple title="Form Example" closeTitle="Cancel" submitTitle="Ok"}}
+     {{#bs-form onSubmit=(action "submit") model=this as |form|}}
+       {{form.element controlType="text" label="first name" property="firstname"}}
+       {{form.element controlType="text" label="last name" property="lastname"}}
+     {{/bs-form}}
+   {{/bs-modal-simple}}
+   ```
+  
+   The modal component supports this common case by triggering the submit event programmatically on the body's form if
+   present whenever the footer's submit button is pressed, so the example above will work as expected.
+  
+   ### Auto-focus
+  
+   In order to allow key handling to function, the modal's root element is given focus once the modal is shown. If your
+   modal contains an element such as a text input and you would like it to be given focus rather than the modal element,
+   then give it the HTML5 autofocus attribute:
+  
+   ```hbs
+   {{#bs-modal-simple title="Form Example" closeTitle="Cancel" submitTitle="Ok"}}
+     {{#bs-form onSubmit=(action "submit") model=this as |form|}}
+       {{form.element controlType="text" label="first name" property="firstname" autofocus=true}}
+       {{form.element controlType="text" label="last name" property="lastname"}}
+     {{/bs-form}}
+   {{/bs-modal-simple}}
+  
+   ```
+  
+   ### Modals inside wormhole
+  
+   Modals make use of the [ember-wormhole](https://github.com/yapplabs/ember-wormhole) addon, which will be installed
+   automatically alongside ember-bootstrap. This is used to allow the modal to be placed in deeply nested
+   components/templates where it belongs to logically, but to have the actual DOM elements within a special container
+   element, which is a child of ember's root element. This will make sure that modals always overlay the whole app, and
+   are not effected by parent elements with `overflow: hidden` for example.
+  
+   If you want the modal to render in place, rather than being wormholed, you can set renderInPlace=true.
+  
+   @class ModalSimple
+   @namespace Components
+   @extends Components.Modal
+   @public
+   */
+  exports['default'] = _emberBootstrapComponentsBsModal['default'].extend({
+    layout: _emberBootstrapTemplatesComponentsBsModalSimple['default'],
+
+    /**
+     * The title of the modal, visible in the modal header. Is ignored if `header` is false.
+     *
+     * @property title
+     * @type string
+     * @public
+     */
+    title: null,
+
+    /**
+     * Display a close button (x icon) in the corner of the modal header.
+     *
+     * @property closeButton
+     * @type boolean
+     * @default true
+     * @public
+     */
+    closeButton: true,
+
+    /**
+     * The title of the default close button.
+     *
+     * @property closeTitle
+     * @type string
+     * @default 'Ok'
+     * @public
+     */
+    closeTitle: 'Ok',
+
+    /**
+     * The type of the submit button (primary button).
+     *
+     * @property submitButtonType
+     * @type string
+     * @default 'primary'
+     * @public
+     */
+    submitButtonType: 'primary',
+
+    /**
+     * The title of the submit button (primary button). Will be ignored (i.e. no button) if set to null.
+     *
+     * @property submitTitle
+     * @type string
+     * @default null
+     * @public
+     */
+    submitTitle: null
+
+  });
+});
+define('ember-bootstrap/components/base/bs-modal', ['exports', 'ember-bootstrap/templates/components/bs-modal', 'ember-bootstrap/mixins/transition-support', 'ember-bootstrap/utils/listen-to-cp', 'ember-bootstrap/utils/transition-end', 'ember-bootstrap/utils/dom'], function (exports, _emberBootstrapTemplatesComponentsBsModal, _emberBootstrapMixinsTransitionSupport, _emberBootstrapUtilsListenToCp, _emberBootstrapUtilsTransitionEnd, _emberBootstrapUtilsDom) {
+  'use strict';
+
+  /**
+  
+   Component for creating [Bootstrap modals](http://getbootstrap.com/javascript/#modals) with custom markup.
+  
+   ### Usage
+  
+   ```hbs
+   {{#bs-modal onSubmit=(action "submit") as |modal|}}
+     {{#modal.header}}
+       <h4 class="modal-title"><i class="glyphicon glyphicon-alert"></i> Alert</h4>
+     {{/modal.header}}
+     {{#modal.body}}Are you absolutely sure you want to do that???{{/modal.body}}
+     {{#modal.footer as |footer|}}
+       {{#bs-button onClick=(action modal.close) type="danger"}}Oh no, forget it!{{/bs-button}}
+       {{#bs-button onClick=(action modal.submit) type="success"}}Yeah!{{/bs-button}}
+     {{/modal.footer}}
+   {{/bs-modal}}
+   ```
+  
+   The component yields references to the following contextual components, that you can use to further customize the output:
+  
+   * [modal.body](Components.ModalBody.html)
+   * [modal.header](Components.ModalHeader.html)
+   * [modal.footer](Components.ModalFooter.html)
+  
+   Furthermore references to the following actions are yielded:
+  
+   * `close`: triggers the `onHide` action and closes the modal
+   * `submit`: triggers the `onSubmit` action (or the submit event on a form if present in the body element)
+  
+   ### Further reading
+  
+   See the documentation of the [bs-modal-simple](Components.ModalSimple.html) component for further examples.
+  
+   @class Modal
+   @namespace Components
+   @extends Ember.Component
+   @uses Mixins.TransitionSupport
+   @public
+   */
+  exports['default'] = Ember.Component.extend(_emberBootstrapMixinsTransitionSupport['default'], {
+    layout: _emberBootstrapTemplatesComponentsBsModal['default'],
+
+    /**
+     * Visibility of the modal. Toggle to show/hide with CSS transitions.
+     *
+     * When the modal is closed by user interaction this property will not update by using two-way bindings in order
+     * to follow DDAU best practices. If you want to react to such changes, subscribe to the `onHide` action
+     *
+     * @property open
+     * @type boolean
+     * @default true
+     * @public
+     */
+    open: true,
+
+    /**
+     * @property isOpen
+     * @private
+     */
+    isOpen: (0, _emberBootstrapUtilsListenToCp['default'])('open'),
+
+    /**
+     * @property _isOpen
+     * @private
+     */
+    _isOpen: false,
+
+    /**
+     * Set to false to disable fade animations.
+     *
+     * @property fade
+     * @type boolean
+     * @default true
+     * @public
+     */
+    fade: Ember.computed.not('isFastBoot'),
+
+    /**
+     * @property notFade
+     * @type boolean
+     * @private
+     */
+    notFade: Ember.computed.not('fade'),
+
+    /**
+     * Used to apply Bootstrap's visibility classes.
+     *
+     * @property showModal
+     * @type boolean
+     * @default false
+     * @private
+     */
+    showModal: false,
+
+    /**
+     * Render modal markup?
+     *
+     * @property inDom
+     * @type boolean
+     * @default false
+     * @private
+     */
+    inDom: false,
+
+    /**
+     * @property paddingLeft
+     * @type number|null
+     * @default null
+     * @private
+     */
+    paddingLeft: null,
+
+    /**
+     * @property paddingRight
+     * @type number|null
+     * @default null
+     * @private
+     */
+    paddingRight: null,
+
+    /**
+     * Use a semi-transparent modal background to hide the rest of the page.
+     *
+     * @property backdrop
+     * @type boolean
+     * @default true
+     * @public
+     */
+    backdrop: true,
+
+    /**
+     * @property showBackdrop
+     * @type boolean
+     * @default false
+     * @private
+     */
+    showBackdrop: false,
+
+    /**
+     * Closes the modal when escape key is pressed.
+     *
+     * @property keyboard
+     * @type boolean
+     * @default true
+     * @public
+     */
+    keyboard: true,
+
+    /**
+     * [BS4 only!] Vertical position, either 'top' (default) or 'center'
+     * 'center' will apply the `modal-dialog-centered` class
+     *
+     * @property position
+     * @type {string}
+     * @default 'top'
+     * @public
+     */
+    position: 'top',
+
+    /**
+     * The id of the `.modal` element.
+     *
+     * @property modalId
+     * @type string
+     * @readonly
+     * @private
+     */
+    modalId: Ember.computed('elementId', function () {
+      return this.get('elementId') + '-modal';
+    }),
+
+    /**
+     * The DOM element of the `.modal` element.
+     *
+     * @property modalElement
+     * @type object
+     * @readonly
+     * @private
+     */
+    modalElement: Ember.computed('modalId', function () {
+      return document.getElementById(this.get('modalId'));
+    }).volatile(),
+
+    /**
+     * The id of the backdrop element.
+     *
+     * @property backdropId
+     * @type string
+     * @readonly
+     * @private
+     */
+    backdropId: Ember.computed('elementId', function () {
+      return this.get('elementId') + '-backdrop';
+    }),
+
+    /**
+     * The DOM element of the backdrop element.
+     *
+     * @property backdropElement
+     * @type object
+     * @readonly
+     * @private
+     */
+    backdropElement: Ember.computed('backdropId', function () {
+      return document.getElementById(this.get('backdropId'));
+    }).volatile(),
+
+    /**
+     * The destination DOM element for in-element.
+     *
+     * @property destinationElement
+     * @type object
+     * @readonly
+     * @private
+     */
+    destinationElement: Ember.computed(function () {
+      var dom = (0, _emberBootstrapUtilsDom.getDOM)(this);
+      return (0, _emberBootstrapUtilsDom.findElementById)(dom, 'ember-bootstrap-wormhole');
+    }).volatile(),
+
+    /**
+     * Property for size styling, set to null (default), 'lg' or 'sm'
+     *
+     * Also see the [Bootstrap docs](http://getbootstrap.com/javascript/#modals-sizes)
+     *
+     * @property size
+     * @type String
+     * @public
+     */
+    size: null,
+
+    /**
+     * If true clicking on the backdrop will close the modal.
+     *
+     * @property backdropClose
+     * @type boolean
+     * @default true
+     * @public
+     */
+    backdropClose: true,
+
+    /**
+     * If true component will render in place, rather than be wormholed.
+     *
+     * @property renderInPlace
+     * @type boolean
+     * @default false
+     * @public
+     */
+    renderInPlace: false,
+
+    /**
+     * @property _renderInPlace
+     * @type boolean
+     * @private
+     */
+    _renderInPlace: Ember.computed('renderInPlace', 'destinationElement', function () {
+      return this.get('renderInPlace') || !this.get('destinationElement');
+    }),
+
+    /**
+     * The duration of the fade transition
+     *
+     * @property transitionDuration
+     * @type number
+     * @default 300
+     * @public
+     */
+    transitionDuration: 300,
+
+    /**
+     * The duration of the backdrop fade transition
+     *
+     * @property backdropTransitionDuration
+     * @type number
+     * @default 150
+     * @public
+     */
+    backdropTransitionDuration: 150,
+
+    /**
+     * @property isFastBoot
+     * @type {Boolean}
+     * @private
+     */
+    isFastBoot: Ember.computed(function () {
+      if (!Ember.getOwner) {
+        // Ember.getOwner is available as of Ember 2.3, while FastBoot requires 2.4. So just return false...
+        return false;
+      }
+
+      var owner = Ember.getOwner(this);
+      if (!owner) {
+        return false;
+      }
+
+      var fastboot = owner.lookup('service:fastboot');
+      if (!fastboot) {
+        return false;
+      }
+
+      return Ember.get(fastboot, 'isFastBoot');
+    }),
+
+    /**
+     * The action to be sent when the modal footer's submit button (if present) is pressed.
+     * Note that if your modal body contains a form (e.g. [Components.Form](Components.Form.html){{/crossLink}}) this action will
+     * not be triggered. Instead a submit event will be triggered on the form itself. See the class description for an
+     * example.
+     *
+     * @property onSubmit
+     * @type function
+     * @public
+     */
+    onSubmit: function onSubmit() {},
+
+    /**
+     * The action to be sent when the modal is closing.
+     * This will be triggered by pressing the modal header's close button (x button) or the modal footer's close button.
+     * Note that this will happen before the modal is hidden from the DOM, as the fade transitions will still need some
+     * time to finish. Use the `onHidden` if you need the modal to be hidden when the action triggers.
+     *
+     * You can return false to prevent closing the modal automatically, and do that in your action by
+     * setting `open` to false.
+     *
+     * @property onHide
+     * @type function
+     * @public
+     */
+    onHide: function onHide() {},
+
+    /**
+     * The action to be sent after the modal has been completely hidden (including the CSS transition).
+     *
+     * @property onHidden
+     * @type function
+     * @default null
+     * @public
+     */
+    onHidden: function onHidden() {},
+
+    /**
+     * The action to be sent when the modal is opening.
+     * This will be triggered immediately after the modal is shown (so it's safe to access the DOM for
+     * size calculations and the like). This means that if fade=true, it will be shown in between the
+     * backdrop animation and the fade animation.
+     *
+     * @property onShow
+     * @type function
+     * @default null
+     * @public
+     */
+    onShow: function onShow() {},
+
+    /**
+     * The action to be sent after the modal has been completely shown (including the CSS transition).
+     *
+     * @property onShown
+     * @type function
+     * @public
+     */
+    onShown: function onShown() {},
+
+    actions: {
+      close: function close() {
+        if (this.get('onHide')() !== false) {
+          this.set('isOpen', false);
+        }
+      },
+      submit: function submit() {
+        // replace modalId by :scope selector if supported by all target browsers
+        var modalId = this.get('modalId');
+        var forms = this.get('modalElement').querySelectorAll('#' + modalId + ' .modal-body form');
+        if (forms.length > 0) {
+          // trigger submit event on body forms
+          var event = document.createEvent('Events');
+          event.initEvent('submit', true, true);
+          Array.prototype.slice.call(forms).forEach(function (form) {
+            return form.dispatchEvent(event);
+          });
+        } else {
+          // if we have no form, we send a submit action
+          this.get('onSubmit')();
+        }
+      }
+    },
+
+    /**
+     * Give the modal (or its autofocus element) focus
+     *
+     * @method takeFocus
+     * @private
+     */
+    takeFocus: function takeFocus() {
+      var modalEl = this.get('modalElement');
+      var focusElement = modalEl && modalEl.querySelector('[autofocus]');
+      if (!focusElement) {
+        focusElement = modalEl;
+      }
+      if (focusElement) {
+        focusElement.focus();
+      }
+    },
+
+    /**
+     * Show the modal
+     *
+     * @method show
+     * @private
+     */
+    show: function show() {
+      if (this._isOpen) {
+        return;
+      }
+      this._isOpen = true;
+
+      document.body.classList.add('modal-open');
+
+      this.resize();
+
+      var callback = function callback() {
+        var _this = this;
+
+        if (this.get('isDestroyed')) {
+          return;
+        }
+
+        this.checkScrollbar();
+        this.setScrollbar();
+
+        Ember.run.schedule('afterRender', function () {
+          var modalEl = _this.get('modalElement');
+          if (!modalEl) {
+            return;
+          }
+
+          modalEl.scrollTop = 0;
+          _this.handleUpdate();
+          _this.set('showModal', true);
+          _this.get('onShow')();
+
+          if (_this.get('usesTransition')) {
+            (0, _emberBootstrapUtilsTransitionEnd['default'])(_this.get('modalElement'), function () {
+              this.takeFocus();
+              this.get('onShown')();
+            }, _this, _this.get('transitionDuration'));
+          } else {
+            _this.takeFocus();
+            _this.get('onShown')();
+          }
+        });
+      };
+      this.set('inDom', true);
+      this.handleBackdrop(callback);
+    },
+
+    /**
+     * Hide the modal
+     *
+     * @method hide
+     * @private
+     */
+    hide: function hide() {
+      if (!this._isOpen) {
+        return;
+      }
+      this._isOpen = false;
+
+      this.resize();
+      this.set('showModal', false);
+
+      if (this.get('usesTransition')) {
+        (0, _emberBootstrapUtilsTransitionEnd['default'])(this.get('modalElement'), this.hideModal, this, this.get('transitionDuration'));
+      } else {
+        this.hideModal();
+      }
+    },
+
+    /**
+     * Clean up after modal is hidden and call onHidden
+     *
+     * @method hideModal
+     * @private
+     */
+    hideModal: function hideModal() {
+      var _this2 = this;
+
+      if (this.get('isDestroyed')) {
+        return;
+      }
+
+      this.handleBackdrop(function () {
+        document.body.classList.remove('modal-open');
+        _this2.resetAdjustments();
+        _this2.resetScrollbar();
+        _this2.set('inDom', false);
+        _this2.get('onHidden')();
+      });
+    },
+
+    /**
+     * SHow/hide the backdrop
+     *
+     * @method handleBackdrop
+     * @param callback
+     * @private
+     */
+    handleBackdrop: function handleBackdrop(callback) {
+      var doAnimate = this.get('usesTransition');
+
+      if (this.get('isOpen') && this.get('backdrop')) {
+        this.set('showBackdrop', true);
+
+        if (!callback) {
+          return;
+        }
+
+        Ember.run.schedule('afterRender', this, function () {
+          var backdrop = this.get('backdropElement');
+          true && !backdrop && Ember.assert('Backdrop element should be in DOM', backdrop);
+
+          if (doAnimate) {
+            (0, _emberBootstrapUtilsTransitionEnd['default'])(backdrop, callback, this, this.get('backdropTransitionDuration'));
+          } else {
+            callback.call(this);
+          }
+        });
+      } else if (!this.get('isOpen') && this.get('backdrop')) {
+        var backdrop = this.get('backdropElement');
+        true && !backdrop && Ember.assert('Backdrop element should be in DOM', backdrop);
+
+        var callbackRemove = function callbackRemove() {
+          if (this.get('isDestroyed')) {
+            return;
+          }
+          this.set('showBackdrop', false);
+          if (callback) {
+            callback.call(this);
+          }
+        };
+        if (doAnimate) {
+          (0, _emberBootstrapUtilsTransitionEnd['default'])(backdrop, callbackRemove, this, this.get('backdropTransitionDuration'));
+        } else {
+          callbackRemove.call(this);
+        }
+      } else if (callback) {
+        Ember.run.next(this, callback);
+      }
+    },
+
+    /**
+     * Attach/Detach resize event listeners
+     *
+     * @method resize
+     * @private
+     */
+    resize: function resize() {
+      if (this.get('isOpen')) {
+        this._handleUpdate = Ember.run.bind(this, this.handleUpdate);
+        window.addEventListener('resize', this._handleUpdate, false);
+      } else {
+        window.removeEventListener('resize', this._handleUpdate, false);
+      }
+    },
+
+    /**
+     * @method handleUpdate
+     * @private
+     */
+    handleUpdate: function handleUpdate() {
+      this.adjustDialog();
+    },
+
+    /**
+     * @method adjustDialog
+     * @private
+     */
+    adjustDialog: function adjustDialog() {
+      var modalIsOverflowing = this.get('modalElement').scrollHeight > document.documentElement.clientHeight;
+      this.setProperties({
+        paddingLeft: !this.bodyIsOverflowing && modalIsOverflowing ? this.get('scrollbarWidth') : null,
+        paddingRight: this.bodyIsOverflowing && !modalIsOverflowing ? this.get('scrollbarWidth') : null
+      });
+    },
+
+    /**
+     * @method resetAdjustments
+     * @private
+     */
+    resetAdjustments: function resetAdjustments() {
+      this.setProperties({
+        paddingLeft: null,
+        paddingRight: null
+      });
+    },
+
+    /**
+     * @method checkScrollbar
+     * @private
+     */
+    checkScrollbar: function checkScrollbar() {
+      var fullWindowWidth = window.innerWidth;
+      if (!fullWindowWidth) {
+        // workaround for missing window.innerWidth in IE8
+        var documentElementRect = document.documentElement.getBoundingClientRect();
+        fullWindowWidth = documentElementRect.right - Math.abs(documentElementRect.left);
+      }
+
+      this.bodyIsOverflowing = document.body.clientWidth < fullWindowWidth;
+    },
+
+    /**
+     * @method setScrollbar
+     * @private
+     */
+    setScrollbar: function setScrollbar() {
+      var bodyPad = parseInt(document.body.style.paddingRight || 0, 10);
+      this._originalBodyPad = document.body.style.paddingRight || '';
+      if (this.bodyIsOverflowing) {
+        document.body.style.paddingRight = bodyPad + this.get('scrollbarWidth');
+      }
+    },
+
+    /**
+     * @method resetScrollbar
+     * @private
+     */
+    resetScrollbar: function resetScrollbar() {
+      document.body.style.paddingRight = this._originalBodyPad;
+    },
+
+    /**
+     * @property scrollbarWidth
+     * @type number
+     * @readonly
+     * @private
+     */
+    scrollbarWidth: Ember.computed(function () {
+      var scrollDiv = document.createElement('div');
+      scrollDiv.className = 'modal-scrollbar-measure';
+      var modalEl = this.get('modalElement');
+      modalEl.parentNode.insertBefore(scrollDiv, modalEl.nextSibling);
+      var scrollbarWidth = scrollDiv.offsetWidth - scrollDiv.clientWidth;
+      scrollDiv.parentNode.removeChild(scrollDiv);
+      return scrollbarWidth;
+    }),
+
+    didInsertElement: function didInsertElement() {
+      this._super.apply(this, arguments);
+      if (this.get('isOpen')) {
+        this.show();
+      }
+    },
+    willDestroyElement: function willDestroyElement() {
+      this._super.apply(this, arguments);
+      window.removeEventListener('resize', this._handleUpdate, false);
+      document.body.classList.remove('modal-open');
+      this.resetScrollbar();
+    },
+
+    _observeOpen: Ember.observer('isOpen', function () {
+      if (this.get('isOpen')) {
+        this.show();
+      } else {
+        this.hide();
+      }
+    }),
+
+    init: function init() {
+      this._super.apply(this, arguments);
+
+      var _getProperties = this.getProperties('isOpen', 'backdrop', 'fade', 'isFastBoot'),
+          isOpen = _getProperties.isOpen,
+          backdrop = _getProperties.backdrop,
+          fade = _getProperties.fade,
+          isFastBoot = _getProperties.isFastBoot;
+
+      this.setProperties({
+        showModal: isOpen && (!fade || isFastBoot),
+        showBackdrop: isOpen && backdrop,
+        inDom: isOpen
+      });
+    }
+  });
+});
+define('ember-bootstrap/components/base/bs-modal/body', ['exports', 'ember-bootstrap/templates/components/bs-modal/body'], function (exports, _emberBootstrapTemplatesComponentsBsModalBody) {
+  'use strict';
+
+  /**
+  
+   Modal body element used within [Components.Modal](Components.Modal.html) components. See there for examples.
+  
+   @class ModalBody
+   @namespace Components
+   @extends Ember.Component
+   @public
+   */
+  exports['default'] = Ember.Component.extend({
+    layout: _emberBootstrapTemplatesComponentsBsModalBody['default'],
+    classNames: ['modal-body']
+  });
+});
+define('ember-bootstrap/components/base/bs-modal/dialog', ['exports', 'ember-bootstrap/templates/components/bs-modal/dialog'], function (exports, _emberBootstrapTemplatesComponentsBsModalDialog) {
+  'use strict';
+
+  /**
+    Internal component for modal's markup and event handling. Should not be used directly.
+  
+    @class ModalDialog
+    @namespace Components
+    @extends Ember.Component
+    @private
+   */
+  exports['default'] = Ember.Component.extend({
+    layout: _emberBootstrapTemplatesComponentsBsModalDialog['default'],
+    classNames: ['modal'],
+    classNameBindings: ['fade'],
+    attributeBindings: ['tabindex', 'style'],
+    ariaRole: 'dialog',
+    tabindex: '-1',
+
+    /**
+     * Set to false to disable fade animations.
+     *
+     * @property fade
+     * @type boolean
+     * @default true
+     * @public
+     */
+    fade: true,
+
+    /**
+     * Used to apply Bootstrap's visibility classes
+     *
+     * @property showModal
+     * @type boolean
+     * @default false
+     * @private
+     */
+    showModal: false,
+
+    /**
+     * Render modal markup?
+     *
+     * @property inDom
+     * @type boolean
+     * @default false
+     * @private
+     */
+    inDom: false,
+
+    /**
+     * @property paddingLeft
+     * @type number|null
+     * @default null
+     * @private
+     */
+    paddingLeft: null,
+
+    /**
+     * @property paddingRight
+     * @type number|null
+     * @default null
+     * @private
+     */
+    paddingRight: null,
+
+    /**
+     * Closes the modal when escape key is pressed.
+     *
+     * @property keyboard
+     * @type boolean
+     * @default true
+     * @public
+     */
+    keyboard: true,
+
+    /**
+     * Property for size styling, set to null (default), 'lg' or 'sm'
+     *
+     * Also see the [Bootstrap docs](http://getbootstrap.com/javascript/#modals-sizes)
+     *
+     * @property size
+     * @type String
+     * @public
+     */
+    size: null,
+
+    /**
+     * If true clicking on the backdrop will close the modal.
+     *
+     * @property backdropClose
+     * @type boolean
+     * @default true
+     * @public
+     */
+    backdropClose: true,
+
+    /**
+     * @property style
+     * @type string
+     * @readOnly
+     * @private
+     */
+    style: Ember.computed('inDom', 'paddingLeft', 'paddingRight', function () {
+      var styles = [];
+
+      var _getProperties = this.getProperties('inDom', 'paddingLeft', 'paddingRight'),
+          inDom = _getProperties.inDom,
+          paddingLeft = _getProperties.paddingLeft,
+          paddingRight = _getProperties.paddingRight;
+
+      if (inDom) {
+        styles.push('display: block');
+      }
+      if (paddingLeft) {
+        styles.push('padding-left: ' + paddingLeft + 'px');
+      }
+      if (paddingRight) {
+        styles.push('padding-right: ' + paddingRight + 'px');
+      }
+
+      return Ember.String.htmlSafe(styles.join(';'));
+    }),
+
+    /**
+     * Name of the size class
+     *
+     * @property sizeClass
+     * @type string
+     * @readOnly
+     * @private
+     */
+    sizeClass: Ember.computed('size', function () {
+      var size = this.get('size');
+      return Ember.isBlank(size) ? null : 'modal-' + size;
+    }).readOnly(),
+
+    /**
+     * @event onClose
+     * @public
+     */
+    onClose: function onClose() {},
+    keyDown: function keyDown(e) {
+      var code = e.keyCode || e.which;
+      if (code === 27 && this.get('keyboard')) {
+        this.get('onClose')();
+      }
+    },
+    _click: function _click(e) {
+      if (!e.target.classList.contains('modal') || !this.get('backdropClose')) {
+        return;
+      }
+      this.get('onClose')();
+    },
+    didInsertElement: function didInsertElement() {
+      this._super.apply(this, arguments);
+      // Ember events use event delegation, but we need to add an `onclick` handler directly on the modal element for
+      // iOS to allow clicking the div. So a `click(){}` method here won't work, we need to attach an event listener
+      // directly to the element
+      this.element.onclick = Ember.run.bind(this, this._click);
+    },
+    willDestroyElement: function willDestroyElement() {
+      this.element.onclick = null;
+    }
+  });
+});
+define('ember-bootstrap/components/base/bs-modal/footer', ['exports', 'ember-bootstrap/templates/components/bs-modal/footer'], function (exports, _emberBootstrapTemplatesComponentsBsModalFooter) {
+  'use strict';
+
+  /**
+  
+   Modal footer element used within [Components.Modal](Components.Modal.html) components. See there for examples.
+  
+   @class ModalFooter
+   @namespace Components
+   @extends Ember.Component
+   @public
+   */
+  exports['default'] = Ember.Component.extend({
+    layout: _emberBootstrapTemplatesComponentsBsModalFooter['default'],
+    tagName: 'form',
+    classNames: ['modal-footer'],
+
+    /**
+     * The title of the default close button. Will be ignored (i.e. no close button) if you provide your own block
+     * template.
+     *
+     * @property closeTitle
+     * @type string
+     * @default 'Ok'
+     * @public
+     */
+    closeTitle: 'Ok',
+
+    /**
+     * The title of the submit button (primary button). Will be ignored (i.e. no button) if set to null or if you provide
+     * your own block template.
+     *
+     * @property submitTitle
+     * @type string
+     * @default null
+     * @public
+     */
+    submitTitle: null,
+
+    hasSubmitButton: Ember.computed.notEmpty('submitTitle'),
+
+    /**
+     * Set to true to disable the submit button. If you bind this to some property that indicates if submitting is allowed
+     * (form validation for example) this can be used to prevent the user from pressing the submit button.
+     *
+     * @property submitDisabled
+     * @type boolean
+     * @default false
+     * @public
+     */
+    submitDisabled: false,
+
+    /**
+     * The type of the submit button (primary button).
+     *
+     * @property submitButtonType
+     * @type string
+     * @default 'primary'
+     * @public
+     */
+    submitButtonType: 'primary',
+
+    /**
+     * The action to send to the parent modal component when the modal footer's form is submitted
+     *
+     * @event onSubmit
+     * @public
+     */
+    onSubmit: function onSubmit() {},
+
+    /**
+     * @event onClose
+     * @public
+     */
+    onClose: function onClose() {},
+    submit: function submit(e) {
+      e.preventDefault();
+      // send to parent bs-modal component
+      this.get('onSubmit')();
+    }
+  });
+});
+define('ember-bootstrap/components/base/bs-modal/header', ['exports', 'ember-bootstrap/templates/components/bs-modal/header'], function (exports, _emberBootstrapTemplatesComponentsBsModalHeader) {
+  'use strict';
+
+  /**
+  
+   Modal header element used within [Components.Modal](Components.Modal.html) components. See there for examples.
+  
+   @class ModalHeader
+   @namespace Components
+   @extends Ember.Component
+   @public
+   */
+  exports['default'] = Ember.Component.extend({
+    layout: _emberBootstrapTemplatesComponentsBsModalHeader['default'],
+    classNames: ['modal-header'],
+
+    /**
+     * Show a close button (x icon)
+     *
+     * @property closeButton
+     * @type boolean
+     * @default true
+     * @public
+     */
+    closeButton: true,
+
+    /**
+     * The title to display in the modal header
+     *
+     * @property title
+     * @type string
+     * @default null
+     * @public
+     */
+    title: null,
+
+    /**
+     * @event onClose
+     * @public
+     */
+    onClose: function onClose() {}
+  });
+});
+define('ember-bootstrap/components/base/bs-modal/header/close', ['exports', 'ember-bootstrap/templates/components/bs-modal/header/close'], function (exports, _emberBootstrapTemplatesComponentsBsModalHeaderClose) {
+  'use strict';
+
+  /**
+  
+   @class ModalHeaderClose
+   @namespace Components
+   @extends Ember.Component
+   @private
+   */
+  exports['default'] = Ember.Component.extend({
+    layout: _emberBootstrapTemplatesComponentsBsModalHeaderClose['default'],
+    tagName: 'button',
+    classNames: ['close'],
+    attributeBindings: ['type', 'aria-label'],
+    'aria-label': 'Close',
+    type: 'button',
+
+    /**
+     * @event onClick
+     * @public
+     */
+    onClick: function onClick() {},
+    click: function click() {
+      this.get('onClick')();
+    }
+  });
+});
+define('ember-bootstrap/components/base/bs-modal/header/title', ['exports', 'ember-bootstrap/templates/components/bs-modal/header/title'], function (exports, _emberBootstrapTemplatesComponentsBsModalHeaderTitle) {
+  'use strict';
+
+  /**
+  
+   @class ModalHeaderTitle
+   @namespace Components
+   @extends Ember.Component
+   @private
+   */
+  exports['default'] = Ember.Component.extend({
+    layout: _emberBootstrapTemplatesComponentsBsModalHeaderTitle['default'],
+    tagName: 'h4',
+    classNames: ['modal-title']
+  });
+});
+define('ember-bootstrap/components/base/bs-nav', ['exports', 'ember-bootstrap/templates/components/bs-nav'], function (exports, _emberBootstrapTemplatesComponentsBsNav) {
+  'use strict';
+
+  /**
+  
+   Component to generate [bootstrap navs](http://getbootstrap.com/components/#nav)
+  
+   ### Usage
+  
+   Use in combination with the yielded components
+  
+   * [Components.NavItem](Components.NavItem.html)
+   * [Components.NavLinkTo](Components.NavLinkTo.html)
+   * [`nav.dropdown`](Components.Dropdown.html)
+  
+   ```hbs
+   {{#bs-nav type="pills" as |nav|}}
+     {{#nav.item}}
+        {{#nav.link-to "foo"}}Foo{{/nav.link-to}}
+     {{/nav.item}}
+     {{#nav.item}}
+       {{#nav.link-to "bar"}}Bar{{/nav.link-to}}
+     {{/nav.item}}
+   {{/bs-nav}}
+   ```
+  
+   ### Nav styles
+  
+   The component supports the default bootstrap nav styling options "pills" and "tabs" through the `type`
+   property, as well as the `justified` and `stacked` properties.
+  
+   ### Active items
+  
+   Bootstrap expects to have the `active` class on the `<li>` element that should be the active (highlighted)
+   navigation item. To achieve that just use the `link-to` helper as usual. If the link is active, i.e
+   it points to the current route, the `bs-nav-item` component will detect that and apply the `active` class
+   automatically. The same applies for the `disabled` state.
+  
+   ### Dropdowns
+  
+   Use the `nav.dropdown` contextual version of the [Components.Dropdown](Components.Dropdown.html) component
+   with a `tagName` of "li" to integrate a dropdown into your nav:
+  
+   ```hbs
+   {{#bs-nav type="pills" as |nav|}}
+     {{#nav.item}}{{#nav.link-to "index"}}Home{{/nav.link-to}}{{/nav.item}}
+     {{#nav.dropdown as |dd|}}
+       {{#dd.toggle}}Dropdown <span class="caret"></span>{{/dd.toggle}}
+       {{#dd.menu as |ddm|}}
+         {{#ddm.item}}{{#ddm.link-to "foo"}}Foo{{/ddm.link-to}}{{/ddm.item}}
+         {{#ddm.item}}{{#ddm.link-to "bar"}}Bar{{/ddm.link-to}}{{/ddm.item}}
+       {{/dd.menu}}
+     {{/nav.dropdown}}
+   {{/bs-nav}}
+   ```
+  
+   ### Bootstrap 3/4 Notes
+  
+   Use [`nav.link-to`](Components.NavLinkTo.html) for in-app links to ensure proper styling regardless of
+   Bootstrap version. Explicit use of `<a>` tags in Bootstrap 4 must apply the `nav-link` class and manage
+   the `active` state explicitly.
+  
+   You can override `tagName` if you want to use Bootstrap 4's ability to represent more structural
+   components with `div` tags.
+  
+   @class Nav
+   @namespace Components
+   @extends Ember.Component
+   @public
+  
+   */
+  exports['default'] = Ember.Component.extend({
+    layout: _emberBootstrapTemplatesComponentsBsNav['default'],
+
+    tagName: 'ul',
+    classNames: ['nav'],
+
+    classNameBindings: ['typeClass', 'justified:nav-justified'],
+
+    typeClass: Ember.computed('type', function () {
+      var type = this.get('type');
+      if (Ember.isPresent(type)) {
+        return 'nav-' + type;
+      }
+    }),
+
+    /**
+     * Special type of nav, either "pills" or "tabs"
+     *
+     * @property type
+     * @type String
+     * @default null
+     * @public
+     */
+    type: null,
+
+    /**
+     * Make the nav justified, see [bootstrap docs](http://getbootstrap.com/components/#nav-justified)
+     *
+     * @property justified
+     * @type boolean
+     * @default false
+     * @public
+     */
+    justified: false,
+
+    /**
+     * Make the nav pills stacked, see [bootstrap docs](http://getbootstrap.com/components/#nav-pills)
+     *
+     * @property stacked
+     * @type boolean
+     * @default false
+     * @public
+     */
+    stacked: false,
+
+    /**
+     * @property itemComponent
+     * @type {String}
+     * @private
+     */
+    itemComponent: 'bs-nav/item',
+
+    /**
+     * @property linkToComponent
+     * @type {String}
+     * @private
+     */
+    linkToComponent: 'bs-nav/link-to',
+
+    /**
+     * @property dropdownComponent
+     * @type {String}
+     * @private
+     */
+    dropdownComponent: 'bs-dropdown'
+  });
+});
+define('ember-bootstrap/components/base/bs-nav/item', ['exports', 'ember-bootstrap/templates/components/bs-nav/item', 'ember-bootstrap/mixins/component-parent'], function (exports, _emberBootstrapTemplatesComponentsBsNavItem, _emberBootstrapMixinsComponentParent) {
+  'use strict';
+
+  /**
+  
+   Component for each item within a [Components.Nav](Components.Nav.html) component. Have a look there for examples.
+  
+   @class NavItem
+   @namespace Components
+   @extends Ember.Component
+   @uses Mixins.ComponentParent
+   @public
+   */
+  exports['default'] = Ember.Component.extend(_emberBootstrapMixinsComponentParent['default'], {
+    layout: _emberBootstrapTemplatesComponentsBsNavItem['default'],
+    classNameBindings: ['disabled', 'active'],
+    tagName: 'li',
+    ariaRole: 'presentation',
+
+    /**
+     * Render the nav item as disabled (see [Bootstrap docs](http://getbootstrap.com/components/#nav-disabled-links)).
+     * By default it will look at any nested `link-to` components and make itself disabled if there is a disabled link.
+     * See the [link-to API](http://emberjs.com/api/classes/Ember.Templates.helpers.html#toc_disabling-the-code-link-to-code-component)
+     *
+     * @property disabled
+     * @type boolean
+     * @public
+     */
+    disabled: Ember.computed.reads('_disabled'),
+    _disabled: false,
+
+    /**
+     * Render the nav item as active.
+     * By default it will look at any nested `link-to` components and make itself active if there is an active link
+     * (i.e. the link points to the current route).
+     * See the [link-to API](http://emberjs.com/api/classes/Ember.Templates.helpers.html#toc_handling-current-route)
+     *
+     * @property active
+     * @type boolean
+     * @public
+     */
+    active: Ember.computed.reads('_active'),
+    _active: false,
+
+    /**
+     * Collection of all `Ember.LinkComponent`s that are children
+     *
+     * @property childLinks
+     * @private
+     */
+    childLinks: Ember.computed.filter('children', function (view) {
+      return view instanceof Ember.LinkComponent;
+    }),
+
+    activeChildLinks: Ember.computed.filterBy('childLinks', 'active'),
+    hasActiveChildLinks: Ember.computed.gt('activeChildLinks.length', 0),
+
+    disabledChildLinks: Ember.computed.filterBy('childLinks', 'disabled'),
+    hasDisabledChildLinks: Ember.computed.gt('disabledChildLinks.length', 0),
+
+    /**
+     * Called when clicking the nav item
+     *
+     * @event onClick
+     * @public
+     */
+    onClick: function onClick() {},
+    click: function click() {
+      this.onClick();
+    },
+    init: function init() {
+      this._super.apply(this, arguments);
+      this.get('activeChildLinks');
+      this.get('disabledChildLinks');
+    },
+
+    _observeActive: Ember.observer('activeChildLinks.[]', function () {
+      Ember.run.scheduleOnce('afterRender', this, this._updateActive);
+    }),
+
+    _updateActive: function _updateActive() {
+      this.set('_active', this.get('hasActiveChildLinks'));
+    },
+
+    _observeDisabled: Ember.observer('disabledChildLinks.[]', function () {
+      Ember.run.scheduleOnce('afterRender', this, this._updateDisabled);
+    }),
+
+    _updateDisabled: function _updateDisabled() {
+      this.set('_disabled', this.get('hasDisabledChildLinks'));
+    }
+  });
+});
+define('ember-bootstrap/components/base/bs-nav/link-to', ['exports', 'ember-bootstrap/mixins/component-child'], function (exports, _emberBootstrapMixinsComponentChild) {
+  'use strict';
+
+  /**
+  
+   Extended `{{link-to}}` component for use within Navs.
+  
+   @class NavLinkTo
+   @namespace Components
+   @extends Ember.LinkComponent
+   @uses Mixins.ComponentChild
+   @public
+   */
+  exports['default'] = Ember.LinkComponent.extend(_emberBootstrapMixinsComponentChild['default'], {});
+});
+define('ember-bootstrap/components/base/bs-navbar', ['exports', 'ember-bootstrap/mixins/type-class', 'ember-bootstrap/templates/components/bs-navbar', 'ember-bootstrap/utils/listen-to-cp'], function (exports, _emberBootstrapMixinsTypeClass, _emberBootstrapTemplatesComponentsBsNavbar, _emberBootstrapUtilsListenToCp) {
+  'use strict';
+
+  /**
+   Component to generate [Bootstrap navbars](http://getbootstrap.com/components/#navbar).
+  
+   ### Usage
+  
+   Uses the following components by a contextual reference:
+  
+   ```hbs
+   {{#bs-navbar as |navbar|}}
+     <div class="navbar-header">
+       {{navbar.toggle}}
+       <a class="navbar-brand" href="#">Brand</a>
+     </div>
+     {{#navbar.content}}
+       {{#navbar.nav as |nav|}}
+         {{#nav.item}}
+           {{#nav.link-to "home"}}Home{{/nav.link-to}}
+         {{/nav.item}}
+         {{#nav.item}}
+           {{#nav.link-to "navbars"}}Navbars{{/nav.link-to}}
+         {{/nav.item}}
+       {{/navbar.nav}}
+     {{/navbar.content}}
+   {{/bs-navbar}}
+   ```
+  
+   **Note:** the `<div class="navbar-header">` is required for BS3 to hold the elements visible on a mobile breakpoint,
+   when the actual content is collapsed. It should *not* be used for BS4!
+  
+   The component yields references to the following contextual components:
+  
+   * [Components.NavbarContent](Components.NavbarContent.html)
+   * [Components.NavbarToggle](Components.NavbarToggle.html)
+   * [Components.NavbarNav](Components.NavbarNav.html)
+  
+   Furthermore references to the following actions are yielded:
+  
+   * `collapse`: triggers the `onCollapse` action and collapses the navbar (mobile)
+   * `expand`: triggers the `onExpand` action and expands the navbar (mobile)
+  
+   ### Responsive Design
+  
+   For the mobile breakpoint the Bootstrap styles will hide the navbar content (`{{navbar.content}}`). Clicking on the
+   navbar toggle button (`{{navbar.toggle}}`) will expand the menu. By default all nav links (`{{nav.link-to}}`) are already
+   wired up to call the navbar's `collapse` action, so clicking any of them will collapse the navbar. To selectively
+   prevent that, you can set its `collapseNavbar` property to false:
+  
+   ```hbs
+   {{#nav.item}}
+     {{#nav.link-to "index" collapseNavbar=false}}Don't collapse{{/nav.link-to}}
+   {{/nav.item}}
+   ```
+  
+   To collapse the navbar when clicking on some nav items that are not internal links, you can use the yielded `collapse`
+   action:
+  
+   ```hbs
+   {#bs-navbar as |navbar|}}
+     {{#navbar.content}}
+       {{#navbar.nav as |nav|}}
+         {{#nav.item}}
+           <a {{action navbar.collapse}}>Collapse</a>
+         {{/nav.item}}
+       {{/navbar.nav}}
+     {{/navbar.content}}
+   {{/bs-navbar}}
+   ```
+  
+   ### Navbar styles
+  
+   The component supports the default bootstrap navbar styling options through the `type`
+   property. Bootstrap navbars [do not currently support justified nav links](http://getbootstrap.com/components/#navbar-default),
+   so those are explicitly disallowed.
+  
+   Other bootstrap navbar variations, such as forms, buttons, etc. can be supported through direct use of
+   bootstrap styles applied through the `class` attribute on the components.
+  
+   ### Bootstrap 3/4 Notes
+  
+   Bootstrap 4 changed the default navbar styling option from `navbar-default` to `navbar-light`.
+   If you explicitly specified "default" in Bootstrap 3 and are migrating, you will need to change
+   this in your code. Bootstrap 4 changes `navbar-inverse` to `navbar-dark`.
+  
+   Bootstrap 4 navbars are fluid by default without the need for an additional container. An
+   additional container is added like with Bootstrap 3 if `fluid` is `false`.
+  
+   @class Navbar
+   @namespace Components
+   @extends Ember.Component
+   @uses Mixins.TypeClass
+   @public
+  
+   */
+  exports['default'] = Ember.Component.extend(_emberBootstrapMixinsTypeClass['default'], {
+    layout: _emberBootstrapTemplatesComponentsBsNavbar['default'],
+
+    tagName: 'nav',
+    classNames: ['navbar'],
+    classNameBindings: ['positionClass'],
+
+    classTypePrefix: 'navbar',
+
+    /**
+     * Manages the state for the responsive menu between the toggle and the content.
+     *
+     * @property collapsed
+     * @type boolean
+     * @default true
+     * @public
+     */
+    collapsed: true,
+
+    /**
+     * @property _collapsed
+     * @private
+     */
+    _collapsed: (0, _emberBootstrapUtilsListenToCp['default'])('collapsed'),
+
+    /**
+     * Controls whether the wrapping div is a fluid container or not.
+     *
+     * @property fluid
+     * @type boolean
+     * @default true
+     * @public
+     */
+    fluid: true,
+
+    /**
+     * Specifies the position classes for the navbar, currently supporting none, "fixed-top", "fixed-bottom", and
+     * either "static-top" (BS3) or "sticky-top" (BS4).
+     * See the [bootstrap docs](http://getbootstrap.com/components/#navbar-fixed-top) for details.
+     *
+     * @property position
+     * @type String
+     * @default null
+     * @public
+     */
+    position: null,
+
+    positionClass: Ember.computed('position', function () {
+      var position = this.get('position');
+      var validPositions = this.get('_validPositions');
+      var positionPrefix = this.get('_positionPrefix');
+
+      if (validPositions.indexOf(position) === -1) {
+        return null;
+      }
+
+      return '' + positionPrefix + position;
+    }),
+
+    /**
+     * The action to be sent when the navbar is about to be collapsed.
+     *
+     * You can return false to prevent collapsing the navbar automatically, and do that in your action by
+     * setting `collapsed` to true.
+     *
+     * @event onCollapse
+     * @public
+     */
+    onCollapse: function onCollapse() {},
+
+    /**
+     * The action to be sent after the navbar has been collapsed (including the CSS transition).
+     *
+     * @event onCollapsed
+     * @public
+     */
+    onCollapsed: function onCollapsed() {},
+
+    /**
+     * The action to be sent when the navbar is about to be expanded.
+     *
+     * You can return false to prevent expanding the navbar automatically, and do that in your action by
+     * setting `collapsed` to false.
+     *
+     * @event onExpand
+     * @public
+     */
+    onExpand: function onExpand() {},
+
+    /**
+     * The action to be sent after the navbar has been expanded (including the CSS transition).
+     *
+     * @event onExpanded
+     * @public
+     */
+    onExpanded: function onExpanded() {},
+
+    _onCollapsedChange: Ember.observer('_collapsed', function () {
+      var collapsed = this.get('_collapsed');
+      var active = this.get('active');
+      if (collapsed !== active) {
+        return;
+      }
+      if (collapsed === false) {
+        this.show();
+      } else {
+        this.hide();
+      }
+    }),
+
+    /**
+     * @method expand
+     * @private
+     */
+    expand: function expand() {
+      if (this.onExpand() !== false) {
+        this.set('_collapsed', false);
+      }
+    },
+
+    /**
+     * @method collapse
+     * @private
+     */
+    collapse: function collapse() {
+      if (this.onCollapse() !== false) {
+        this.set('_collapsed', true);
+      }
+    },
+
+    actions: {
+      expand: function expand() {
+        this.expand();
+      },
+      collapse: function collapse() {
+        this.collapse();
+      },
+      toggleNavbar: function toggleNavbar() {
+        if (this.get('_collapsed')) {
+          this.expand();
+        } else {
+          this.collapse();
+        }
+      }
+    }
+
+    /**
+     * Bootstrap 4 Only: Defines the responsive toggle breakpoint size. Options are the standard
+     * two character Bootstrap size abbreviations. Used to set the `navbar-expand-*`
+     * class. Set to `null` to disable collapsing.
+     *
+     * @property toggleBreakpoint
+     * @type String
+     * @default 'lg'
+     * @public
+     */
+
+    /**
+     * Bootstrap 4 Only: Sets the background color for the navbar. Can be any color
+     * in the set that composes the `bg-*` classes and can be extended by creating your
+     * own `bg-*` classes.
+     *
+     * @property backgroundColor
+     * @type String
+     * @default 'light'
+     * @public
+     */
+  });
+});
+define('ember-bootstrap/components/base/bs-navbar/content', ['exports', 'ember-bootstrap/templates/components/bs-navbar/content', 'ember-bootstrap/components/bs-collapse'], function (exports, _emberBootstrapTemplatesComponentsBsNavbarContent, _emberBootstrapComponentsBsCollapse) {
+  'use strict';
+
+  /**
+   * Component to wrap the collapsible content of a [Components.Navbar](Components.Navbar.html) component.
+   * Have a look there for examples.
+   *
+   * @class NavbarContent
+   * @namespace Components
+   * @extends Components.Collapse
+   * @public
+   */
+  exports['default'] = _emberBootstrapComponentsBsCollapse['default'].extend({
+    layout: _emberBootstrapTemplatesComponentsBsNavbarContent['default'],
+
+    classNames: ['navbar-collapse']
+  });
+});
+define('ember-bootstrap/components/base/bs-navbar/link-to', ['exports', 'ember-bootstrap/components/bs-nav/link-to'], function (exports, _emberBootstrapComponentsBsNavLinkTo) {
+  'use strict';
+
+  /**
+   * Extended `{{link-to}}` component for use within Navbars.
+   *
+   * @class NavbarLinkTo
+   * @namespace Components
+   * @extends Components.NavLinkTo
+   * @public
+   */
+  exports['default'] = _emberBootstrapComponentsBsNavLinkTo['default'].extend({
+
+    /**
+     * @property collapseNavbar
+     * @type {Boolean}
+     * @default true
+     * @public
+     */
+    collapseNavbar: true,
+
+    /**
+     * @event onCollapse
+     * @private
+     */
+    onCollapse: function onCollapse() {},
+    click: function click() {
+      if (this.get('collapseNavbar')) {
+        this.onCollapse();
+      }
+    }
+  });
+});
+define('ember-bootstrap/components/base/bs-navbar/nav', ['exports', 'ember-bootstrap/components/bs-nav'], function (exports, _emberBootstrapComponentsBsNav) {
+  'use strict';
+
+  /**
+   * Component for the `.nav` element within a [Components.Navbar](Components.Navbar.html)
+   * component. Have a look there for examples.
+   *
+   * Per [the bootstrap docs](http://getbootstrap.com/components/#navbar),
+   * justified navbar nav links are not supported.
+   *
+   * @class NavbarNav
+   * @namespace Components
+   * @extends Components.Nav
+   * @public
+   */
+  exports['default'] = _emberBootstrapComponentsBsNav['default'].extend({
+    classNames: ['navbar-nav'],
+
+    didReceiveAttrs: function didReceiveAttrs() {
+      this._super.apply(this, arguments);
+      this.set('justified', false);
+    }
+  });
+});
+define('ember-bootstrap/components/base/bs-navbar/toggle', ['exports', 'ember-bootstrap/templates/components/bs-navbar/toggle'], function (exports, _emberBootstrapTemplatesComponentsBsNavbarToggle) {
+  'use strict';
+
+  /**
+   * Component to implement the responsive menu toggle behavior in a [Components.Navbar](Components.Navbar.html)
+   * component. Have a look there for examples.
+   *
+   * ### Bootstrap 3/4 Notes
+   *
+   * The inline version of the component uses the triple `icon-bar` styling for Bootstrap 3 and the
+   * `navbar-toggler-icon` styling for Bootstrap 4.
+   *
+   * @class NavbarToggle
+   * @namespace Components
+   * @extends Components.Button
+   * @public
+   */
+  exports['default'] = Ember.Component.extend({
+    layout: _emberBootstrapTemplatesComponentsBsNavbarToggle['default'],
+    tagName: 'button',
+
+    classNameBindings: ['collapsed'],
+    collapsed: true,
+
+    /**
+     * @event onClick
+     * @public
+     */
+    onClick: function onClick() {},
+    click: function click() {
+      this.onClick();
+    }
+  });
+});
+define('ember-bootstrap/components/base/bs-popover', ['exports', 'ember-bootstrap/components/base/bs-contextual-help', 'ember-bootstrap/templates/components/bs-popover'], function (exports, _emberBootstrapComponentsBaseBsContextualHelp, _emberBootstrapTemplatesComponentsBsPopover) {
+  'use strict';
+
+  /**
+   Component that implements Bootstrap [popovers](http://getbootstrap.com/javascript/#popovers).
+  
+   By default it will attach its listeners (click) to the parent DOM element to trigger
+   the popover:
+  
+   ```hbs
+   <button class="btn">
+     {{#bs-popover title="This is a title"}}and this the body{{/bs-popover}}
+   </button>
+   ```
+  
+   ### Trigger
+  
+   The trigger element is the DOM element that will cause the popover to be shown when one of the trigger events occur on
+   that element. By default the trigger element is the parent DOM element of the component, and the trigger event will be
+   "click".
+  
+   The `triggerElement` property accepts any CSS selector to attach the popover to any other existing DOM element.
+   With the special value "parentView" you can attach the popover to the DOM element of the parent component:
+  
+   ```hbs
+   {{#my-component}}
+     {{#bs-popover triggerElement="parentView"}}This is a popover{{/bs-popover}}
+   {{/my-component}}
+   ```
+  
+   To customize the events that will trigger the popover use the `triggerEvents` property, that accepts an array or a
+   string of events, with "hover", "focus" and "click" being supported.
+  
+   ### Placement options
+  
+   By default the popover will show up to the right of the trigger element. Use the `placement` property to change that
+   ("top", "bottom", "left" and "right"). To make sure the popover will not exceed the viewport (see Advanced customization)
+   you can set `autoPlacement` to true. A popover with `placement="right" will be placed to the right if there is enough
+   space, otherwise to the left.
+  
+   ### Advanced customization
+  
+   Several other properties allow for some advanced customization:
+   * `visible` to show/hide the popover programmatically
+   * `fade` to disable the fade in transition
+   * `delay` (or `delayShow` and `delayHide`) to add a delay
+   * `viewportSelector` and `viewportPadding` to customize the viewport that affects `autoPlacement`
+  
+   See the individual API docs for each property.
+  
+   ### Actions
+  
+   When you want to react on the popover being shown or hidden, you can use one of the following supported actions:
+   * `onShow`
+   * `onShown`
+   * `onHide`
+   * `onHidden`
+  
+   @class Popover
+   @namespace Components
+   @extends Components.ContextualHelp
+   @public
+   */
+  exports['default'] = _emberBootstrapComponentsBaseBsContextualHelp['default'].extend({
+    layout: _emberBootstrapTemplatesComponentsBsPopover['default'],
+
+    /**
+     * @property placement
+     * @type string
+     * @default 'right'
+     * @public
+     */
+    placement: 'right',
+
+    /**
+     * @property triggerEvents
+     * @type array|string
+     * @default 'click'
+     * @public
+     */
+    triggerEvents: 'click',
+
+    /**
+     * The DOm element of the arrow element.
+     *
+     * @property arrowElement
+     * @type object
+     * @readonly
+     * @private
+     */
+    arrowElement: Ember.computed('overlayElement', function () {
+      return this.get('overlayElement').querySelector('.arrow');
+    }).volatile()
+  });
+});
+define('ember-bootstrap/components/base/bs-popover/element', ['exports', 'ember-bootstrap/components/base/bs-contextual-help/element', 'ember-bootstrap/templates/components/bs-popover/element'], function (exports, _emberBootstrapComponentsBaseBsContextualHelpElement, _emberBootstrapTemplatesComponentsBsPopoverElement) {
+  'use strict';
+
+  /**
+   Internal component for popover's markup. Should not be used directly.
+  
+   @class PopoverElement
+   @namespace Components
+   @extends Components.ContextualHelpElement
+   @private
+   */
+  exports['default'] = _emberBootstrapComponentsBaseBsContextualHelpElement['default'].extend({
+    layout: _emberBootstrapTemplatesComponentsBsPopoverElement['default'],
+
+    /**
+     * @property title
+     * @type string
+     * @public
+     */
+    title: undefined,
+
+    /**
+     * @property hasTitle
+     * @type boolean
+     * @private
+     */
+    hasTitle: Ember.computed.notEmpty('title')
+  });
+});
+define('ember-bootstrap/components/base/bs-progress', ['exports', 'ember-bootstrap/templates/components/bs-progress'], function (exports, _emberBootstrapTemplatesComponentsBsProgress) {
+  'use strict';
+
+  /**
+   Component to display a Bootstrap progress bar, see http://getbootstrap.com/components/#progress.
+  
+   ### Usage
+  
+   The component yields a [Components.ProgressBar)(Components.ProgressBar.html) component that represents a single bar.
+   Use the `value` property to control the progress bar's width. To apply the different styling options supplied by
+   Bootstrap, use the appropriate properties like `type`, `showLabel`, `striped` or `animate`.
+  
+   ```hbs
+   {{#bs-progress as |p|}}
+     {{p.bar value=progressValue minValue=0 maxValue=10 showLabel=true type="danger"}}
+   {{/bs-progress}}
+   ```
+  
+   ### Stacked
+  
+   You can place multiple progress bar components in a single progress component to
+   create a stack of progress bars as seen in http://getbootstrap.com/components/#progress-stacked.
+  
+   ```hbs
+   {{#bs-progress as |p|}}
+     {{p.bar value=progressValue1 type="success"}}
+     {{p.bar value=progressValue2 type="warning"}}
+     {{p.bar value=progressValue3 type="danger"}}
+   {{/bs-progress}}
+   ```
+  
+   @class Progress
+   @namespace Components
+   @extends Ember.Component
+   @public
+   */
+  exports['default'] = Ember.Component.extend({
+    layout: _emberBootstrapTemplatesComponentsBsProgress['default'],
+    classNames: ['progress']
+  });
+});
+define('ember-bootstrap/components/base/bs-progress/bar', ['exports', 'ember-bootstrap/templates/components/bs-progress/bar', 'ember-bootstrap/mixins/type-class'], function (exports, _emberBootstrapTemplatesComponentsBsProgressBar, _emberBootstrapMixinsTypeClass) {
+  'use strict';
+
+  /**
+  
+   Component for a single progress bar, see [Components.Progress](Components.Progress.html) for more examples.
+  
+   @class ProgressBar
+   @namespace Components
+   @extends Ember.Component
+   @uses Mixins.TypeClass
+   @public
+   */
+  exports['default'] = Ember.Component.extend(_emberBootstrapMixinsTypeClass['default'], {
+    layout: _emberBootstrapTemplatesComponentsBsProgressBar['default'],
+    classNames: ['progress-bar'],
+    classNameBindings: ['progressBarStriped'],
+
+    attributeBindings: ['style', 'ariaValuenow', 'ariaValuemin', 'ariaValuemax'],
+
+    /**
+     * The lower limit of the value range
+     *
+     * @property minValue
+     * @type number
+     * @default 0
+     * @public
+     */
+    minValue: 0,
+
+    /**
+     * The upper limit of the value range
+     *
+     * @property maxValue
+     * @type number
+     * @default 100
+     * @public
+     */
+    maxValue: 100,
+
+    /**
+     * The value the progress bar should represent
+     *
+     * @property value
+     * @type number
+     * @default 0
+     * @public
+     */
+    value: 0,
+
+    /**
+     If true a label will be shown inside the progress bar.
+      By default it will be the percentage corresponding to the `value` property, rounded to `roundDigits` digits.
+     You can customize it by using the component with a block template, which the component yields the percentage
+     value to:
+      ```hbs
+     {{#bs-progress}}
+       {{#bs-progress-bar value=progressValue as |percent|}}{{progressValue}} ({{percent}}%){{/bs-progress-bar}}
+     {{/bs-progress}}
+     ```
+      @property showLabel
+     @type boolean
+     @default false
+     @public
+     */
+    showLabel: false,
+
+    /**
+     * Create a striped effect, see http://getbootstrap.com/components/#progress-striped
+     *
+     * @property striped
+     * @type boolean
+     * @default false
+     * @public
+     */
+    striped: false,
+
+    /**
+     * Animate the stripes, see http://getbootstrap.com/components/#progress-animated
+     *
+     * @property animate
+     * @type boolean
+     * @default false
+     * @public
+     */
+    animate: false,
+
+    /**
+     * Specify to how many digits the progress bar label should be rounded.
+     *
+     * @property roundDigits
+     * @type number
+     * @default 0
+     * @public
+     */
+    roundDigits: 0,
+
+    progressBarStriped: Ember.computed.readOnly('striped'),
+    progressBarAnimate: Ember.computed.readOnly('animate'),
+
+    ariaValuenow: Ember.computed.readOnly('value'),
+    ariaValuemin: Ember.computed.readOnly('minValue'),
+    ariaValuemax: Ember.computed.readOnly('maxValue'),
+
+    /**
+     * The percentage of `value`
+     *
+     * @property percent
+     * @type number
+     * @protected
+     * @readonly
+     */
+    percent: Ember.computed('value', 'minValue', 'maxValue', function () {
+      var value = parseFloat(this.get('value'));
+      var minValue = parseFloat(this.get('minValue'));
+      var maxValue = parseFloat(this.get('maxValue'));
+
+      return Math.min(Math.max((value - minValue) / (maxValue - minValue), 0), 1) * 100;
+    }).readOnly(),
+
+    /**
+     * The percentage of `value`, rounded to `roundDigits` digits
+     *
+     * @property percentRounded
+     * @type number
+     * @protected
+     * @readonly
+     */
+    percentRounded: Ember.computed('percent', 'roundDigits', function () {
+      var roundFactor = Math.pow(10, this.get('roundDigits'));
+      return Math.round(this.get('percent') * roundFactor) / roundFactor;
+    }).readOnly(),
+
+    /**
+     * @property style
+     * @type string
+     * @private
+     * @readonly
+     */
+    style: Ember.computed('percent', function () {
+      var percent = this.get('percent');
+      return Ember.String.htmlSafe('width: ' + percent + '%');
+    })
+
+  });
+});
+define('ember-bootstrap/components/base/bs-tab', ['exports', 'ember-bootstrap/templates/components/bs-tab', 'ember-bootstrap/mixins/component-parent', 'ember-bootstrap/components/bs-tab/pane', 'ember-bootstrap/utils/listen-to-cp'], function (exports, _emberBootstrapTemplatesComponentsBsTab, _emberBootstrapMixinsComponentParent, _emberBootstrapComponentsBsTabPane, _emberBootstrapUtilsListenToCp) {
+  'use strict';
+
+  /**
+   Tab component for dynamic tab functionality that mimics the behaviour of Bootstrap's tab.js plugin,
+   see http://getbootstrap.com/javascript/#tabs
+  
+   ### Usage
+  
+   Just nest any number of yielded [Components.TabPane](Components.TabPane.html) components that hold the tab content.
+   The tab navigation is automatically generated from the tab panes' `title` property:
+  
+   ```hbs
+   {{#bs-tab as |tab|}}
+     {{#tab.pane title="Tab 1"}}
+       <p>...</p>
+     {{/tab.pane}}
+     {{#tab.pane title="Tab 2"}}
+       <p>...</p>
+     {{/tab.pane}}
+   {{/bs-tab}}
+   ```
+  
+   ### Groupable (dropdown) tabs
+  
+   Bootstrap's support for dropdown menus as tab navigation is mimiced by the use of the `groupTitle` property.
+   All panes with the same `groupTitle` will be put inside the menu of a [Components.Dropdown](Components.Dropdown.html)
+   component with `groupTitle` being the dropdown's title:
+  
+   ```hbs
+   {{#bs-tab as |tab|}}
+      {{#tab.pane title="Tab 1"}}
+        <p>...</p>
+      {{/tab.pane}}
+      {{#tab.pane title="Tab 2"}}
+        <p>...</p>
+      {{/tab.pane}}
+      {{#tab.pane title="Tab 3" groupTitle="Dropdown"}}
+        <p>...</p>
+      {{/tab.pane}}
+      {{#tab.pane title="Tab 4" groupTitle="Dropdown"}}
+        <p>...</p>
+      {{/tab.pane}}
+   {{/bs-tab}}
+   ```
+  
+   ### Custom tabs
+  
+   When having the tab pane's `title` as the tab navigation title is not sufficient, for example because you want to
+   integrate some other dynamic content, maybe even other components in the tab navigation item, then you have to setup
+   your navigation by yourself.
+  
+   Set `customTabs` to true to deactivate the automatic tab navigation generation. Then setup your navigation, probably
+   using a [Components.Nav](Components.Nav.html) component. The tab component yields the `activeId` property as well as
+   its `select` action, which you would have to use to manually set the `active` state of the navigation items and to
+   trigger the selection of the different tab panes, using their ids:
+  
+   ```hbs
+   {{#bs-tab customTabs=true as |tab|}}
+      {{#bs-nav type="tabs" as |nav|}}
+          {{#nav.item active=(bs-eq tab.activeId "pane1")}}<a href="#pane1" role="tab" {{action tab.select "pane1"}}>Tab 1</a>{{/nav.item}}
+          {{#nav.item active=(bs-eq tab.activeId "pane2")}}<a href="#pane1" role="tab" {{action tab.select "pane2"}}>Tab 2 <span class="badge">{{badge}}</span></a>{{/nav.item}}
+      {{/bs-nav}}
+  
+      <div class="tab-content">
+      {{#tab.pane elementId="pane1" title="Tab 1"}}
+          <p>...</p>
+      {{/tab.pane}}
+      {{#tab.pane elementId="pane2" title="Tab 2"}}
+          <p>...</p>
+      {{/tab.pane}}
+      </div>
+   {{/bs-tab}}
+   ```
+  
+   Note that the `bs-eq` helper used in the example above is a private helper, which is not guaranteed to be available for
+   the future. Better use the corresponding `eq` helper of the
+   [ember-truth-helpers](https://github.com/jmurphyau/ember-truth-helpers) addon for example!
+  
+   ### Routable tabs
+  
+   The tab component purpose is to have panes of content, that are all in DOM at the same time and that are activated and
+   deactivated dynamically, just as the  original Bootstrap implementation.
+  
+   If you want to have the content delivered through individual sub routes, just use
+   the [Components.Nav](Components.Nav.html) component and an `{{outlet}}` that show the nested routes' content:
+  
+   ```hbs
+   <div>
+     {{#bs-nav type="tabs" as |nav|}}
+       {{#nav.item}}{{#nav.link-to "tabs.index"}}Tab 1{{/nav.link-to}}{{/nav.item}}
+       {{#nav.item}}{{#nav.link-to "tabs.other"}}Tab 2{{/nav.link-to}}{{/nav.item}}
+     {{/bs-nav}}
+     {{outlet}}
+   </div>
+   ```
+  
+   @class Tab
+   @namespace Components
+   @extends Ember.Component
+   @uses Mixins.ComponentParent
+   @public
+   */
+  exports['default'] = Ember.Component.extend(_emberBootstrapMixinsComponentParent['default'], {
+    layout: _emberBootstrapTemplatesComponentsBsTab['default'],
+
+    /**
+     * Type of nav, either "pills" or "tabs"
+     *
+     * @property type
+     * @type String
+     * @default 'tabs'
+     * @public
+     */
+    type: 'tabs',
+
+    /**
+     * By default the tabs will be automatically generated using the available [TabPane](Components.TabPane.html)
+     * components. If set to true, you can deactivate this and setup the tabs manually. See the example above.
+     *
+     * @property customTabs
+     * @type boolean
+     * @default false
+     * @public
+     */
+    customTabs: false,
+
+    /**
+     * The id (`elementId`) of the active [TabPane](Components.TabPane.html).
+     * By default the first tab will be active, but this can be changed by setting this property
+     *
+     * ```hbs
+     * {{#bs-tab activeId="pane2"}}
+     *   {{#tab.pane id="pane1" title="Tab 1"}}
+     *      ...
+     *   {{/tab.pane}}
+     *   {{#tab.pane id="pane1" title="Tab 1"}}
+     *     ...
+     *   {{/tab.pane}}
+     * {{/bs-tab}}
+     * ```
+     *
+     * When the selection is changed by user interaction this property will not update by using two-way bindings in order
+     * to follow DDAU best practices. If you want to react to such changes, subscribe to the `onChange` action
+     *
+     * @property activeId
+     * @type string
+     * @public
+     */
+    activeId: Ember.computed.oneWay('childPanes.firstObject.elementId'),
+
+    /**
+     * @property isActiveId
+     * @private
+     */
+    isActiveId: (0, _emberBootstrapUtilsListenToCp['default'])('activeId'),
+
+    /**
+     * Set to false to disable the fade animation when switching tabs.
+     *
+     * @property fade
+     * @type boolean
+     * @default true
+     * @public
+     */
+    fade: true,
+
+    /**
+     * The duration of the fade animation
+     *
+     * @property fadeDuration
+     * @type integer
+     * @default 150
+     * @public
+     */
+    fadeDuration: 150,
+
+    /**
+     * This action is called when switching the active tab, with the new and previous pane id
+     *
+     * You can return false to prevent changing the active tab automatically, and do that in your action by
+     * setting `activeId`.
+     *
+     * @event onChange
+     * @public
+     */
+    onChange: function onChange() {},
+
+    /**
+     * All `TabPane` child components
+     *
+     * @property childPanes
+     * @type array
+     * @readonly
+     * @private
+     */
+    childPanes: Ember.computed.filter('children', function (view) {
+      return view instanceof _emberBootstrapComponentsBsTabPane['default'];
+    }),
+
+    /**
+     * Array of objects that define the tab structure
+     *
+     * @property navItems
+     * @type array
+     * @readonly
+     * @private
+     */
+    navItems: Ember.computed('childPanes.@each.{elementId,title,group}', function () {
+      var items = Ember.A();
+      this.get('childPanes').forEach(function (pane) {
+        var groupTitle = pane.get('groupTitle');
+        var item = pane.getProperties('elementId', 'title');
+        if (Ember.isPresent(groupTitle)) {
+          var group = items.findBy('groupTitle', groupTitle);
+          if (group) {
+            group.children.push(item);
+            group.childIds.push(item.elementId);
+          } else {
+            items.push({
+              isGroup: true,
+              groupTitle: groupTitle,
+              children: Ember.A([item]),
+              childIds: Ember.A([item.elementId])
+            });
+          }
+        } else {
+          items.push(item);
+        }
+      });
+      return items;
+    }),
+
+    actions: {
+      select: function select(id) {
+        var previous = this.get('isActiveId');
+        if (this.get('onChange')(id, previous) !== false) {
+          // change active tab when `onChange` does not return false
+          this.set('isActiveId', id);
+        }
+      }
+    }
+  });
+});
+define('ember-bootstrap/components/base/bs-tab/pane', ['exports', 'ember-bootstrap/templates/components/bs-tab/pane', 'ember-bootstrap/mixins/component-child', 'ember-bootstrap/mixins/transition-support', 'ember-bootstrap/utils/transition-end'], function (exports, _emberBootstrapTemplatesComponentsBsTabPane, _emberBootstrapMixinsComponentChild, _emberBootstrapMixinsTransitionSupport, _emberBootstrapUtilsTransitionEnd) {
+  'use strict';
+
+  /**
+   The tab pane of a tab component.
+   See [Components.Tab](Components.Tab.html) for examples.
+  
+   @class TabPane
+   @namespace Components
+   @extends Ember.Component
+   @uses Mixins.ComponentChild
+   @public
+   */
+  exports['default'] = Ember.Component.extend(_emberBootstrapMixinsComponentChild['default'], _emberBootstrapMixinsTransitionSupport['default'], {
+    layout: _emberBootstrapTemplatesComponentsBsTabPane['default'],
+    classNameBindings: ['active', 'usesTransition:fade'],
+    classNames: ['tab-pane'],
+    ariaRole: 'tabpanel',
+
+    /**
+     * @property activeId
+     * @private
+     */
+    activeId: null,
+
+    /**
+     * True if this pane is active (visible)
+     *
+     * @property isActive
+     * @type boolean
+     * @readonly
+     * @private
+     */
+    isActive: Ember.computed('activeId', 'elementId', function () {
+      return this.get('activeId') === this.get('elementId');
+    }).readOnly(),
+
+    /**
+     * Used to apply Bootstrap's "active" class
+     *
+     * @property active
+     * @type boolean
+     * @default false
+     * @private
+     */
+    active: false,
+
+    /**
+     * Used to trigger the Bootstrap visibility classes.
+     *
+     * @property showContent
+     * @type boolean
+     * @default false
+     * @private
+     */
+    showContent: false,
+
+    /**
+     * The title for this tab pane. This is used by the `bs-tab` component to automatically generate
+     * the tab navigation.
+     * See the [Components.Tab](Components.Tab.html) for examples.
+     *
+     * @property title
+     * @type string
+     * @default null
+     * @public
+     */
+    title: null,
+
+    /**
+     * An optional group title used by the `bs-tab` component to group all panes with the same group title
+     * under a common drop down in the tab navigation.
+     * See the [Components.Tab](Components.Tab.html) for examples.
+     *
+     * @property groupTitle
+     * @type string
+     * @default null
+     * @public
+     */
+    groupTitle: null,
+
+    /**
+     * Use fade animation when switching tabs.
+     *
+     * @property fade
+     * @type boolean
+     * @private
+     */
+    fade: true,
+
+    /**
+     * The duration of the fade out animation
+     *
+     * @property fadeDuration
+     * @type integer
+     * @default 150
+     * @private
+     */
+    fadeDuration: 150,
+
+    /**
+     * Show the pane
+     *
+     * @method show
+     * @protected
+     */
+    show: function show() {
+      if (this.get('usesTransition')) {
+        (0, _emberBootstrapUtilsTransitionEnd['default'])(this.get('element'), function () {
+          if (!this.get('isDestroyed')) {
+            this.setProperties({
+              active: true,
+              showContent: true
+            });
+          }
+        }, this, this.get('fadeDuration'));
+      } else {
+        this.set('active', true);
+      }
+    },
+
+    /**
+     * Hide the pane
+     *
+     * @method hide
+     * @protected
+     */
+    hide: function hide() {
+      if (this.get('usesTransition')) {
+        (0, _emberBootstrapUtilsTransitionEnd['default'])(this.get('element'), function () {
+          if (!this.get('isDestroyed')) {
+            this.set('active', false);
+          }
+        }, this, this.get('fadeDuration'));
+        this.set('showContent', false);
+      } else {
+        this.set('active', false);
+      }
+    },
+
+    _showHide: Ember.observer('isActive', function () {
+      if (this.get('isActive')) {
+        this.show();
+      } else {
+        this.hide();
+      }
+    }),
+
+    init: function init() {
+      this._super.apply(this, arguments);
+      Ember.run.scheduleOnce('afterRender', this, function () {
+        // isActive comes from parent component, so only available after render...
+        this.set('active', this.get('isActive'));
+        this.set('showContent', this.get('isActive') && this.get('fade'));
+      });
+    }
+  });
+});
+define('ember-bootstrap/components/base/bs-tooltip', ['exports', 'ember-bootstrap/components/base/bs-contextual-help', 'ember-bootstrap/templates/components/bs-tooltip'], function (exports, _emberBootstrapComponentsBaseBsContextualHelp, _emberBootstrapTemplatesComponentsBsTooltip) {
+  'use strict';
+
+  /**
+   Component that implements Bootstrap [tooltips](http://getbootstrap.com/javascript/#tooltips).
+  
+   By default it will attach its listeners (mouseover and focus) to the parent DOM element to trigger
+   the tooltip:
+  
+   ```hbs
+   <button class="btn">
+     {{bs-tooltip title="This is a tooltip"}}
+   </button>
+   ```
+  
+   You can also use the component in a block form to set the title:
+  
+   ```hbs
+   <button class="btn">
+     {{#bs-tooltip}}This is a tooltip{{/bs-tooltip}}
+   </button>
+   ```
+  
+   ### Trigger
+  
+   The trigger element is the DOM element that will cause the tooltip to be shown when one of the trigger events occur on
+   that element. By default the trigger element is the parent DOM element of the component, and the trigger events will be
+   "hover" and "focus".
+  
+   The `triggerElement` property accepts any CSS selector to attach the tooltip to any other existing DOM element.
+   With the special value "parentView" you can attach the tooltip to the DOM element of the parent component:
+  
+   ```hbs
+   {{#my-component}}
+     {{bs-tooltip title="This is a tooltip" triggerElement="parentView"}}
+   {{/my-component}}
+   ```
+  
+   To customize the events that will trigger the tooltip use the `triggerEvents` property, that accepts an array or a
+   string of events, with "hover", "focus" and "click" being supported.
+  
+   ### Placement options
+  
+   By default the tooltip will show up on top of the trigger element. Use the `placement` property to change that
+   ("top", "bottom", "left" and "right"). To make sure the tooltip will not exceed the viewport (see Advanced customization)
+   you can set `autoPlacement` to true. A tooltip with `placement="right" will be placed to the right if there is enough
+   space, otherwise to the left.
+  
+   ### Advanced customization
+  
+   Several other properties allow for some advanced customization:
+   * `visible` to show/hide the tooltip programmatically
+   * `fade` to disable the fade in transition
+   * `delay` (or `delayShow` and `delayHide`) to add a delay
+   * `viewportSelector` and `viewportPadding` to customize the viewport that affects `autoPlacement`
+  
+   See the individual API docs for each property.
+  
+   ### Actions
+  
+   When you want to react on the tooltip being shown or hidden, you can use one of the following supported actions:
+   * `onShow`
+   * `onShown`
+   * `onHide`
+   * `onHidden`
+  
+   @class Tooltip
+   @namespace Components
+   @extends Components.ContextualHelp
+   @public
+   */
+  exports['default'] = _emberBootstrapComponentsBaseBsContextualHelp['default'].extend({
+    layout: _emberBootstrapTemplatesComponentsBsTooltip['default'],
+
+    /**
+     * The DOM element of the arrow element.
+     *
+     * @property arrowElement
+     * @type object
+     * @readonly
+     * @private
+     */
+    arrowElement: Ember.computed('overlayElement', function () {
+      return this.get('overlayElement').querySelector('.tooltip-arrow');
+    }).volatile()
+  });
+});
+define('ember-bootstrap/components/base/bs-tooltip/element', ['exports', 'ember-bootstrap/templates/components/bs-tooltip/element', 'ember-bootstrap/components/base/bs-contextual-help/element'], function (exports, _emberBootstrapTemplatesComponentsBsTooltipElement, _emberBootstrapComponentsBaseBsContextualHelpElement) {
+  'use strict';
+
+  /**
+   Internal component for tooltip's markup. Should not be used directly.
+  
+   @class TooltipElement
+   @namespace Components
+   @extends Components.ContextualHelpElement
+   @private
+   */
+  exports['default'] = _emberBootstrapComponentsBaseBsContextualHelpElement['default'].extend({
+    layout: _emberBootstrapTemplatesComponentsBsTooltipElement['default']
+  });
+});
+define('ember-bootstrap/components/bs-accordion', ['exports', 'ember-bootstrap/components/base/bs-accordion'], function (exports, _emberBootstrapComponentsBaseBsAccordion) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsAccordion['default'].extend({
+    classNames: ['panel-group']
+  });
+});
+define('ember-bootstrap/components/bs-accordion/item', ['exports', 'ember-bootstrap/components/base/bs-accordion/item'], function (exports, _emberBootstrapComponentsBaseBsAccordionItem) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsAccordionItem['default'].extend({
+    classNames: ['panel'],
+
+    /**
+     * @property classTypePrefix
+     * @type String
+     * @default 'panel'
+     * @protected
+     */
+    classTypePrefix: 'panel'
+  });
+});
+define('ember-bootstrap/components/bs-accordion/item/body', ['exports', 'ember-bootstrap/components/base/bs-accordion/item/body'], function (exports, _emberBootstrapComponentsBaseBsAccordionItemBody) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsAccordionItemBody['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-accordion/item/title', ['exports', 'ember-bootstrap/components/base/bs-accordion/item/title'], function (exports, _emberBootstrapComponentsBaseBsAccordionItemTitle) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsAccordionItemTitle['default'].extend({
+    classNames: ['panel-heading']
+  });
+});
+define('ember-bootstrap/components/bs-alert', ['exports', 'ember-bootstrap/components/base/bs-alert'], function (exports, _emberBootstrapComponentsBaseBsAlert) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsAlert['default'].extend({
+    classNameBindings: ['showAlert:in']
+  });
+});
+define('ember-bootstrap/components/bs-button-group', ['exports', 'ember-bootstrap/components/base/bs-button-group'], function (exports, _emberBootstrapComponentsBaseBsButtonGroup) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsButtonGroup['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-button-group/button', ['exports', 'ember-bootstrap/components/base/bs-button-group/button'], function (exports, _emberBootstrapComponentsBaseBsButtonGroupButton) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsButtonGroupButton['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-button', ['exports', 'ember-bootstrap/components/base/bs-button'], function (exports, _emberBootstrapComponentsBaseBsButton) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsButton['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-carousel', ['exports', 'ember-bootstrap/components/base/bs-carousel'], function (exports, _emberBootstrapComponentsBaseBsCarousel) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsCarousel['default'].extend({
+    nextControlClassName: 'carousel-control right',
+    nextControlIcon: 'icon-next',
+    prevControlClassName: 'carousel-control left',
+    prevControlIcon: 'icon-prev'
+  });
+});
+define('ember-bootstrap/components/bs-carousel/slide', ['exports', 'ember-bootstrap/components/base/bs-carousel/slide'], function (exports, _emberBootstrapComponentsBaseBsCarouselSlide) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsCarouselSlide['default'].extend({
+    classNameBindings: ['left', 'next', 'prev', 'right'],
+    classNames: ['item']
+  });
+});
+define('ember-bootstrap/components/bs-collapse', ['exports', 'ember-bootstrap/components/base/bs-collapse'], function (exports, _emberBootstrapComponentsBaseBsCollapse) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsCollapse['default'].extend({
+    classNameBindings: ['showContent:in']
+  });
+});
+define('ember-bootstrap/components/bs-dropdown', ['exports', 'ember-bootstrap/components/base/bs-dropdown'], function (exports, _emberBootstrapComponentsBaseBsDropdown) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsDropdown['default'].extend({
+    classNameBindings: ['isOpen:open']
+  });
+});
+define('ember-bootstrap/components/bs-dropdown/button', ['exports', 'ember-bootstrap/components/base/bs-dropdown/button'], function (exports, _emberBootstrapComponentsBaseBsDropdownButton) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsDropdownButton['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-dropdown/menu', ['exports', 'ember-bootstrap/components/base/bs-dropdown/menu'], function (exports, _emberBootstrapComponentsBaseBsDropdownMenu) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsDropdownMenu['default'].extend({
+    tagName: 'ul',
+
+    classNames: ['dropdown-menu'],
+    classNameBindings: ['alignClass']
+  });
+});
+define('ember-bootstrap/components/bs-dropdown/menu/divider', ['exports', 'ember-bootstrap/components/base/bs-dropdown/menu/divider'], function (exports, _emberBootstrapComponentsBaseBsDropdownMenuDivider) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsDropdownMenuDivider['default'].extend({
+    classNames: ['divider']
+  });
+});
+define('ember-bootstrap/components/bs-dropdown/menu/item', ['exports', 'ember-bootstrap/components/base/bs-dropdown/menu/item'], function (exports, _emberBootstrapComponentsBaseBsDropdownMenuItem) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsDropdownMenuItem['default'].extend({
+    tagName: 'li'
+  });
+});
+define('ember-bootstrap/components/bs-dropdown/menu/link-to', ['exports', 'ember-bootstrap/components/base/bs-dropdown/menu/link-to'], function (exports, _emberBootstrapComponentsBaseBsDropdownMenuLinkTo) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsDropdownMenuLinkTo['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-dropdown/toggle', ['exports', 'ember-bootstrap/components/base/bs-dropdown/toggle'], function (exports, _emberBootstrapComponentsBaseBsDropdownToggle) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsDropdownToggle['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-form', ['exports', 'ember-bootstrap/components/base/bs-form'], function (exports, _emberBootstrapComponentsBaseBsForm) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsForm['default'].extend({
+    layoutClass: Ember.computed('formLayout', function () {
+      var layout = this.get('formLayout');
+      var supportedTypes = ['vertical', 'horizontal', 'inline'];
+      true && !(supportedTypes.indexOf(layout) >= 0) && Ember.assert('must provide a valid `formLayout` attribute.', supportedTypes.indexOf(layout) >= 0);
+
+      return layout === 'vertical' ? 'form' : 'form-' + layout;
+    }).readOnly()
+  });
+});
+define('ember-bootstrap/components/bs-form/element', ['exports', 'ember-bootstrap/components/base/bs-form/element'], function (exports, _emberBootstrapComponentsBaseBsFormElement) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsFormElement['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-form/element/control', ['exports', 'ember-bootstrap/components/base/bs-form/element/control'], function (exports, _emberBootstrapComponentsBaseBsFormElementControl) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsFormElementControl['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-form/element/control/checkbox', ['exports', 'ember-bootstrap/components/base/bs-form/element/control/checkbox'], function (exports, _emberBootstrapComponentsBaseBsFormElementControlCheckbox) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsFormElementControlCheckbox['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-form/element/control/input', ['exports', 'ember-bootstrap/components/base/bs-form/element/control/input'], function (exports, _emberBootstrapComponentsBaseBsFormElementControlInput) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsFormElementControlInput['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-form/element/control/textarea', ['exports', 'ember-bootstrap/components/base/bs-form/element/control/textarea'], function (exports, _emberBootstrapComponentsBaseBsFormElementControlTextarea) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsFormElementControlTextarea['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-form/element/errors', ['exports', 'ember-bootstrap/components/base/bs-form/element/errors'], function (exports, _emberBootstrapComponentsBaseBsFormElementErrors) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsFormElementErrors['default'].extend({
+    feedbackClass: 'help-block'
+  });
+});
+define('ember-bootstrap/components/bs-form/element/feedback-icon', ['exports', 'ember-bootstrap/components/base/bs-form/element/feedback-icon'], function (exports, _emberBootstrapComponentsBaseBsFormElementFeedbackIcon) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsFormElementFeedbackIcon['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-form/element/help-text', ['exports', 'ember-bootstrap/components/base/bs-form/element/help-text'], function (exports, _emberBootstrapComponentsBaseBsFormElementHelpText) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsFormElementHelpText['default'].extend({
+    classNames: ['help-block']
+  });
+});
+define('ember-bootstrap/components/bs-form/element/label', ['exports', 'ember-bootstrap/components/base/bs-form/element/label'], function (exports, _emberBootstrapComponentsBaseBsFormElementLabel) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsFormElementLabel['default'].extend({
+    tagName: ''
+  });
+});
+define('ember-bootstrap/components/bs-form/element/layout', ['exports', 'ember-bootstrap/components/base/bs-form/element/layout'], function (exports, _emberBootstrapComponentsBaseBsFormElementLayout) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsFormElementLayout['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-form/element/layout/horizontal', ['exports', 'ember-bootstrap/components/base/bs-form/element/layout/horizontal'], function (exports, _emberBootstrapComponentsBaseBsFormElementLayoutHorizontal) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsFormElementLayoutHorizontal['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-form/element/layout/horizontal/checkbox', ['exports', 'ember-bootstrap/components/base/bs-form/element/layout/horizontal/checkbox'], function (exports, _emberBootstrapComponentsBaseBsFormElementLayoutHorizontalCheckbox) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsFormElementLayoutHorizontalCheckbox['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-form/element/layout/inline', ['exports', 'ember-bootstrap/components/base/bs-form/element/layout/inline'], function (exports, _emberBootstrapComponentsBaseBsFormElementLayoutInline) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsFormElementLayoutInline['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-form/element/layout/inline/checkbox', ['exports', 'ember-bootstrap/components/base/bs-form/element/layout/inline/checkbox'], function (exports, _emberBootstrapComponentsBaseBsFormElementLayoutInlineCheckbox) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsFormElementLayoutInlineCheckbox['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-form/element/layout/vertical', ['exports', 'ember-bootstrap/components/base/bs-form/element/layout/vertical'], function (exports, _emberBootstrapComponentsBaseBsFormElementLayoutVertical) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsFormElementLayoutVertical['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-form/element/layout/vertical/checkbox', ['exports', 'ember-bootstrap/components/base/bs-form/element/layout/vertical/checkbox'], function (exports, _emberBootstrapComponentsBaseBsFormElementLayoutVerticalCheckbox) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsFormElementLayoutVerticalCheckbox['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-form/group', ['exports', 'ember-bootstrap/components/base/bs-form/group', 'ember-bootstrap/config', 'ember-bootstrap/mixins/size-class'], function (exports, _emberBootstrapComponentsBaseBsFormGroup, _emberBootstrapConfig, _emberBootstrapMixinsSizeClass) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsFormGroup['default'].extend(_emberBootstrapMixinsSizeClass['default'], {
+    classNames: ['form-group'],
+    classNameBindings: ['validationClass', 'hasFeedback'],
+
+    classTypePrefix: 'form-group',
+
+    /**
+     * Whether to show validation state icons.
+     * See http://getbootstrap.com/css/#forms-control-validation
+     *
+     * @property useIcons
+     * @type boolean
+     * @default true
+     * @public
+     */
+    useIcons: true,
+
+    /**
+     * Computed property which is true if the form group is showing a validation icon
+     *
+     * @property hasFeedback
+     * @type boolean
+     * @private
+     * @readonly
+     */
+    hasFeedback: Ember.computed.and('hasValidation', 'useIcons', 'hasIconForValidationState').readOnly(),
+
+    /**
+     * The icon classes to be used for a feedback icon in a "success" validation state.
+     * Defaults to the usual glyphicon classes. This is ignored, and no feedback icon is
+     * rendered if `useIcons` is false.
+     *
+     * You can change this globally by setting the `formValidationSuccessIcon` property of
+     * the ember-bootstrap configuration in your config/environment.js file. If your are
+     * using FontAwesome for example:
+     *
+     * ```js
+     * ENV['ember-bootstrap'] = {
+       *   formValidationSuccessIcon: 'fa fa-check'
+       * }
+     * ```
+     *
+     * @property successIcon
+     * @type string
+     * @default 'glyphicon glyphicon-ok'
+     * @public
+     */
+    successIcon: _emberBootstrapConfig['default'].formValidationSuccessIcon,
+
+    /**
+     * The icon classes to be used for a feedback icon in a "error" validation state.
+     * Defaults to the usual glyphicon classes. This is ignored, and no feedback icon is
+     * rendered if `useIcons` is false.
+     *
+     * You can change this globally by setting the `formValidationErrorIcon` property of
+     * the ember-bootstrap configuration in your config/environment.js file. If your are
+     * using FontAwesome for example:
+     *
+     * ```js
+     * ENV['ember-bootstrap'] = {
+       *   formValidationErrorIcon: 'fa fa-times'
+       * }
+     * ```
+     *
+     * @property errorIcon
+     * @type string
+     * @public
+     */
+    errorIcon: _emberBootstrapConfig['default'].formValidationErrorIcon,
+
+    /**
+     * The icon classes to be used for a feedback icon in a "warning" validation state.
+     * Defaults to the usual glyphicon classes. This is ignored, and no feedback icon is
+     * rendered if `useIcons` is false.
+     *
+     * You can change this globally by setting the `formValidationWarningIcon` property of
+     * the ember-bootstrap configuration in your config/environment.js file. If your are
+     * using FontAwesome for example:
+     *
+     * ```js
+     * ENV['ember-bootstrap'] = {
+       *   formValidationWarningIcon: 'fa fa-warning'
+       * }
+     * ```
+     *
+     * @property warningIcon
+     * @type string
+     * @public
+     */
+    warningIcon: _emberBootstrapConfig['default'].formValidationWarningIcon,
+
+    /**
+     * The icon classes to be used for a feedback icon in a "info" validation state.
+     * Defaults to the usual glyphicon classes. This is ignored, and no feedback icon is
+     * rendered if `useIcons` is false.
+     *
+     * You can change this globally by setting the `formValidationInfoIcon` property of
+     * the ember-bootstrap configuration in your config/environment.js file. If your are
+     * using FontAwesome for example:
+     *
+     * ```js
+     * ENV['ember-bootstrap'] = {
+       *   formValidationInfoIcon: 'fa fa-info-circle
+       * }
+     * ```
+     *
+     * The "info" validation state is not supported in Bootstrap CSS, but can be easily added
+     * using the following LESS style:
+     * ```less
+     * .has-info {
+       *   .form-control-validation(@state-info-text; @state-info-text; @state-info-bg);
+       * }
+     * ```
+     *
+     * @property infoIcon
+     * @type string
+     * @public
+     */
+    infoIcon: _emberBootstrapConfig['default'].formValidationInfoIcon,
+
+    /**
+     * @property iconName
+     * @type string
+     * @readonly
+     * @private
+     */
+    iconName: Ember.computed('validation', function () {
+      var validation = this.get('validation') || 'success';
+      return this.get(validation + 'Icon');
+    }).readOnly(),
+
+    /**
+     * @property hasIconForValidationState
+     * @type boolean
+     * @readonly
+     * @private
+     */
+    hasIconForValidationState: Ember.computed.notEmpty('iconName').readOnly(),
+
+    /**
+     * @property validationClass
+     * @type string
+     * @readonly
+     * @private
+     */
+    validationClass: Ember.computed('validation', function () {
+      var validation = this.get('validation');
+      if (!Ember.isBlank(validation)) {
+        return 'has-' + validation;
+      }
+    }).readOnly()
+  });
+});
+define('ember-bootstrap/components/bs-modal-simple', ['exports', 'ember-bootstrap/components/base/bs-modal-simple'], function (exports, _emberBootstrapComponentsBaseBsModalSimple) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsModalSimple['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-modal', ['exports', 'ember-bootstrap/components/base/bs-modal'], function (exports, _emberBootstrapComponentsBaseBsModal) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsModal['default'].extend({
+    showClass: 'in'
+  });
+});
+define('ember-bootstrap/components/bs-modal/body', ['exports', 'ember-bootstrap/components/base/bs-modal/body'], function (exports, _emberBootstrapComponentsBaseBsModalBody) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsModalBody['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-modal/dialog', ['exports', 'ember-bootstrap/components/base/bs-modal/dialog'], function (exports, _emberBootstrapComponentsBaseBsModalDialog) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsModalDialog['default'].extend({
+    classNameBindings: ['showModal:in']
+  });
+});
+define('ember-bootstrap/components/bs-modal/footer', ['exports', 'ember-bootstrap/components/base/bs-modal/footer'], function (exports, _emberBootstrapComponentsBaseBsModalFooter) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsModalFooter['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-modal/header', ['exports', 'ember-bootstrap/components/base/bs-modal/header'], function (exports, _emberBootstrapComponentsBaseBsModalHeader) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsModalHeader['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-modal/header/close', ['exports', 'ember-bootstrap/components/base/bs-modal/header/close'], function (exports, _emberBootstrapComponentsBaseBsModalHeaderClose) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsModalHeaderClose['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-modal/header/title', ['exports', 'ember-bootstrap/components/base/bs-modal/header/title'], function (exports, _emberBootstrapComponentsBaseBsModalHeaderTitle) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsModalHeaderTitle['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-nav', ['exports', 'ember-bootstrap/components/base/bs-nav'], function (exports, _emberBootstrapComponentsBaseBsNav) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsNav['default'].extend({
+    classNameBindings: ['stacked:nav-stacked']
+  });
+});
+define('ember-bootstrap/components/bs-nav/item', ['exports', 'ember-bootstrap/components/base/bs-nav/item'], function (exports, _emberBootstrapComponentsBaseBsNavItem) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsNavItem['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-nav/link-to', ['exports', 'ember-bootstrap/components/base/bs-nav/link-to'], function (exports, _emberBootstrapComponentsBaseBsNavLinkTo) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsNavLinkTo['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-navbar', ['exports', 'ember-bootstrap/components/base/bs-navbar'], function (exports, _emberBootstrapComponentsBaseBsNavbar) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsNavbar['default'].extend({
+    _positionPrefix: 'navbar-',
+
+    init: function init() {
+      this._super.apply(this, arguments);
+      this.set('_validPositions', ['fixed-top', 'fixed-bottom', 'static-top']);
+    }
+  });
+});
+define('ember-bootstrap/components/bs-navbar/content', ['exports', 'ember-bootstrap/components/base/bs-navbar/content'], function (exports, _emberBootstrapComponentsBaseBsNavbarContent) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsNavbarContent['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-navbar/link-to', ['exports', 'ember-bootstrap/components/base/bs-navbar/link-to'], function (exports, _emberBootstrapComponentsBaseBsNavbarLinkTo) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsNavbarLinkTo['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-navbar/nav', ['exports', 'ember-bootstrap/components/base/bs-navbar/nav'], function (exports, _emberBootstrapComponentsBaseBsNavbarNav) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsNavbarNav['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-navbar/toggle', ['exports', 'ember-bootstrap/components/base/bs-navbar/toggle'], function (exports, _emberBootstrapComponentsBaseBsNavbarToggle) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsNavbarToggle['default'].extend({
+    classNames: ['navbar-toggle']
+  });
+});
+define('ember-bootstrap/components/bs-popover', ['exports', 'ember-bootstrap/components/base/bs-popover'], function (exports, _emberBootstrapComponentsBaseBsPopover) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsPopover['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-popover/element', ['exports', 'ember-bootstrap/components/base/bs-popover/element'], function (exports, _emberBootstrapComponentsBaseBsPopoverElement) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsPopoverElement['default'].extend({
+    popperClassNames: Ember.computed('fade', 'actualPlacement', 'showHelp', function () {
+      var classes = ['popover', 'ember-bootstrap-popover', this.get('actualPlacement')];
+      if (this.get('fade')) {
+        classes.push('fade');
+      }
+      if (this.get('showHelp')) {
+        classes.push('in');
+      }
+      return classes;
+    }),
+
+    /**
+     * @property titleClass
+     * @private
+     */
+    titleClass: 'popover-title',
+
+    /**
+     * @property contentClass
+     * @private
+     */
+    contentClass: 'popover-content'
+  });
+});
+define('ember-bootstrap/components/bs-progress', ['exports', 'ember-bootstrap/components/base/bs-progress'], function (exports, _emberBootstrapComponentsBaseBsProgress) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsProgress['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-progress/bar', ['exports', 'ember-bootstrap/components/base/bs-progress/bar'], function (exports, _emberBootstrapComponentsBaseBsProgressBar) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsProgressBar['default'].extend({
+    classNameBindings: ['progressBarAnimate:active'],
+
+    /**
+     * @property classTypePrefix
+     * @type String
+     * @default 'progress-bar'
+     * @protected
+     */
+    classTypePrefix: 'progress-bar'
+  });
+});
+define('ember-bootstrap/components/bs-tab', ['exports', 'ember-bootstrap/components/base/bs-tab'], function (exports, _emberBootstrapComponentsBaseBsTab) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsTab['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-tab/pane', ['exports', 'ember-bootstrap/components/base/bs-tab/pane'], function (exports, _emberBootstrapComponentsBaseBsTabPane) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsTabPane['default'].extend({
+    classNameBindings: ['showContent:in']
+  });
+});
+define('ember-bootstrap/components/bs-tooltip', ['exports', 'ember-bootstrap/components/base/bs-tooltip'], function (exports, _emberBootstrapComponentsBaseBsTooltip) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _emberBootstrapComponentsBaseBsTooltip['default'];
+    }
+  });
+});
+define('ember-bootstrap/components/bs-tooltip/element', ['exports', 'ember-bootstrap/components/base/bs-tooltip/element'], function (exports, _emberBootstrapComponentsBaseBsTooltipElement) {
+  'use strict';
+
+  exports['default'] = _emberBootstrapComponentsBaseBsTooltipElement['default'].extend({
+    /**
+     * @property arrowClass
+     * @private
+     */
+    arrowClass: 'tooltip-arrow',
+
+    popperClassNames: Ember.computed('fade', 'actualPlacement', 'showHelp', function () {
+      var classes = ['tooltip', 'ember-bootstrap-tooltip', this.get('actualPlacement')];
+      if (this.get('fade')) {
+        classes.push('fade');
+      }
+      if (this.get('showHelp')) {
+        classes.push('in');
+      }
+      return classes;
+    })
+  });
+});
+define('ember-bootstrap/config', ['exports'], function (exports) {
+  'use strict';
+
+  var Config = Ember.Object.extend();
+
+  Config.reopenClass({
+    formValidationSuccessIcon: 'glyphicon glyphicon-ok',
+    formValidationErrorIcon: 'glyphicon glyphicon-remove',
+    formValidationWarningIcon: 'glyphicon glyphicon-warning-sign',
+    formValidationInfoIcon: 'glyphicon glyphicon-info-sign',
+    insertEmberWormholeElementToDom: true,
+
+    load: function load() {
+      var config = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
+
+      for (var property in config) {
+        if (this.hasOwnProperty(property) && typeof this[property] !== 'function') {
+          this[property] = config[property];
+        }
+      }
+    }
+  });
+
+  exports['default'] = Config;
+});
+define("ember-bootstrap/helpers/bs-contains", ["exports"], function (exports) {
+  "use strict";
+
+  exports.bsContains = bsContains;
+
+  function bsContains(params /* , hash*/) {
+    return Ember.isArray(params[0]) ? Ember.A(params[0]).includes(params[1]) : false;
+  }
+
+  exports["default"] = Ember.Helper.helper(bsContains);
+});
+define("ember-bootstrap/helpers/bs-eq", ["exports"], function (exports) {
+  "use strict";
+
+  exports.eq = eq;
+
+  function eq(params) {
+    return params[0] === params[1];
+  }
+
+  exports["default"] = Ember.Helper.helper(eq);
+});
+define('ember-bootstrap/mixins/component-child', ['exports', 'ember-bootstrap/mixins/component-parent'], function (exports, _emberBootstrapMixinsComponentParent) {
+  'use strict';
+
+  /**
+   * Mixin for components that act as a child component in a parent-child relationship of components
+   *
+   * @class ComponentChild
+   * @namespace Mixins
+   * @private
+   */
+  exports['default'] = Ember.Mixin.create({
+
+    /**
+     * The parent component
+     *
+     * @property _parent
+     * @private
+     */
+    _parent: Ember.computed(function () {
+      return this.nearestOfType(_emberBootstrapMixinsComponentParent['default']);
+    }),
+
+    /**
+     * flag to check if component has already been registered
+     * @property _didRegister
+     * @type boolean
+     * @private
+     */
+    _didRegister: false,
+
+    /**
+     * Register ourself as a child at the parent component
+     * We use the `willRender` event here to also support the fastboot environment, where there is no `didInsertElement`
+     *
+     * @method _registerWithParent
+     * @private
+     */
+    _registerWithParent: function _registerWithParent() {
+      if (!this._didRegister) {
+        var parent = this.get('_parent');
+        if (parent) {
+          parent.registerChild(this);
+          this._didRegister = true;
+        }
+      }
+    },
+
+    /**
+     * Unregister from the parent component
+     *
+     * @method _unregisterFromParent
+     * @private
+     */
+    _unregisterFromParent: function _unregisterFromParent() {
+      var parent = this.get('_parent');
+      if (this._didRegister && parent) {
+        parent.removeChild(this);
+        this._didRegister = false;
+      }
+    },
+    didReceiveAttrs: function didReceiveAttrs() {
+      this._super.apply(this, arguments);
+      this._registerWithParent();
+    },
+    willRender: function willRender() {
+      this._super.apply(this, arguments);
+      this._registerWithParent();
+    },
+    willDestroyElement: function willDestroyElement() {
+      this._super.apply(this, arguments);
+      this._unregisterFromParent();
+    }
+  });
+});
+define('ember-bootstrap/mixins/component-parent', ['exports'], function (exports) {
+
+  /**
+   * Mixin for components that act as a parent component in a parent-child relationship of components
+   *
+   * @class ComponentParent
+   * @namespace Mixins
+   * @private
+   */
+  'use strict';
+
+  exports['default'] = Ember.Mixin.create({
+
+    /**
+     * Array of registered child components
+     *
+     * @property children
+     * @type array
+     * @protected
+     */
+    children: null,
+
+    init: function init() {
+      this._super.apply(this, arguments);
+      this.set('children', Ember.A());
+    },
+
+    /**
+     * Register a component as a child of this parent
+     *
+     * @method registerChild
+     * @param child
+     * @public
+     */
+    registerChild: function registerChild(child) {
+      Ember.run.schedule('actions', this, function () {
+        this.get('children').addObject(child);
+      });
+    },
+
+    /**
+     * Remove the child component from this parent component
+     *
+     * @method removeChild
+     * @param child
+     * @public
+     */
+    removeChild: function removeChild(child) {
+      Ember.run.schedule('actions', this, function () {
+        this.get('children').removeObject(child);
+      });
+    }
+  });
+});
+define('ember-bootstrap/mixins/control-attributes', ['exports'], function (exports) {
+
+  /**
+   * Mixin for control components to add standard HTML attributes
+   *
+   * @class ControlAttributes
+   * @namespace Mixins
+   * @private
+   */
+  'use strict';
+
+  exports['default'] = Ember.Mixin.create({
+    attributeBindings: ['name', 'autofocus', 'disabled', 'readonly', 'required', 'tabindex', 'form', 'title', 'ariaDescribedBy:aria-describedby'],
+    tagName: 'input'
+  });
+});
+define('ember-bootstrap/mixins/control-validation', ['exports'], function (exports) {
+
+  /**
+   * Mixin for BS4 validation styles added to form controls
+   *
+   * @class ControlValidation
+   * @namespace Mixins
+   * @private
+   */
+  'use strict';
+
+  exports['default'] = Ember.Mixin.create({
+    classNameBindings: ['formFeedbackClass'],
+
+    validationType: null,
+
+    formFeedbackClass: Ember.computed('validationType', function () {
+      var validationType = this.get('validationType');
+      switch (validationType) {
+        case 'error':
+          return 'is-invalid';
+        case 'success':
+          return 'is-valid';
+        case 'warning':
+          return 'is-warning'; // not officially supported in BS4 :(
+      }
+    })
+  });
+});
+define('ember-bootstrap/mixins/dropdown-toggle', ['exports'], function (exports) {
+
+  /**
+   * Mixin for components that act as dropdown toggles.
+   *
+   * @class DropdownToggle
+   * @namespace Mixins
+   * @private
+   */
+  'use strict';
+
+  exports['default'] = Ember.Mixin.create({
+    classNames: ['dropdown-toggle'],
+
+    /**
+     * @property ariaRole
+     * @default button
+     * @type string
+     * @protected
+     */
+    ariaRole: 'button',
+
+    /**
+     * Reference to the parent dropdown component
+     *
+     * @property dropdown
+     * @type {Components.Dropdown}
+     * @private
+     */
+    dropdown: null,
+
+    didReceiveAttrs: function didReceiveAttrs() {
+      this._super.apply(this, arguments);
+      var dropdown = this.get('dropdown');
+      if (dropdown) {
+        Ember.run.schedule('actions', this, function () {
+          if (!this.get('isDestroyed')) {
+            dropdown.set('toggle', this);
+          }
+        });
+      }
+    }
+  });
+});
+define('ember-bootstrap/mixins/size-class', ['exports'], function (exports) {
+
+  /**
+   * Mixin to set the appropriate class for components with different sizes.
+   *
+   *
+   * @class SizeClass
+   * @namespace Mixins
+   * @private
+   */
+  'use strict';
+
+  exports['default'] = Ember.Mixin.create({
+    /**
+     * Prefix for the size class, e.g. "btn" for button size classes ("btn-lg", "btn-sm" etc.)
+     *
+     * @property classTypePrefix
+     * @type string
+     * @required
+     * @protected
+     */
+    classTypePrefix: null,
+
+    classNameBindings: ['sizeClass'],
+
+    sizeClass: Ember.computed('size', function () {
+      var prefix = this.get('classTypePrefix');
+      var size = this.get('size');
+      return Ember.isBlank(size) ? null : prefix + '-' + size;
+    }),
+
+    /**
+     * Property for size styling, set to 'lg', 'sm' or 'xs'
+     *
+     * Also see the [Bootstrap docs](http://getbootstrap.com/css/#buttons-sizes)
+     *
+     * @property size
+     * @type String
+     * @public
+     */
+    size: null
+  });
+});
+define('ember-bootstrap/mixins/sub-component', ['exports'], function (exports) {
+
+  /**
+   * @class SubComponent
+   * @namespace Mixins
+   * @deprecated
+   * @private
+   */
+  'use strict';
+
+  exports['default'] = Ember.Mixin.create({
+    targetObject: Ember.computed.alias('parentView')
+  });
+});
+define('ember-bootstrap/mixins/transition-support', ['exports', 'ember-bootstrap/utils/transition-support'], function (exports, _emberBootstrapUtilsTransitionSupport) {
+  'use strict';
+
+  /**
+   * Mixin for components that support transitions
+   *
+   * @class TransitionSupport
+   * @namespace Mixins
+   * @private
+   */
+  exports['default'] = Ember.Mixin.create({
+
+    /**
+     * @property transitionsEnabled
+     * @type boolean
+     * @private
+     */
+    transitionsEnabled: Ember.computed.reads('fade'),
+
+    /**
+     * Access to the fastboot service if available
+     *
+     * @property fastboot
+     * @type {Ember.Service}
+     * @private
+     */
+    fastboot: Ember.computed(function () {
+      var owner = Ember.getOwner(this);
+      return owner.lookup('service:fastboot');
+    }),
+
+    /**
+     * Use CSS transitions?
+     *
+     * @property usesTransition
+     * @type boolean
+     * @readonly
+     * @private
+     */
+    usesTransition: Ember.computed('fade', 'fastboot.isFastBoot', function () {
+      return !this.get('fastboot.isFastBoot') && !!_emberBootstrapUtilsTransitionSupport['default'] && this.get('transitionsEnabled');
+    })
+  });
+});
+define('ember-bootstrap/mixins/type-class', ['exports'], function (exports) {
+
+  /**
+   * Mixin to set the appropriate class for components with differently styled types ("success", "danger" etc.)
+   *
+   * @class TypeClass
+   * @namespace Mixins
+   * @private
+   */
+  'use strict';
+
+  exports['default'] = Ember.Mixin.create({
+    /**
+     * Prefix for the type class, e.g. "btn" for button type classes ("btn-primary2 etc.)
+     *
+     * @property classTypePrefix
+     * @type string
+     * @required
+     * @protected
+     */
+    classTypePrefix: null,
+
+    classNameBindings: ['typeClass'],
+
+    typeClass: Ember.computed('type', function () {
+      var prefix = this.get('classTypePrefix');
+      var type = this.get('type') || 'default';
+      return prefix + '-' + type;
+    }),
+
+    /**
+     * Property for type styling
+     *
+     * For the available types see the [Bootstrap docs](http://getbootstrap.com/css/#buttons-options) (use without "btn-" prefix)
+     *
+     * @property type
+     * @type String
+     * @default 'default'
+     * @public
+     */
+    type: 'default'
+  });
+});
+define("ember-bootstrap/templates/components/bs-accordion", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 6,
+            "column": 2
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-accordion.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["inline", "yield", [["subexpr", "hash", [], ["item", ["subexpr", "component", ["bs-accordion/item"], ["selected", ["subexpr", "@mut", [["get", "isSelected", ["loc", [null, [3, 49], [3, 59]]], 0, 0, 0, 0]], [], [], 0, 0], "onClick", ["subexpr", "action", ["change"], [], ["loc", [null, [3, 68], [3, 85]]], 0, 0]], ["loc", [null, [3, 9], [3, 86]]], 0, 0], "change", ["subexpr", "action", ["change"], [], ["loc", [null, [4, 11], [4, 28]]], 0, 0]], ["loc", [null, [2, 2], [5, 3]]], 0, 0]], [], ["loc", [null, [1, 0], [6, 2]]], 0, 0]],
+      locals: [],
+      templates: []
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-accordion/body", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 1,
+              "column": 0
+            },
+            "end": {
+              "line": 5,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-accordion/body.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("div");
+          var el2 = dom.createTextNode("\n    ");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createComment("");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createTextNode("\n  ");
+          dom.appendChild(el1, el2);
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var element0 = dom.childAt(fragment, [1]);
+          var morphs = new Array(2);
+          morphs[0] = dom.createAttrMorph(element0, 'class');
+          morphs[1] = dom.createMorphAt(element0, 1, 1);
+          return morphs;
+        },
+        statements: [["attribute", "class", ["concat", ["panel-body ", ["get", "class", ["loc", [null, [2, 27], [2, 32]]], 0, 0, 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0], ["content", "yield", ["loc", [null, [3, 4], [3, 13]]], 0, 0, 0, 0]],
+        locals: [],
+        templates: []
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 6,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-accordion/body.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["block", "bs-collapse", [], ["ariaRole", "tabpanel", "collapsed", ["subexpr", "@mut", [["get", "collapsed", ["loc", [null, [1, 45], [1, 54]]], 0, 0, 0, 0]], [], [], 0, 0], "class", "panel-collapse"], 0, null, ["loc", [null, [1, 0], [5, 16]]]]],
+      locals: [],
+      templates: [child0]
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-accordion/item", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 1,
+              "column": 0
+            },
+            "end": {
+              "line": 8,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-accordion/item.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(1);
+          morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+          return morphs;
+        },
+        statements: [["inline", "yield", [["subexpr", "hash", [], ["title", ["subexpr", "component", ["bs-accordion/item/title"], ["collapsed", ["subexpr", "@mut", [["get", "collapsed", ["loc", [null, [4, 59], [4, 68]]], 0, 0, 0, 0]], [], [], 0, 0], "onClick", ["subexpr", "action", [["get", "onClick", ["loc", [null, [4, 85], [4, 92]]], 0, 0, 0, 0], ["get", "value", ["loc", [null, [4, 93], [4, 98]]], 0, 0, 0, 0]], [], ["loc", [null, [4, 77], [4, 99]]], 0, 0]], ["loc", [null, [4, 12], [4, 100]]], 0, 0], "body", ["subexpr", "component", ["bs-accordion/item/body"], ["collapsed", ["subexpr", "@mut", [["get", "collapsed", ["loc", [null, [5, 57], [5, 66]]], 0, 0, 0, 0]], [], [], 0, 0]], ["loc", [null, [5, 11], [5, 67]]], 0, 0]], ["loc", [null, [3, 4], [6, 5]]], 0, 0]], [], ["loc", [null, [2, 2], [7, 4]]], 0, 0]],
+        locals: [],
+        templates: []
+      };
+    })();
+    var child1 = (function () {
+      var child0 = (function () {
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": {
+              "source": null,
+              "start": {
+                "line": 9,
+                "column": 2
+              },
+              "end": {
+                "line": 11,
+                "column": 2
+              }
+            },
+            "moduleName": "modules/ember-bootstrap/templates/components/bs-accordion/item.hbs"
+          },
+          isEmpty: false,
+          arity: 0,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createTextNode("    ");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createComment("");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createTextNode("\n");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+            var morphs = new Array(1);
+            morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+            return morphs;
+          },
+          statements: [["content", "title", ["loc", [null, [10, 4], [10, 13]]], 0, 0, 0, 0]],
+          locals: [],
+          templates: []
+        };
+      })();
+      var child1 = (function () {
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": {
+              "source": null,
+              "start": {
+                "line": 12,
+                "column": 2
+              },
+              "end": {
+                "line": 14,
+                "column": 2
+              }
+            },
+            "moduleName": "modules/ember-bootstrap/templates/components/bs-accordion/item.hbs"
+          },
+          isEmpty: false,
+          arity: 0,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createTextNode("    ");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createComment("");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createTextNode("\n");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+            var morphs = new Array(1);
+            morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+            return morphs;
+          },
+          statements: [["content", "yield", ["loc", [null, [13, 4], [13, 13]]], 0, 0, 0, 0]],
+          locals: [],
+          templates: []
+        };
+      })();
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 8,
+              "column": 0
+            },
+            "end": {
+              "line": 15,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-accordion/item.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(2);
+          morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+          morphs[1] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+          dom.insertBoundary(fragment, 0);
+          dom.insertBoundary(fragment, null);
+          return morphs;
+        },
+        statements: [["block", "bs-accordion/item/title", [], ["collapsed", ["subexpr", "@mut", [["get", "collapsed", ["loc", [null, [9, 39], [9, 48]]], 0, 0, 0, 0]], [], [], 0, 0], "onClick", ["subexpr", "action", [["get", "onClick", ["loc", [null, [9, 65], [9, 72]]], 0, 0, 0, 0], ["get", "value", ["loc", [null, [9, 73], [9, 78]]], 0, 0, 0, 0]], [], ["loc", [null, [9, 57], [9, 79]]], 0, 0]], 0, null, ["loc", [null, [9, 2], [11, 30]]]], ["block", "bs-accordion/item/body", [], ["collapsed", ["subexpr", "@mut", [["get", "collapsed", ["loc", [null, [12, 38], [12, 47]]], 0, 0, 0, 0]], [], [], 0, 0]], 1, null, ["loc", [null, [12, 2], [14, 29]]]]],
+        locals: [],
+        templates: [child0, child1]
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 16,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-accordion/item.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["block", "if", [["get", "hasBlockParams", ["loc", [null, [1, 6], [1, 20]]], 0, 0, 0, 0]], [], 0, 1, ["loc", [null, [1, 0], [15, 7]]]]],
+      locals: [],
+      templates: [child0, child1]
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-accordion/title", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 6,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-accordion/title.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createElement("h4");
+        dom.setAttribute(el1, "class", "panel-title");
+        var el2 = dom.createTextNode("\n  ");
+        dom.appendChild(el1, el2);
+        var el2 = dom.createElement("a");
+        dom.setAttribute(el2, "href", "#");
+        var el3 = dom.createTextNode("\n    ");
+        dom.appendChild(el2, el3);
+        var el3 = dom.createComment("");
+        dom.appendChild(el2, el3);
+        var el3 = dom.createTextNode("\n  ");
+        dom.appendChild(el2, el3);
+        dom.appendChild(el1, el2);
+        var el2 = dom.createTextNode("\n");
+        dom.appendChild(el1, el2);
+        dom.appendChild(el0, el1);
+        var el1 = dom.createTextNode("\n");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(dom.childAt(fragment, [0, 1]), 1, 1);
+        return morphs;
+      },
+      statements: [["content", "yield", ["loc", [null, [3, 4], [3, 13]]], 0, 0, 0, 0]],
+      locals: [],
+      templates: []
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-alert", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      var child0 = (function () {
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": {
+              "source": null,
+              "start": {
+                "line": 2,
+                "column": 2
+              },
+              "end": {
+                "line": 6,
+                "column": 2
+              }
+            },
+            "moduleName": "modules/ember-bootstrap/templates/components/bs-alert.hbs"
+          },
+          isEmpty: false,
+          arity: 0,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createTextNode("    ");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createElement("button");
+            dom.setAttribute(el1, "type", "button");
+            dom.setAttribute(el1, "class", "close");
+            dom.setAttribute(el1, "aria-label", "Close");
+            var el2 = dom.createTextNode("\n      ");
+            dom.appendChild(el1, el2);
+            var el2 = dom.createElement("span");
+            dom.setAttribute(el2, "aria-hidden", "true");
+            var el3 = dom.createTextNode("×");
+            dom.appendChild(el2, el3);
+            dom.appendChild(el1, el2);
+            var el2 = dom.createTextNode("\n    ");
+            dom.appendChild(el1, el2);
+            dom.appendChild(el0, el1);
+            var el1 = dom.createTextNode("\n");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+            var element0 = dom.childAt(fragment, [1]);
+            var morphs = new Array(1);
+            morphs[0] = dom.createElementMorph(element0);
+            return morphs;
+          },
+          statements: [["element", "action", ["dismiss"], [], ["loc", [null, [3, 59], [3, 79]]], 0, 0]],
+          locals: [],
+          templates: []
+        };
+      })();
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 1,
+              "column": 0
+            },
+            "end": {
+              "line": 8,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-alert.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(2);
+          morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+          morphs[1] = dom.createMorphAt(fragment, 2, 2, contextualElement);
+          dom.insertBoundary(fragment, 0);
+          return morphs;
+        },
+        statements: [["block", "if", [["get", "dismissible", ["loc", [null, [2, 8], [2, 19]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [2, 2], [6, 9]]]], ["content", "yield", ["loc", [null, [7, 2], [7, 11]]], 0, 0, 0, 0]],
+        locals: [],
+        templates: [child0]
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 9,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-alert.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["block", "unless", [["get", "hidden", ["loc", [null, [1, 10], [1, 16]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [1, 0], [8, 11]]]]],
+      locals: [],
+      templates: [child0]
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-button-group", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 5,
+            "column": 2
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-button-group.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["inline", "yield", [["subexpr", "hash", [], ["button", ["subexpr", "component", ["bs-button-group/button"], ["buttonGroupType", ["subexpr", "@mut", [["get", "type", ["loc", [null, [3, 63], [3, 67]]], 0, 0, 0, 0]], [], [], 0, 0], "groupValue", ["subexpr", "@mut", [["get", "value", ["loc", [null, [3, 79], [3, 84]]], 0, 0, 0, 0]], [], [], 0, 0], "onClick", ["subexpr", "action", ["buttonPressed"], [], ["loc", [null, [3, 93], [3, 117]]], 0, 0]], ["loc", [null, [3, 11], [3, 118]]], 0, 0]], ["loc", [null, [2, 2], [4, 3]]], 0, 0]], [], ["loc", [null, [1, 0], [5, 2]]], 0, 0]],
+      locals: [],
+      templates: []
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-button", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 1,
+              "column": 0
+            },
+            "end": {
+              "line": 1,
+              "column": 37
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-button.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createElement("i");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode(" ");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var element0 = dom.childAt(fragment, [0]);
+          var morphs = new Array(1);
+          morphs[0] = dom.createAttrMorph(element0, 'class');
+          return morphs;
+        },
+        statements: [["attribute", "class", ["concat", [["get", "icon", ["loc", [null, [1, 24], [1, 28]]], 0, 0, 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0]],
+        locals: [],
+        templates: []
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 1,
+            "column": 61
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-button.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(3);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        morphs[1] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+        morphs[2] = dom.createMorphAt(fragment, 2, 2, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["block", "if", [["get", "icon", ["loc", [null, [1, 6], [1, 10]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [1, 0], [1, 44]]]], ["content", "text", ["loc", [null, [1, 44], [1, 52]]], 0, 0, 0, 0], ["content", "yield", ["loc", [null, [1, 52], [1, 61]]], 0, 0, 0, 0]],
+      locals: [],
+      templates: [child0]
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-carousel", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      var child0 = (function () {
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": {
+              "source": null,
+              "start": {
+                "line": 3,
+                "column": 4
+              },
+              "end": {
+                "line": 5,
+                "column": 4
+              }
+            },
+            "moduleName": "modules/ember-bootstrap/templates/components/bs-carousel.hbs"
+          },
+          isEmpty: false,
+          arity: 2,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createTextNode("      ");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createElement("li");
+            dom.setAttribute(el1, "role", "button");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createTextNode("\n");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+            var element4 = dom.childAt(fragment, [1]);
+            var morphs = new Array(2);
+            morphs[0] = dom.createAttrMorph(element4, 'class');
+            morphs[1] = dom.createAttrMorph(element4, 'onclick');
+            return morphs;
+          },
+          statements: [["attribute", "class", ["concat", [["subexpr", "if", [["subexpr", "bs-eq", [["get", "currentIndex", ["loc", [null, [4, 29], [4, 41]]], 0, 0, 0, 0], ["get", "_index", ["loc", [null, [4, 42], [4, 48]]], 0, 0, 0, 0]], [], ["loc", [null, [4, 22], [4, 49]]], 0, 0], "active"], [], ["loc", [null, [4, 17], [4, 60]]], 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0], ["attribute", "onclick", ["subexpr", "action", ["toSlide", ["get", "_index", ["loc", [null, [4, 89], [4, 95]]], 0, 0, 0, 0]], [], ["loc", [null, [null, null], [4, 97]]], 0, 0], 0, 0, 0, 0]],
+          locals: ["indicator", "_index"],
+          templates: []
+        };
+      })();
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 1,
+              "column": 0
+            },
+            "end": {
+              "line": 7,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-carousel.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("ol");
+          dom.setAttribute(el1, "class", "carousel-indicators");
+          var el2 = dom.createTextNode("\n");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createComment("");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createTextNode("  ");
+          dom.appendChild(el1, el2);
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(1);
+          morphs[0] = dom.createMorphAt(dom.childAt(fragment, [1]), 1, 1);
+          return morphs;
+        },
+        statements: [["block", "each", [["get", "indicators", ["loc", [null, [3, 12], [3, 22]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [3, 4], [5, 13]]]]],
+        locals: [],
+        templates: [child0]
+      };
+    })();
+    var child1 = (function () {
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 19,
+              "column": 0
+            },
+            "end": {
+              "line": 28,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-carousel.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("a");
+          dom.setAttribute(el1, "role", "button");
+          var el2 = dom.createTextNode("\n    ");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createElement("span");
+          dom.setAttribute(el2, "aria-hidden", "true");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createTextNode("\n    ");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createElement("span");
+          dom.setAttribute(el2, "class", "sr-only");
+          var el3 = dom.createComment("");
+          dom.appendChild(el2, el3);
+          dom.appendChild(el1, el2);
+          var el2 = dom.createTextNode("\n  ");
+          dom.appendChild(el1, el2);
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("a");
+          dom.setAttribute(el1, "role", "button");
+          var el2 = dom.createTextNode("\n    ");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createElement("span");
+          dom.setAttribute(el2, "aria-hidden", "true");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createTextNode("\n    ");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createElement("span");
+          dom.setAttribute(el2, "class", "sr-only");
+          var el3 = dom.createComment("");
+          dom.appendChild(el2, el3);
+          dom.appendChild(el1, el2);
+          var el2 = dom.createTextNode("\n  ");
+          dom.appendChild(el1, el2);
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var element0 = dom.childAt(fragment, [1]);
+          var element1 = dom.childAt(element0, [1]);
+          var element2 = dom.childAt(fragment, [3]);
+          var element3 = dom.childAt(element2, [1]);
+          var morphs = new Array(10);
+          morphs[0] = dom.createAttrMorph(element0, 'class');
+          morphs[1] = dom.createAttrMorph(element0, 'href');
+          morphs[2] = dom.createElementMorph(element0);
+          morphs[3] = dom.createAttrMorph(element1, 'class');
+          morphs[4] = dom.createMorphAt(dom.childAt(element0, [3]), 0, 0);
+          morphs[5] = dom.createAttrMorph(element2, 'class');
+          morphs[6] = dom.createAttrMorph(element2, 'href');
+          morphs[7] = dom.createElementMorph(element2);
+          morphs[8] = dom.createAttrMorph(element3, 'class');
+          morphs[9] = dom.createMorphAt(dom.childAt(element2, [3]), 0, 0);
+          return morphs;
+        },
+        statements: [["attribute", "class", ["concat", [["get", "prevControlClassName", ["loc", [null, [20, 14], [20, 34]]], 0, 0, 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0], ["attribute", "href", ["concat", ["#", ["get", "elementId", ["loc", [null, [20, 47], [20, 56]]], 0, 0, 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0], ["element", "action", ["toPrevSlide"], [], ["loc", [null, [20, 60], [20, 84]]], 0, 0], ["attribute", "class", ["concat", [["get", "prevControlIcon", ["loc", [null, [21, 38], [21, 53]]], 0, 0, 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0], ["content", "prevControlLabel", ["loc", [null, [22, 26], [22, 46]]], 0, 0, 0, 0], ["attribute", "class", ["concat", [["get", "nextControlClassName", ["loc", [null, [24, 14], [24, 34]]], 0, 0, 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0], ["attribute", "href", ["concat", ["#", ["get", "elementId", ["loc", [null, [24, 47], [24, 56]]], 0, 0, 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0], ["element", "action", ["toNextSlide"], [], ["loc", [null, [24, 60], [24, 84]]], 0, 0], ["attribute", "class", ["concat", [["get", "nextControlIcon", ["loc", [null, [25, 38], [25, 53]]], 0, 0, 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0], ["content", "nextControlLabel", ["loc", [null, [26, 26], [26, 46]]], 0, 0, 0, 0]],
+        locals: [],
+        templates: []
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 29,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-carousel.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createTextNode("\n");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createElement("div");
+        dom.setAttribute(el1, "class", "carousel-inner");
+        dom.setAttribute(el1, "role", "listbox");
+        var el2 = dom.createTextNode("\n  ");
+        dom.appendChild(el1, el2);
+        var el2 = dom.createComment("");
+        dom.appendChild(el1, el2);
+        var el2 = dom.createTextNode("\n");
+        dom.appendChild(el1, el2);
+        dom.appendChild(el0, el1);
+        var el1 = dom.createTextNode("\n\n");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(3);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        morphs[1] = dom.createMorphAt(dom.childAt(fragment, [2]), 1, 1);
+        morphs[2] = dom.createMorphAt(fragment, 4, 4, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["block", "if", [["get", "showIndicators", ["loc", [null, [1, 6], [1, 20]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [1, 0], [7, 7]]]], ["inline", "yield", [["subexpr", "hash", [], ["slide", ["subexpr", "component", ["bs-carousel/slide"], ["currentSlide", ["subexpr", "@mut", [["get", "currentSlide", ["loc", [null, [11, 17], [11, 29]]], 0, 0, 0, 0]], [], [], 0, 0], "directionalClassName", ["subexpr", "@mut", [["get", "directionalClassName", ["loc", [null, [12, 25], [12, 45]]], 0, 0, 0, 0]], [], [], 0, 0], "followingSlide", ["subexpr", "@mut", [["get", "followingSlide", ["loc", [null, [13, 19], [13, 33]]], 0, 0, 0, 0]], [], [], 0, 0], "orderClassName", ["subexpr", "@mut", [["get", "orderClassName", ["loc", [null, [14, 19], [14, 33]]], 0, 0, 0, 0]], [], [], 0, 0], "presentationState", ["subexpr", "@mut", [["get", "presentationState", ["loc", [null, [15, 22], [15, 39]]], 0, 0, 0, 0]], [], [], 0, 0]], ["loc", [null, [10, 22], [16, 3]]], 0, 0]], ["loc", [null, [10, 10], [16, 4]]], 0, 0]], [], ["loc", [null, [10, 2], [16, 6]]], 0, 0], ["block", "if", [["get", "showControls", ["loc", [null, [19, 6], [19, 18]]], 0, 0, 0, 0]], [], 1, null, ["loc", [null, [19, 0], [28, 7]]]]],
+      locals: [],
+      templates: [child0, child1]
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-carousel/slide", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 1,
+            "column": 9
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-carousel/slide.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["content", "yield", ["loc", [null, [1, 0], [1, 9]]], 0, 0, 0, 0]],
+      locals: [],
+      templates: []
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-dropdown", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 8,
+            "column": 2
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-dropdown.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["inline", "yield", [["subexpr", "hash", [], ["button", ["subexpr", "component", ["bs-dropdown/button"], ["dropdown", ["subexpr", "@mut", [["get", "this", ["loc", [null, [3, 52], [3, 56]]], 0, 0, 0, 0]], [], [], 0, 0], "onClick", ["subexpr", "action", ["toggleDropdown"], [], ["loc", [null, [3, 65], [3, 90]]], 0, 0]], ["loc", [null, [3, 11], [3, 91]]], 0, 0], "toggle", ["subexpr", "component", ["bs-dropdown/toggle"], ["dropdown", ["subexpr", "@mut", [["get", "this", ["loc", [null, [4, 52], [4, 56]]], 0, 0, 0, 0]], [], [], 0, 0], "inNav", ["subexpr", "@mut", [["get", "inNav", ["loc", [null, [4, 63], [4, 68]]], 0, 0, 0, 0]], [], [], 0, 0], "onClick", ["subexpr", "action", ["toggleDropdown"], [], ["loc", [null, [4, 77], [4, 102]]], 0, 0]], ["loc", [null, [4, 11], [4, 103]]], 0, 0], "menu", ["subexpr", "component", ["bs-dropdown/menu"], ["isOpen", ["subexpr", "@mut", [["get", "isOpen", ["loc", [null, [5, 46], [5, 52]]], 0, 0, 0, 0]], [], [], 0, 0], "direction", ["subexpr", "@mut", [["get", "direction", ["loc", [null, [5, 63], [5, 72]]], 0, 0, 0, 0]], [], [], 0, 0], "inNav", ["subexpr", "@mut", [["get", "inNav", ["loc", [null, [5, 79], [5, 84]]], 0, 0, 0, 0]], [], [], 0, 0], "toggleElement", ["subexpr", "@mut", [["get", "toggleElement", ["loc", [null, [5, 99], [5, 112]]], 0, 0, 0, 0]], [], [], 0, 0]], ["loc", [null, [5, 9], [5, 113]]], 0, 0], "isOpen", ["get", "isOpen", ["loc", [null, [6, 11], [6, 17]]], 0, 0, 0, 0]], ["loc", [null, [2, 2], [7, 3]]], 0, 0]], [], ["loc", [null, [1, 0], [8, 2]]], 0, 0]],
+      locals: [],
+      templates: []
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-dropdown/menu", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 8,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-dropdown/menu.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createTextNode("\n");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        return morphs;
+      },
+      statements: [["inline", "yield", [["subexpr", "hash", [], ["item", ["subexpr", "component", ["bs-dropdown/menu/item"], [], ["loc", [null, [3, 9], [3, 44]]], 0, 0], "link-to", ["subexpr", "component", ["bs-dropdown/menu/link-to"], [], ["loc", [null, [4, 12], [4, 50]]], 0, 0], "divider", ["subexpr", "component", ["bs-dropdown/menu/divider"], [], ["loc", [null, [5, 12], [5, 50]]], 0, 0]], ["loc", [null, [2, 2], [6, 3]]], 0, 0]], [], ["loc", [null, [1, 0], [7, 2]]], 0, 0]],
+      locals: [],
+      templates: []
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-form", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 12,
+            "column": 2
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-form.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["inline", "yield", [["subexpr", "hash", [], ["element", ["subexpr", "component", ["bs-form/element"], ["model", ["subexpr", "@mut", [["get", "model", ["loc", [null, [4, 12], [4, 17]]], 0, 0, 0, 0]], [], [], 0, 0], "formLayout", ["subexpr", "@mut", [["get", "formLayout", ["loc", [null, [5, 17], [5, 27]]], 0, 0, 0, 0]], [], [], 0, 0], "horizontalLabelGridClass", ["subexpr", "@mut", [["get", "horizontalLabelGridClass", ["loc", [null, [6, 31], [6, 55]]], 0, 0, 0, 0]], [], [], 0, 0], "showAllValidations", ["subexpr", "@mut", [["get", "showAllValidations", ["loc", [null, [7, 25], [7, 43]]], 0, 0, 0, 0]], [], [], 0, 0], "onChange", ["subexpr", "action", ["change"], [], ["loc", [null, [8, 15], [8, 32]]], 0, 0]], ["loc", [null, [3, 12], [9, 5]]], 0, 0], "group", ["subexpr", "component", ["bs-form/group"], ["formLayout", ["subexpr", "@mut", [["get", "formLayout", ["loc", [null, [10, 48], [10, 58]]], 0, 0, 0, 0]], [], [], 0, 0]], ["loc", [null, [10, 10], [10, 59]]], 0, 0]], ["loc", [null, [2, 2], [11, 3]]], 0, 0]], [], ["loc", [null, [1, 0], [12, 2]]], 0, 0]],
+      locals: [],
+      templates: []
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-form/element", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      var child0 = (function () {
+        var child0 = (function () {
+          return {
+            meta: {
+              "revision": "Ember@2.8.3",
+              "loc": {
+                "source": null,
+                "start": {
+                  "line": 67,
+                  "column": 4
+                },
+                "end": {
+                  "line": 76,
+                  "column": 4
+                }
+              },
+              "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element.hbs"
+            },
+            isEmpty: false,
+            arity: 0,
+            cachedFragment: null,
+            hasRendered: false,
+            buildFragment: function buildFragment(dom) {
+              var el0 = dom.createDocumentFragment();
+              var el1 = dom.createTextNode("      ");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createComment("");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createTextNode("\n");
+              dom.appendChild(el0, el1);
+              return el0;
+            },
+            buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+              var morphs = new Array(1);
+              morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+              return morphs;
+            },
+            statements: [["inline", "yield", [["subexpr", "hash", [], ["value", ["get", "value", ["loc", [null, [70, 16], [70, 21]]], 0, 0, 0, 0], "id", ["get", "formElementId", ["loc", [null, [71, 13], [71, 26]]], 0, 0, 0, 0], "validation", ["get", "validation", ["loc", [null, [72, 21], [72, 31]]], 0, 0, 0, 0], "control", ["get", "control", ["loc", [null, [73, 18], [73, 25]]], 0, 0, 0, 0]], ["loc", [null, [69, 8], [74, 9]]], 0, 0]], [], ["loc", [null, [68, 6], [75, 8]]], 0, 0]],
+            locals: [],
+            templates: []
+          };
+        })();
+        var child1 = (function () {
+          return {
+            meta: {
+              "revision": "Ember@2.8.3",
+              "loc": {
+                "source": null,
+                "start": {
+                  "line": 76,
+                  "column": 4
+                },
+                "end": {
+                  "line": 78,
+                  "column": 4
+                }
+              },
+              "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element.hbs"
+            },
+            isEmpty: false,
+            arity: 0,
+            cachedFragment: null,
+            hasRendered: false,
+            buildFragment: function buildFragment(dom) {
+              var el0 = dom.createDocumentFragment();
+              var el1 = dom.createTextNode("      ");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createComment("");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createTextNode("\n");
+              dom.appendChild(el0, el1);
+              return el0;
+            },
+            buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+              var morphs = new Array(1);
+              morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+              return morphs;
+            },
+            statements: [["inline", "component", [["get", "control", ["loc", [null, [77, 18], [77, 25]]], 0, 0, 0, 0]], [], ["loc", [null, [77, 6], [77, 27]]], 0, 0]],
+            locals: [],
+            templates: []
+          };
+        })();
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": {
+              "source": null,
+              "start": {
+                "line": 29,
+                "column": 2
+              },
+              "end": {
+                "line": 79,
+                "column": 2
+              }
+            },
+            "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element.hbs"
+          },
+          isEmpty: false,
+          arity: 1,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createComment("");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+            var morphs = new Array(1);
+            morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+            dom.insertBoundary(fragment, 0);
+            dom.insertBoundary(fragment, null);
+            return morphs;
+          },
+          statements: [["block", "if", [["get", "hasBlock", ["loc", [null, [67, 10], [67, 18]]], 0, 0, 0, 0]], [], 0, 1, ["loc", [null, [67, 4], [78, 11]]]]],
+          locals: ["control"],
+          templates: [child0, child1]
+        };
+      })();
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 1,
+              "column": 0
+            },
+            "end": {
+              "line": 80,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(1);
+          morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+          dom.insertBoundary(fragment, 0);
+          dom.insertBoundary(fragment, null);
+          return morphs;
+        },
+        statements: [["block", "with", [["subexpr", "component", [["get", "controlComponent", ["loc", [null, [30, 15], [30, 31]]], 0, 0, 0, 0]], ["value", ["subexpr", "@mut", [["get", "value", ["loc", [null, [31, 12], [31, 17]]], 0, 0, 0, 0]], [], [], 0, 0], "id", ["subexpr", "@mut", [["get", "formElementId", ["loc", [null, [32, 9], [32, 22]]], 0, 0, 0, 0]], [], [], 0, 0], "name", ["subexpr", "@mut", [["get", "name", ["loc", [null, [33, 11], [33, 15]]], 0, 0, 0, 0]], [], [], 0, 0], "type", ["subexpr", "@mut", [["get", "controlType", ["loc", [null, [34, 11], [34, 22]]], 0, 0, 0, 0]], [], [], 0, 0], "label", ["subexpr", "@mut", [["get", "label", ["loc", [null, [35, 12], [35, 17]]], 0, 0, 0, 0]], [], [], 0, 0], "placeholder", ["subexpr", "@mut", [["get", "placeholder", ["loc", [null, [36, 18], [36, 29]]], 0, 0, 0, 0]], [], [], 0, 0], "autofocus", ["subexpr", "@mut", [["get", "autofocus", ["loc", [null, [37, 16], [37, 25]]], 0, 0, 0, 0]], [], [], 0, 0], "disabled", ["subexpr", "@mut", [["get", "disabled", ["loc", [null, [38, 15], [38, 23]]], 0, 0, 0, 0]], [], [], 0, 0], "readonly", ["subexpr", "@mut", [["get", "readonly", ["loc", [null, [39, 15], [39, 23]]], 0, 0, 0, 0]], [], [], 0, 0], "required", ["subexpr", "@mut", [["get", "required", ["loc", [null, [40, 15], [40, 23]]], 0, 0, 0, 0]], [], [], 0, 0], "controlSize", ["subexpr", "@mut", [["get", "controlSize", ["loc", [null, [41, 18], [41, 29]]], 0, 0, 0, 0]], [], [], 0, 0], "tabindex", ["subexpr", "@mut", [["get", "tabindex", ["loc", [null, [42, 15], [42, 23]]], 0, 0, 0, 0]], [], [], 0, 0], "minlength", ["subexpr", "@mut", [["get", "minlength", ["loc", [null, [43, 16], [43, 25]]], 0, 0, 0, 0]], [], [], 0, 0], "maxlength", ["subexpr", "@mut", [["get", "maxlength", ["loc", [null, [44, 16], [44, 25]]], 0, 0, 0, 0]], [], [], 0, 0], "min", ["subexpr", "@mut", [["get", "min", ["loc", [null, [45, 10], [45, 13]]], 0, 0, 0, 0]], [], [], 0, 0], "max", ["subexpr", "@mut", [["get", "max", ["loc", [null, [46, 10], [46, 13]]], 0, 0, 0, 0]], [], [], 0, 0], "pattern", ["subexpr", "@mut", [["get", "pattern", ["loc", [null, [47, 14], [47, 21]]], 0, 0, 0, 0]], [], [], 0, 0], "accept", ["subexpr", "@mut", [["get", "accept", ["loc", [null, [48, 13], [48, 19]]], 0, 0, 0, 0]], [], [], 0, 0], "autocomplete", ["subexpr", "@mut", [["get", "autocomplete", ["loc", [null, [49, 19], [49, 31]]], 0, 0, 0, 0]], [], [], 0, 0], "autosave", ["subexpr", "@mut", [["get", "autosave", ["loc", [null, [50, 15], [50, 23]]], 0, 0, 0, 0]], [], [], 0, 0], "inputmode", ["subexpr", "@mut", [["get", "inputmode", ["loc", [null, [51, 16], [51, 25]]], 0, 0, 0, 0]], [], [], 0, 0], "multiple", ["subexpr", "@mut", [["get", "multiple", ["loc", [null, [52, 15], [52, 23]]], 0, 0, 0, 0]], [], [], 0, 0], "step", ["subexpr", "@mut", [["get", "step", ["loc", [null, [53, 11], [53, 15]]], 0, 0, 0, 0]], [], [], 0, 0], "form", ["subexpr", "@mut", [["get", "form", ["loc", [null, [54, 11], [54, 15]]], 0, 0, 0, 0]], [], [], 0, 0], "spellcheck", ["subexpr", "@mut", [["get", "spellcheck", ["loc", [null, [55, 17], [55, 27]]], 0, 0, 0, 0]], [], [], 0, 0], "cols", ["subexpr", "@mut", [["get", "cols", ["loc", [null, [56, 11], [56, 15]]], 0, 0, 0, 0]], [], [], 0, 0], "rows", ["subexpr", "@mut", [["get", "rows", ["loc", [null, [57, 11], [57, 15]]], 0, 0, 0, 0]], [], [], 0, 0], "wrap", ["subexpr", "@mut", [["get", "wrap", ["loc", [null, [58, 11], [58, 15]]], 0, 0, 0, 0]], [], [], 0, 0], "title", ["subexpr", "@mut", [["get", "title", ["loc", [null, [59, 12], [59, 17]]], 0, 0, 0, 0]], [], [], 0, 0], "options", ["subexpr", "@mut", [["get", "options", ["loc", [null, [60, 14], [60, 21]]], 0, 0, 0, 0]], [], [], 0, 0], "optionLabelPath", ["subexpr", "@mut", [["get", "optionLabelPath", ["loc", [null, [61, 22], [61, 37]]], 0, 0, 0, 0]], [], [], 0, 0], "ariaDescribedBy", ["subexpr", "if", [["get", "hasHelpText", ["loc", [null, [62, 26], [62, 37]]], 0, 0, 0, 0], ["get", "ariaDescribedBy", ["loc", [null, [62, 38], [62, 53]]], 0, 0, 0, 0]], [], ["loc", [null, [62, 22], [62, 54]]], 0, 0], "onChange", ["subexpr", "action", ["change"], [], ["loc", [null, [63, 15], [63, 32]]], 0, 0], "validationType", ["subexpr", "@mut", [["get", "validation", ["loc", [null, [64, 21], [64, 31]]], 0, 0, 0, 0]], [], [], 0, 0], "size", ["subexpr", "@mut", [["get", "size", ["loc", [null, [65, 11], [65, 15]]], 0, 0, 0, 0]], [], [], 0, 0]], ["loc", [null, [30, 4], [66, 3]]], 0, 0]], [], 0, null, ["loc", [null, [29, 2], [79, 11]]]]],
+        locals: [],
+        templates: [child0]
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 81,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["block", "component", [["get", "layoutComponent", ["loc", [null, [1, 13], [1, 28]]], 0, 0, 0, 0]], ["hasLabel", ["subexpr", "@mut", [["get", "hasLabel", ["loc", [null, [2, 11], [2, 19]]], 0, 0, 0, 0]], [], [], 0, 0], "formElementId", ["subexpr", "@mut", [["get", "formElementId", ["loc", [null, [3, 16], [3, 29]]], 0, 0, 0, 0]], [], [], 0, 0], "horizontalLabelGridClass", ["subexpr", "@mut", [["get", "horizontalLabelGridClass", ["loc", [null, [4, 27], [4, 51]]], 0, 0, 0, 0]], [], [], 0, 0], "errorsComponent", ["subexpr", "component", [["get", "errorsComponent", ["loc", [null, [5, 29], [5, 44]]], 0, 0, 0, 0]], ["messages", ["subexpr", "@mut", [["get", "validationMessages", ["loc", [null, [6, 13], [6, 31]]], 0, 0, 0, 0]], [], [], 0, 0], "show", ["subexpr", "@mut", [["get", "showValidationMessages", ["loc", [null, [7, 9], [7, 31]]], 0, 0, 0, 0]], [], [], 0, 0], "showMultipleErrors", ["subexpr", "@mut", [["get", "showMultipleErrors", ["loc", [null, [8, 23], [8, 41]]], 0, 0, 0, 0]], [], [], 0, 0]], ["loc", [null, [5, 18], [9, 3]]], 0, 0], "feedbackIconComponent", ["subexpr", "component", [["get", "feedbackIconComponent", ["loc", [null, [10, 35], [10, 56]]], 0, 0, 0, 0]], ["iconName", ["subexpr", "@mut", [["get", "iconName", ["loc", [null, [11, 13], [11, 21]]], 0, 0, 0, 0]], [], [], 0, 0], "show", ["subexpr", "@mut", [["get", "hasFeedback", ["loc", [null, [12, 9], [12, 20]]], 0, 0, 0, 0]], [], [], 0, 0]], ["loc", [null, [10, 24], [13, 3]]], 0, 0], "labelComponent", ["subexpr", "component", [["get", "labelComponent", ["loc", [null, [14, 28], [14, 42]]], 0, 0, 0, 0]], ["label", ["subexpr", "@mut", [["get", "label", ["loc", [null, [15, 10], [15, 15]]], 0, 0, 0, 0]], [], [], 0, 0], "invisibleLabel", ["subexpr", "@mut", [["get", "invisibleLabel", ["loc", [null, [16, 19], [16, 33]]], 0, 0, 0, 0]], [], [], 0, 0], "formElementId", ["subexpr", "@mut", [["get", "formElementId", ["loc", [null, [17, 18], [17, 31]]], 0, 0, 0, 0]], [], [], 0, 0], "controlType", ["subexpr", "@mut", [["get", "controlType", ["loc", [null, [18, 16], [18, 27]]], 0, 0, 0, 0]], [], [], 0, 0], "formLayout", ["subexpr", "@mut", [["get", "formLayout", ["loc", [null, [19, 15], [19, 25]]], 0, 0, 0, 0]], [], [], 0, 0], "size", ["subexpr", "@mut", [["get", "size", ["loc", [null, [20, 9], [20, 13]]], 0, 0, 0, 0]], [], [], 0, 0]], ["loc", [null, [14, 17], [21, 3]]], 0, 0], "helpTextComponent", ["subexpr", "if", [["get", "hasHelpText", ["loc", [null, [22, 24], [22, 35]]], 0, 0, 0, 0], ["subexpr", "component", [["get", "helpTextComponent", ["loc", [null, [23, 15], [23, 32]]], 0, 0, 0, 0]], ["text", ["subexpr", "@mut", [["get", "helpText", ["loc", [null, [24, 11], [24, 19]]], 0, 0, 0, 0]], [], [], 0, 0], "id", ["subexpr", "@mut", [["get", "ariaDescribedBy", ["loc", [null, [25, 9], [25, 24]]], 0, 0, 0, 0]], [], [], 0, 0]], ["loc", [null, [23, 4], [26, 5]]], 0, 0]], [], ["loc", [null, [22, 20], [27, 3]]], 0, 0]], 0, null, ["loc", [null, [1, 0], [80, 14]]]]],
+      locals: [],
+      templates: [child0]
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-form/element/errors", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      var child0 = (function () {
+        var child0 = (function () {
+          return {
+            meta: {
+              "revision": "Ember@2.8.3",
+              "loc": {
+                "source": null,
+                "start": {
+                  "line": 4,
+                  "column": 6
+                },
+                "end": {
+                  "line": 6,
+                  "column": 6
+                }
+              },
+              "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element/errors.hbs"
+            },
+            isEmpty: false,
+            arity: 1,
+            cachedFragment: null,
+            hasRendered: false,
+            buildFragment: function buildFragment(dom) {
+              var el0 = dom.createDocumentFragment();
+              var el1 = dom.createTextNode("        ");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createElement("div");
+              var el2 = dom.createComment("");
+              dom.appendChild(el1, el2);
+              dom.appendChild(el0, el1);
+              var el1 = dom.createTextNode("\n");
+              dom.appendChild(el0, el1);
+              return el0;
+            },
+            buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+              var element1 = dom.childAt(fragment, [1]);
+              var morphs = new Array(2);
+              morphs[0] = dom.createAttrMorph(element1, 'class');
+              morphs[1] = dom.createMorphAt(element1, 0, 0);
+              return morphs;
+            },
+            statements: [["attribute", "class", ["concat", [["get", "feedbackClass", ["loc", [null, [5, 22], [5, 35]]], 0, 0, 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0], ["content", "message", ["loc", [null, [5, 39], [5, 50]]], 0, 0, 0, 0]],
+            locals: ["message"],
+            templates: []
+          };
+        })();
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": {
+              "source": null,
+              "start": {
+                "line": 2,
+                "column": 2
+              },
+              "end": {
+                "line": 8,
+                "column": 2
+              }
+            },
+            "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element/errors.hbs"
+          },
+          isEmpty: false,
+          arity: 0,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createTextNode("    ");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createElement("div");
+            dom.setAttribute(el1, "class", "pre-scrollable");
+            var el2 = dom.createTextNode("\n");
+            dom.appendChild(el1, el2);
+            var el2 = dom.createComment("");
+            dom.appendChild(el1, el2);
+            var el2 = dom.createTextNode("    ");
+            dom.appendChild(el1, el2);
+            dom.appendChild(el0, el1);
+            var el1 = dom.createTextNode("\n");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+            var morphs = new Array(1);
+            morphs[0] = dom.createMorphAt(dom.childAt(fragment, [1]), 1, 1);
+            return morphs;
+          },
+          statements: [["block", "each", [["get", "messages", ["loc", [null, [4, 14], [4, 22]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [4, 6], [6, 15]]]]],
+          locals: [],
+          templates: [child0]
+        };
+      })();
+      var child1 = (function () {
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": {
+              "source": null,
+              "start": {
+                "line": 8,
+                "column": 2
+              },
+              "end": {
+                "line": 10,
+                "column": 2
+              }
+            },
+            "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element/errors.hbs"
+          },
+          isEmpty: false,
+          arity: 0,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createTextNode("    ");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createElement("div");
+            var el2 = dom.createComment("");
+            dom.appendChild(el1, el2);
+            dom.appendChild(el0, el1);
+            var el1 = dom.createTextNode("\n");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+            var element0 = dom.childAt(fragment, [1]);
+            var morphs = new Array(2);
+            morphs[0] = dom.createAttrMorph(element0, 'class');
+            morphs[1] = dom.createMorphAt(element0, 0, 0);
+            return morphs;
+          },
+          statements: [["attribute", "class", ["get", "feedbackClass", ["loc", [null, [9, 17], [9, 30]]], 0, 0, 0, 0], 0, 0, 0, 0], ["content", "messages.firstObject", ["loc", [null, [9, 33], [9, 57]]], 0, 0, 0, 0]],
+          locals: [],
+          templates: []
+        };
+      })();
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 1,
+              "column": 0
+            },
+            "end": {
+              "line": 11,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element/errors.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(1);
+          morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+          dom.insertBoundary(fragment, 0);
+          dom.insertBoundary(fragment, null);
+          return morphs;
+        },
+        statements: [["block", "if", [["get", "showMultipleErrors", ["loc", [null, [2, 8], [2, 26]]], 0, 0, 0, 0]], [], 0, 1, ["loc", [null, [2, 2], [10, 9]]]]],
+        locals: [],
+        templates: [child0, child1]
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 12,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element/errors.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["block", "if", [["get", "show", ["loc", [null, [1, 6], [1, 10]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [1, 0], [11, 7]]]]],
+      locals: [],
+      templates: [child0]
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-form/element/feedback-icon", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 1,
+              "column": 0
+            },
+            "end": {
+              "line": 3,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element/feedback-icon.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("span");
+          dom.setAttribute(el1, "aria-hidden", "true");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var element0 = dom.childAt(fragment, [1]);
+          var morphs = new Array(1);
+          morphs[0] = dom.createAttrMorph(element0, 'class');
+          return morphs;
+        },
+        statements: [["attribute", "class", ["concat", ["form-control-feedback ", ["get", "iconName", ["loc", [null, [2, 39], [2, 47]]], 0, 0, 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0]],
+        locals: [],
+        templates: []
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 3,
+            "column": 7
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element/feedback-icon.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["block", "if", [["get", "show", ["loc", [null, [1, 6], [1, 10]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [1, 0], [3, 7]]]]],
+      locals: [],
+      templates: [child0]
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-form/element/help-text", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 1,
+            "column": 8
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element/help-text.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["content", "text", ["loc", [null, [1, 0], [1, 8]]], 0, 0, 0, 0]],
+      locals: [],
+      templates: []
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-form/element/label", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 1,
+              "column": 0
+            },
+            "end": {
+              "line": 6,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element/label.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("label");
+          var el2 = dom.createTextNode("\n    ");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createComment("");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createTextNode("\n    ");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createComment("");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createTextNode("\n  ");
+          dom.appendChild(el1, el2);
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var element1 = dom.childAt(fragment, [1]);
+          var morphs = new Array(2);
+          morphs[0] = dom.createMorphAt(element1, 1, 1);
+          morphs[1] = dom.createMorphAt(element1, 3, 3);
+          return morphs;
+        },
+        statements: [["content", "yield", ["loc", [null, [3, 4], [3, 13]]], 0, 0, 0, 0], ["content", "label", ["loc", [null, [4, 4], [4, 13]]], 0, 0, 0, 0]],
+        locals: [],
+        templates: []
+      };
+    })();
+    var child1 = (function () {
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 6,
+              "column": 0
+            },
+            "end": {
+              "line": 8,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element/label.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("label");
+          var el2 = dom.createComment("");
+          dom.appendChild(el1, el2);
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var element0 = dom.childAt(fragment, [1]);
+          var morphs = new Array(3);
+          morphs[0] = dom.createAttrMorph(element0, 'class');
+          morphs[1] = dom.createAttrMorph(element0, 'for');
+          morphs[2] = dom.createMorphAt(element0, 0, 0);
+          return morphs;
+        },
+        statements: [["attribute", "class", ["concat", ["control-label ", ["subexpr", "if", [["get", "invisibleLabel", ["loc", [null, [7, 35], [7, 49]]], 0, 0, 0, 0], "sr-only"], [], ["loc", [null, [7, 30], [7, 61]]], 0, 0], " ", ["get", "labelClass", ["loc", [null, [7, 64], [7, 74]]], 0, 0, 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0], ["attribute", "for", ["concat", [["get", "formElementId", ["loc", [null, [7, 85], [7, 98]]], 0, 0, 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0], ["content", "label", ["loc", [null, [7, 102], [7, 111]]], 0, 0, 0, 0]],
+        locals: [],
+        templates: []
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 8,
+            "column": 7
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element/label.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["block", "if", [["get", "hasBlock", ["loc", [null, [1, 6], [1, 14]]], 0, 0, 0, 0]], [], 0, 1, ["loc", [null, [1, 0], [8, 7]]]]],
+      locals: [],
+      templates: [child0, child1]
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-form/element/layout/horizontal", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 1,
+              "column": 0
+            },
+            "end": {
+              "line": 9,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element/layout/horizontal.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("div");
+          var el2 = dom.createTextNode("\n    ");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createComment("");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createTextNode("\n    ");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createComment("");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createTextNode("\n    ");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createComment("");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createTextNode("\n    ");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createComment("");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createTextNode("\n  ");
+          dom.appendChild(el1, el2);
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var element1 = dom.childAt(fragment, [3]);
+          var morphs = new Array(6);
+          morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+          morphs[1] = dom.createAttrMorph(element1, 'class');
+          morphs[2] = dom.createMorphAt(element1, 1, 1);
+          morphs[3] = dom.createMorphAt(element1, 3, 3);
+          morphs[4] = dom.createMorphAt(element1, 5, 5);
+          morphs[5] = dom.createMorphAt(element1, 7, 7);
+          return morphs;
+        },
+        statements: [["inline", "component", [["get", "labelComponent", ["loc", [null, [2, 14], [2, 28]]], 0, 0, 0, 0]], ["labelClass", ["subexpr", "@mut", [["get", "horizontalLabelGridClass", ["loc", [null, [2, 40], [2, 64]]], 0, 0, 0, 0]], [], [], 0, 0]], ["loc", [null, [2, 2], [2, 66]]], 0, 0], ["attribute", "class", ["concat", [["get", "horizontalInputGridClass", ["loc", [null, [3, 16], [3, 40]]], 0, 0, 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0], ["content", "yield", ["loc", [null, [4, 4], [4, 13]]], 0, 0, 0, 0], ["inline", "component", [["get", "feedbackIconComponent", ["loc", [null, [5, 16], [5, 37]]], 0, 0, 0, 0]], [], ["loc", [null, [5, 4], [5, 39]]], 0, 0], ["inline", "component", [["get", "errorsComponent", ["loc", [null, [6, 16], [6, 31]]], 0, 0, 0, 0]], [], ["loc", [null, [6, 4], [6, 33]]], 0, 0], ["inline", "component", [["get", "helpTextComponent", ["loc", [null, [7, 16], [7, 33]]], 0, 0, 0, 0]], [], ["loc", [null, [7, 4], [7, 35]]], 0, 0]],
+        locals: [],
+        templates: []
+      };
+    })();
+    var child1 = (function () {
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 9,
+              "column": 0
+            },
+            "end": {
+              "line": 16,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element/layout/horizontal.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("div");
+          var el2 = dom.createTextNode("\n    ");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createComment("");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createTextNode("\n    ");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createComment("");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createTextNode("\n    ");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createComment("");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createTextNode("\n    ");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createComment("");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createTextNode("\n  ");
+          dom.appendChild(el1, el2);
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var element0 = dom.childAt(fragment, [1]);
+          var morphs = new Array(5);
+          morphs[0] = dom.createAttrMorph(element0, 'class');
+          morphs[1] = dom.createMorphAt(element0, 1, 1);
+          morphs[2] = dom.createMorphAt(element0, 3, 3);
+          morphs[3] = dom.createMorphAt(element0, 5, 5);
+          morphs[4] = dom.createMorphAt(element0, 7, 7);
+          return morphs;
+        },
+        statements: [["attribute", "class", ["concat", [["get", "horizontalInputGridClass", ["loc", [null, [10, 16], [10, 40]]], 0, 0, 0, 0], " ", ["get", "horizontalInputOffsetGridClass", ["loc", [null, [10, 45], [10, 75]]], 0, 0, 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0], ["content", "yield", ["loc", [null, [11, 4], [11, 13]]], 0, 0, 0, 0], ["inline", "component", [["get", "feedbackIconComponent", ["loc", [null, [12, 16], [12, 37]]], 0, 0, 0, 0]], [], ["loc", [null, [12, 4], [12, 39]]], 0, 0], ["inline", "component", [["get", "errorsComponent", ["loc", [null, [13, 16], [13, 31]]], 0, 0, 0, 0]], [], ["loc", [null, [13, 4], [13, 33]]], 0, 0], ["inline", "component", [["get", "helpTextComponent", ["loc", [null, [14, 16], [14, 33]]], 0, 0, 0, 0]], [], ["loc", [null, [14, 4], [14, 35]]], 0, 0]],
+        locals: [],
+        templates: []
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 17,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element/layout/horizontal.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["block", "if", [["get", "hasLabel", ["loc", [null, [1, 6], [1, 14]]], 0, 0, 0, 0]], [], 0, 1, ["loc", [null, [1, 0], [16, 7]]]]],
+      locals: [],
+      templates: [child0, child1]
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-form/element/layout/horizontal/checkbox", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 3,
+              "column": 4
+            },
+            "end": {
+              "line": 5,
+              "column": 4
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element/layout/horizontal/checkbox.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("      ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(1);
+          morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+          return morphs;
+        },
+        statements: [["content", "yield", ["loc", [null, [4, 6], [4, 15]]], 0, 0, 0, 0]],
+        locals: [],
+        templates: []
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 9,
+            "column": 6
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element/layout/horizontal/checkbox.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createElement("div");
+        var el2 = dom.createTextNode("\n  ");
+        dom.appendChild(el1, el2);
+        var el2 = dom.createElement("div");
+        dom.setAttribute(el2, "class", "checkbox");
+        var el3 = dom.createTextNode("\n");
+        dom.appendChild(el2, el3);
+        var el3 = dom.createComment("");
+        dom.appendChild(el2, el3);
+        var el3 = dom.createTextNode("  ");
+        dom.appendChild(el2, el3);
+        dom.appendChild(el1, el2);
+        var el2 = dom.createTextNode("\n  ");
+        dom.appendChild(el1, el2);
+        var el2 = dom.createComment("");
+        dom.appendChild(el1, el2);
+        var el2 = dom.createTextNode("\n  ");
+        dom.appendChild(el1, el2);
+        var el2 = dom.createComment("");
+        dom.appendChild(el1, el2);
+        var el2 = dom.createTextNode("\n");
+        dom.appendChild(el1, el2);
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var element0 = dom.childAt(fragment, [0]);
+        var morphs = new Array(4);
+        morphs[0] = dom.createAttrMorph(element0, 'class');
+        morphs[1] = dom.createMorphAt(dom.childAt(element0, [1]), 1, 1);
+        morphs[2] = dom.createMorphAt(element0, 3, 3);
+        morphs[3] = dom.createMorphAt(element0, 5, 5);
+        return morphs;
+      },
+      statements: [["attribute", "class", ["concat", [["get", "horizontalInputGridClass", ["loc", [null, [1, 14], [1, 38]]], 0, 0, 0, 0], " ", ["get", "horizontalInputOffsetGridClass", ["loc", [null, [1, 43], [1, 73]]], 0, 0, 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0], ["block", "component", [["get", "labelComponent", ["loc", [null, [3, 17], [3, 31]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [3, 4], [5, 18]]]], ["inline", "component", [["get", "errorsComponent", ["loc", [null, [7, 14], [7, 29]]], 0, 0, 0, 0]], [], ["loc", [null, [7, 2], [7, 31]]], 0, 0], ["inline", "component", [["get", "helpTextComponent", ["loc", [null, [8, 14], [8, 31]]], 0, 0, 0, 0]], [], ["loc", [null, [8, 2], [8, 33]]], 0, 0]],
+      locals: [],
+      templates: [child0]
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-form/element/layout/vertical", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 1,
+              "column": 0
+            },
+            "end": {
+              "line": 3,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element/layout/vertical.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(1);
+          morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+          return morphs;
+        },
+        statements: [["inline", "component", [["get", "labelComponent", ["loc", [null, [2, 14], [2, 28]]], 0, 0, 0, 0]], [], ["loc", [null, [2, 2], [2, 30]]], 0, 0]],
+        locals: [],
+        templates: []
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 7,
+            "column": 31
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element/layout/vertical.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createTextNode("\n");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createTextNode("\n");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createTextNode("\n");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(5);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        morphs[1] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+        morphs[2] = dom.createMorphAt(fragment, 3, 3, contextualElement);
+        morphs[3] = dom.createMorphAt(fragment, 5, 5, contextualElement);
+        morphs[4] = dom.createMorphAt(fragment, 7, 7, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["block", "if", [["get", "hasLabel", ["loc", [null, [1, 6], [1, 14]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [1, 0], [3, 7]]]], ["content", "yield", ["loc", [null, [4, 0], [4, 9]]], 0, 0, 0, 0], ["inline", "component", [["get", "feedbackIconComponent", ["loc", [null, [5, 12], [5, 33]]], 0, 0, 0, 0]], [], ["loc", [null, [5, 0], [5, 35]]], 0, 0], ["inline", "component", [["get", "errorsComponent", ["loc", [null, [6, 12], [6, 27]]], 0, 0, 0, 0]], [], ["loc", [null, [6, 0], [6, 29]]], 0, 0], ["inline", "component", [["get", "helpTextComponent", ["loc", [null, [7, 12], [7, 29]]], 0, 0, 0, 0]], [], ["loc", [null, [7, 0], [7, 31]]], 0, 0]],
+      locals: [],
+      templates: [child0]
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-form/element/layout/vertical/checkbox", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 2,
+              "column": 2
+            },
+            "end": {
+              "line": 4,
+              "column": 2
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element/layout/vertical/checkbox.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("    ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(1);
+          morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+          return morphs;
+        },
+        statements: [["content", "yield", ["loc", [null, [3, 4], [3, 13]]], 0, 0, 0, 0]],
+        locals: [],
+        templates: []
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 7,
+            "column": 31
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-form/element/layout/vertical/checkbox.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createElement("div");
+        dom.setAttribute(el1, "class", "checkbox");
+        var el2 = dom.createTextNode("\n");
+        dom.appendChild(el1, el2);
+        var el2 = dom.createComment("");
+        dom.appendChild(el1, el2);
+        dom.appendChild(el0, el1);
+        var el1 = dom.createTextNode("\n");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createTextNode("\n");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(3);
+        morphs[0] = dom.createMorphAt(dom.childAt(fragment, [0]), 1, 1);
+        morphs[1] = dom.createMorphAt(fragment, 2, 2, contextualElement);
+        morphs[2] = dom.createMorphAt(fragment, 4, 4, contextualElement);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["block", "component", [["get", "labelComponent", ["loc", [null, [2, 15], [2, 29]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [2, 2], [4, 16]]]], ["inline", "component", [["get", "errorsComponent", ["loc", [null, [6, 12], [6, 27]]], 0, 0, 0, 0]], [], ["loc", [null, [6, 0], [6, 29]]], 0, 0], ["inline", "component", [["get", "helpTextComponent", ["loc", [null, [7, 12], [7, 29]]], 0, 0, 0, 0]], [], ["loc", [null, [7, 0], [7, 31]]], 0, 0]],
+      locals: [],
+      templates: [child0]
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-form/group", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 2,
+              "column": 0
+            },
+            "end": {
+              "line": 4,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-form/group.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("span");
+          dom.setAttribute(el1, "aria-hidden", "true");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var element0 = dom.childAt(fragment, [1]);
+          var morphs = new Array(1);
+          morphs[0] = dom.createAttrMorph(element0, 'class');
+          return morphs;
+        },
+        statements: [["attribute", "class", ["concat", ["form-control-feedback ", ["get", "iconName", ["loc", [null, [3, 39], [3, 47]]], 0, 0, 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0]],
+        locals: [],
+        templates: []
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 4,
+            "column": 7
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-form/group.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createTextNode("\n");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(2);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        morphs[1] = dom.createMorphAt(fragment, 2, 2, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["content", "yield", ["loc", [null, [1, 0], [1, 9]]], 0, 0, 0, 0], ["block", "if", [["get", "hasFeedback", ["loc", [null, [2, 6], [2, 17]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [2, 0], [4, 7]]]]],
+      locals: [],
+      templates: [child0]
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-modal-simple", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      var child0 = (function () {
+        var child0 = (function () {
+          var child0 = (function () {
+            return {
+              meta: {
+                "revision": "Ember@2.8.3",
+                "loc": {
+                  "source": null,
+                  "start": {
+                    "line": 18,
+                    "column": 6
+                  },
+                  "end": {
+                    "line": 25,
+                    "column": 6
+                  }
+                },
+                "moduleName": "modules/ember-bootstrap/templates/components/bs-modal-simple.hbs"
+              },
+              isEmpty: false,
+              arity: 0,
+              cachedFragment: null,
+              hasRendered: false,
+              buildFragment: function buildFragment(dom) {
+                var el0 = dom.createDocumentFragment();
+                var el1 = dom.createTextNode("        ");
+                dom.appendChild(el0, el1);
+                var el1 = dom.createComment("");
+                dom.appendChild(el0, el1);
+                var el1 = dom.createTextNode("\n");
+                dom.appendChild(el0, el1);
+                return el0;
+              },
+              buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+                var morphs = new Array(1);
+                morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+                return morphs;
+              },
+              statements: [["inline", "yield", [["subexpr", "hash", [], ["close", ["subexpr", "action", ["close"], [], ["loc", [null, [21, 18], [21, 34]]], 0, 0], "submit", ["subexpr", "action", ["submit"], [], ["loc", [null, [22, 19], [22, 36]]], 0, 0]], ["loc", [null, [20, 10], [23, 11]]], 0, 0]], [], ["loc", [null, [19, 8], [24, 10]]], 0, 0]],
+              locals: [],
+              templates: []
+            };
+          })();
+          return {
+            meta: {
+              "revision": "Ember@2.8.3",
+              "loc": {
+                "source": null,
+                "start": {
+                  "line": 3,
+                  "column": 4
+                },
+                "end": {
+                  "line": 33,
+                  "column": 4
+                }
+              },
+              "moduleName": "modules/ember-bootstrap/templates/components/bs-modal-simple.hbs"
+            },
+            isEmpty: false,
+            arity: 0,
+            cachedFragment: null,
+            hasRendered: false,
+            buildFragment: function buildFragment(dom) {
+              var el0 = dom.createDocumentFragment();
+              var el1 = dom.createTextNode("      ");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createComment("");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createTextNode("\n");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createComment("");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createTextNode("      ");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createComment("");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createTextNode("\n");
+              dom.appendChild(el0, el1);
+              return el0;
+            },
+            buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+              var morphs = new Array(3);
+              morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+              morphs[1] = dom.createMorphAt(fragment, 3, 3, contextualElement);
+              morphs[2] = dom.createMorphAt(fragment, 5, 5, contextualElement);
+              return morphs;
+            },
+            statements: [["inline", "bs-modal/header", [], ["title", ["subexpr", "@mut", [["get", "title", ["loc", [null, [17, 30], [17, 35]]], 0, 0, 0, 0]], [], [], 0, 0], "closeButton", ["subexpr", "@mut", [["get", "closeButton", ["loc", [null, [17, 48], [17, 59]]], 0, 0, 0, 0]], [], [], 0, 0], "onClose", ["subexpr", "action", ["close"], [], ["loc", [null, [17, 68], [17, 84]]], 0, 0]], ["loc", [null, [17, 6], [17, 86]]], 0, 0], ["block", "bs-modal/body", [], [], 0, null, ["loc", [null, [18, 6], [25, 24]]]], ["inline", "bs-modal/footer", [], ["closeTitle", ["subexpr", "@mut", [["get", "closeTitle", ["loc", [null, [27, 19], [27, 29]]], 0, 0, 0, 0]], [], [], 0, 0], "submitTitle", ["subexpr", "@mut", [["get", "submitTitle", ["loc", [null, [28, 20], [28, 31]]], 0, 0, 0, 0]], [], [], 0, 0], "submitButtonType", ["subexpr", "@mut", [["get", "submitButtonType", ["loc", [null, [29, 25], [29, 41]]], 0, 0, 0, 0]], [], [], 0, 0], "onClose", ["subexpr", "action", ["close"], [], ["loc", [null, [30, 16], [30, 32]]], 0, 0], "onSubmit", ["subexpr", "action", ["submit"], [], ["loc", [null, [31, 17], [31, 34]]], 0, 0]], ["loc", [null, [26, 6], [32, 8]]], 0, 0]],
+            locals: [],
+            templates: [child0]
+          };
+        })();
+        var child1 = (function () {
+          return {
+            meta: {
+              "revision": "Ember@2.8.3",
+              "loc": {
+                "source": null,
+                "start": {
+                  "line": 36,
+                  "column": 6
+                },
+                "end": {
+                  "line": 38,
+                  "column": 6
+                }
+              },
+              "moduleName": "modules/ember-bootstrap/templates/components/bs-modal-simple.hbs"
+            },
+            isEmpty: false,
+            arity: 0,
+            cachedFragment: null,
+            hasRendered: false,
+            buildFragment: function buildFragment(dom) {
+              var el0 = dom.createDocumentFragment();
+              var el1 = dom.createTextNode("        ");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createElement("div");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createTextNode("\n");
+              dom.appendChild(el0, el1);
+              return el0;
+            },
+            buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+              var element1 = dom.childAt(fragment, [1]);
+              var morphs = new Array(2);
+              morphs[0] = dom.createAttrMorph(element1, 'class');
+              morphs[1] = dom.createAttrMorph(element1, 'id');
+              return morphs;
+            },
+            statements: [["attribute", "class", ["concat", ["modal-backdrop ", ["subexpr", "if", [["get", "fade", ["loc", [null, [37, 40], [37, 44]]], 0, 0, 0, 0], "fade"], [], ["loc", [null, [37, 35], [37, 53]]], 0, 0], " ", ["subexpr", "if", [["get", "showModal", ["loc", [null, [37, 59], [37, 68]]], 0, 0, 0, 0], ["get", "showClass", ["loc", [null, [37, 69], [37, 78]]], 0, 0, 0, 0]], [], ["loc", [null, [37, 54], [37, 80]]], 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0], ["attribute", "id", ["concat", [["get", "backdropId", ["loc", [null, [37, 88], [37, 98]]], 0, 0, 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0]],
+            locals: [],
+            templates: []
+          };
+        })();
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": {
+              "source": null,
+              "start": {
+                "line": 2,
+                "column": 2
+              },
+              "end": {
+                "line": 40,
+                "column": 2
+              }
+            },
+            "moduleName": "modules/ember-bootstrap/templates/components/bs-modal-simple.hbs"
+          },
+          isEmpty: false,
+          arity: 0,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createComment("");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createTextNode("\n    ");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createElement("div");
+            var el2 = dom.createTextNode("\n");
+            dom.appendChild(el1, el2);
+            var el2 = dom.createComment("");
+            dom.appendChild(el1, el2);
+            var el2 = dom.createTextNode("    ");
+            dom.appendChild(el1, el2);
+            dom.appendChild(el0, el1);
+            var el1 = dom.createTextNode("\n");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+            var morphs = new Array(2);
+            morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+            morphs[1] = dom.createMorphAt(dom.childAt(fragment, [2]), 1, 1);
+            dom.insertBoundary(fragment, 0);
+            return morphs;
+          },
+          statements: [["block", "bs-modal/dialog", [], ["onClose", ["subexpr", "action", ["close"], [], ["loc", [null, [4, 14], [4, 30]]], 0, 0], "fade", ["subexpr", "@mut", [["get", "fade", ["loc", [null, [5, 11], [5, 15]]], 0, 0, 0, 0]], [], [], 0, 0], "showModal", ["subexpr", "@mut", [["get", "showModal", ["loc", [null, [6, 16], [6, 25]]], 0, 0, 0, 0]], [], [], 0, 0], "id", ["subexpr", "@mut", [["get", "modalId", ["loc", [null, [7, 9], [7, 16]]], 0, 0, 0, 0]], [], [], 0, 0], "keyboard", ["subexpr", "@mut", [["get", "keyboard", ["loc", [null, [8, 15], [8, 23]]], 0, 0, 0, 0]], [], [], 0, 0], "size", ["subexpr", "@mut", [["get", "size", ["loc", [null, [9, 11], [9, 15]]], 0, 0, 0, 0]], [], [], 0, 0], "backdropClose", ["subexpr", "@mut", [["get", "backdropClose", ["loc", [null, [10, 20], [10, 33]]], 0, 0, 0, 0]], [], [], 0, 0], "class", ["subexpr", "@mut", [["get", "class", ["loc", [null, [11, 12], [11, 17]]], 0, 0, 0, 0]], [], [], 0, 0], "inDom", ["subexpr", "@mut", [["get", "inDom", ["loc", [null, [12, 12], [12, 17]]], 0, 0, 0, 0]], [], [], 0, 0], "paddingLeft", ["subexpr", "@mut", [["get", "paddingLeft", ["loc", [null, [13, 18], [13, 29]]], 0, 0, 0, 0]], [], [], 0, 0], "paddingRight", ["subexpr", "@mut", [["get", "paddingRight", ["loc", [null, [14, 19], [14, 31]]], 0, 0, 0, 0]], [], [], 0, 0], "centered", ["subexpr", "bs-eq", [["get", "position", ["loc", [null, [15, 22], [15, 30]]], 0, 0, 0, 0], "center"], [], ["loc", [null, [15, 15], [15, 40]]], 0, 0]], 0, null, ["loc", [null, [3, 4], [33, 24]]]], ["block", "if", [["get", "showBackdrop", ["loc", [null, [36, 12], [36, 24]]], 0, 0, 0, 0]], [], 1, null, ["loc", [null, [36, 6], [38, 13]]]]],
+          locals: [],
+          templates: [child0, child1]
+        };
+      })();
+      var child1 = (function () {
+        var child0 = (function () {
+          var child0 = (function () {
+            var child0 = (function () {
+              return {
+                meta: {
+                  "revision": "Ember@2.8.3",
+                  "loc": {
+                    "source": null,
+                    "start": {
+                      "line": 18,
+                      "column": 6
+                    },
+                    "end": {
+                      "line": 25,
+                      "column": 6
+                    }
+                  },
+                  "moduleName": "modules/ember-bootstrap/templates/components/bs-modal-simple.hbs"
+                },
+                isEmpty: false,
+                arity: 0,
+                cachedFragment: null,
+                hasRendered: false,
+                buildFragment: function buildFragment(dom) {
+                  var el0 = dom.createDocumentFragment();
+                  var el1 = dom.createTextNode("        ");
+                  dom.appendChild(el0, el1);
+                  var el1 = dom.createComment("");
+                  dom.appendChild(el0, el1);
+                  var el1 = dom.createTextNode("\n");
+                  dom.appendChild(el0, el1);
+                  return el0;
+                },
+                buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+                  var morphs = new Array(1);
+                  morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+                  return morphs;
+                },
+                statements: [["inline", "yield", [["subexpr", "hash", [], ["close", ["subexpr", "action", ["close"], [], ["loc", [null, [21, 18], [21, 34]]], 0, 0], "submit", ["subexpr", "action", ["submit"], [], ["loc", [null, [22, 19], [22, 36]]], 0, 0]], ["loc", [null, [20, 10], [23, 11]]], 0, 0]], [], ["loc", [null, [19, 8], [24, 10]]], 0, 0]],
+                locals: [],
+                templates: []
+              };
+            })();
+            return {
+              meta: {
+                "revision": "Ember@2.8.3",
+                "loc": {
+                  "source": null,
+                  "start": {
+                    "line": 3,
+                    "column": 4
+                  },
+                  "end": {
+                    "line": 33,
+                    "column": 4
+                  }
+                },
+                "moduleName": "modules/ember-bootstrap/templates/components/bs-modal-simple.hbs"
+              },
+              isEmpty: false,
+              arity: 0,
+              cachedFragment: null,
+              hasRendered: false,
+              buildFragment: function buildFragment(dom) {
+                var el0 = dom.createDocumentFragment();
+                var el1 = dom.createTextNode("      ");
+                dom.appendChild(el0, el1);
+                var el1 = dom.createComment("");
+                dom.appendChild(el0, el1);
+                var el1 = dom.createTextNode("\n");
+                dom.appendChild(el0, el1);
+                var el1 = dom.createComment("");
+                dom.appendChild(el0, el1);
+                var el1 = dom.createTextNode("      ");
+                dom.appendChild(el0, el1);
+                var el1 = dom.createComment("");
+                dom.appendChild(el0, el1);
+                var el1 = dom.createTextNode("\n");
+                dom.appendChild(el0, el1);
+                return el0;
+              },
+              buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+                var morphs = new Array(3);
+                morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+                morphs[1] = dom.createMorphAt(fragment, 3, 3, contextualElement);
+                morphs[2] = dom.createMorphAt(fragment, 5, 5, contextualElement);
+                return morphs;
+              },
+              statements: [["inline", "bs-modal/header", [], ["title", ["subexpr", "@mut", [["get", "title", ["loc", [null, [17, 30], [17, 35]]], 0, 0, 0, 0]], [], [], 0, 0], "closeButton", ["subexpr", "@mut", [["get", "closeButton", ["loc", [null, [17, 48], [17, 59]]], 0, 0, 0, 0]], [], [], 0, 0], "onClose", ["subexpr", "action", ["close"], [], ["loc", [null, [17, 68], [17, 84]]], 0, 0]], ["loc", [null, [17, 6], [17, 86]]], 0, 0], ["block", "bs-modal/body", [], [], 0, null, ["loc", [null, [18, 6], [25, 24]]]], ["inline", "bs-modal/footer", [], ["closeTitle", ["subexpr", "@mut", [["get", "closeTitle", ["loc", [null, [27, 19], [27, 29]]], 0, 0, 0, 0]], [], [], 0, 0], "submitTitle", ["subexpr", "@mut", [["get", "submitTitle", ["loc", [null, [28, 20], [28, 31]]], 0, 0, 0, 0]], [], [], 0, 0], "submitButtonType", ["subexpr", "@mut", [["get", "submitButtonType", ["loc", [null, [29, 25], [29, 41]]], 0, 0, 0, 0]], [], [], 0, 0], "onClose", ["subexpr", "action", ["close"], [], ["loc", [null, [30, 16], [30, 32]]], 0, 0], "onSubmit", ["subexpr", "action", ["submit"], [], ["loc", [null, [31, 17], [31, 34]]], 0, 0]], ["loc", [null, [26, 6], [32, 8]]], 0, 0]],
+              locals: [],
+              templates: [child0]
+            };
+          })();
+          var child1 = (function () {
+            return {
+              meta: {
+                "revision": "Ember@2.8.3",
+                "loc": {
+                  "source": null,
+                  "start": {
+                    "line": 36,
+                    "column": 6
+                  },
+                  "end": {
+                    "line": 38,
+                    "column": 6
+                  }
+                },
+                "moduleName": "modules/ember-bootstrap/templates/components/bs-modal-simple.hbs"
+              },
+              isEmpty: false,
+              arity: 0,
+              cachedFragment: null,
+              hasRendered: false,
+              buildFragment: function buildFragment(dom) {
+                var el0 = dom.createDocumentFragment();
+                var el1 = dom.createTextNode("        ");
+                dom.appendChild(el0, el1);
+                var el1 = dom.createElement("div");
+                dom.appendChild(el0, el1);
+                var el1 = dom.createTextNode("\n");
+                dom.appendChild(el0, el1);
+                return el0;
+              },
+              buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+                var element0 = dom.childAt(fragment, [1]);
+                var morphs = new Array(2);
+                morphs[0] = dom.createAttrMorph(element0, 'class');
+                morphs[1] = dom.createAttrMorph(element0, 'id');
+                return morphs;
+              },
+              statements: [["attribute", "class", ["concat", ["modal-backdrop ", ["subexpr", "if", [["get", "fade", ["loc", [null, [37, 40], [37, 44]]], 0, 0, 0, 0], "fade"], [], ["loc", [null, [37, 35], [37, 53]]], 0, 0], " ", ["subexpr", "if", [["get", "showModal", ["loc", [null, [37, 59], [37, 68]]], 0, 0, 0, 0], ["get", "showClass", ["loc", [null, [37, 69], [37, 78]]], 0, 0, 0, 0]], [], ["loc", [null, [37, 54], [37, 80]]], 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0], ["attribute", "id", ["concat", [["get", "backdropId", ["loc", [null, [37, 88], [37, 98]]], 0, 0, 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0]],
+              locals: [],
+              templates: []
+            };
+          })();
+          return {
+            meta: {
+              "revision": "Ember@2.8.3",
+              "loc": {
+                "source": null,
+                "start": {
+                  "line": 2,
+                  "column": 2
+                },
+                "end": {
+                  "line": 40,
+                  "column": 2
+                }
+              },
+              "moduleName": "modules/ember-bootstrap/templates/components/bs-modal-simple.hbs"
+            },
+            isEmpty: false,
+            arity: 0,
+            cachedFragment: null,
+            hasRendered: false,
+            buildFragment: function buildFragment(dom) {
+              var el0 = dom.createDocumentFragment();
+              var el1 = dom.createComment("");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createTextNode("\n    ");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createElement("div");
+              var el2 = dom.createTextNode("\n");
+              dom.appendChild(el1, el2);
+              var el2 = dom.createComment("");
+              dom.appendChild(el1, el2);
+              var el2 = dom.createTextNode("    ");
+              dom.appendChild(el1, el2);
+              dom.appendChild(el0, el1);
+              var el1 = dom.createTextNode("\n");
+              dom.appendChild(el0, el1);
+              return el0;
+            },
+            buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+              var morphs = new Array(2);
+              morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+              morphs[1] = dom.createMorphAt(dom.childAt(fragment, [2]), 1, 1);
+              dom.insertBoundary(fragment, 0);
+              return morphs;
+            },
+            statements: [["block", "bs-modal/dialog", [], ["onClose", ["subexpr", "action", ["close"], [], ["loc", [null, [4, 14], [4, 30]]], 0, 0], "fade", ["subexpr", "@mut", [["get", "fade", ["loc", [null, [5, 11], [5, 15]]], 0, 0, 0, 0]], [], [], 0, 0], "showModal", ["subexpr", "@mut", [["get", "showModal", ["loc", [null, [6, 16], [6, 25]]], 0, 0, 0, 0]], [], [], 0, 0], "id", ["subexpr", "@mut", [["get", "modalId", ["loc", [null, [7, 9], [7, 16]]], 0, 0, 0, 0]], [], [], 0, 0], "keyboard", ["subexpr", "@mut", [["get", "keyboard", ["loc", [null, [8, 15], [8, 23]]], 0, 0, 0, 0]], [], [], 0, 0], "size", ["subexpr", "@mut", [["get", "size", ["loc", [null, [9, 11], [9, 15]]], 0, 0, 0, 0]], [], [], 0, 0], "backdropClose", ["subexpr", "@mut", [["get", "backdropClose", ["loc", [null, [10, 20], [10, 33]]], 0, 0, 0, 0]], [], [], 0, 0], "class", ["subexpr", "@mut", [["get", "class", ["loc", [null, [11, 12], [11, 17]]], 0, 0, 0, 0]], [], [], 0, 0], "inDom", ["subexpr", "@mut", [["get", "inDom", ["loc", [null, [12, 12], [12, 17]]], 0, 0, 0, 0]], [], [], 0, 0], "paddingLeft", ["subexpr", "@mut", [["get", "paddingLeft", ["loc", [null, [13, 18], [13, 29]]], 0, 0, 0, 0]], [], [], 0, 0], "paddingRight", ["subexpr", "@mut", [["get", "paddingRight", ["loc", [null, [14, 19], [14, 31]]], 0, 0, 0, 0]], [], [], 0, 0], "centered", ["subexpr", "bs-eq", [["get", "position", ["loc", [null, [15, 22], [15, 30]]], 0, 0, 0, 0], "center"], [], ["loc", [null, [15, 15], [15, 40]]], 0, 0]], 0, null, ["loc", [null, [3, 4], [33, 24]]]], ["block", "if", [["get", "showBackdrop", ["loc", [null, [36, 12], [36, 24]]], 0, 0, 0, 0]], [], 1, null, ["loc", [null, [36, 6], [38, 13]]]]],
+            locals: [],
+            templates: [child0, child1]
+          };
+        })();
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": null,
+            "moduleName": "modules/ember-bootstrap/templates/components/bs-modal-simple.hbs"
+          },
+          isEmpty: false,
+          arity: 0,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createComment("");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+            var morphs = new Array(1);
+            morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+            dom.insertBoundary(fragment, 0);
+            dom.insertBoundary(fragment, null);
+            return morphs;
+          },
+          statements: [["block", "ember-wormhole", [], ["destinationElement", ["subexpr", "@mut", [["get", "destinationElement", ["loc", [null, [2, 22], [2, 40]]], 0, 0, 0, 0]], [], [], 0, 0]], 0, null, []]],
+          locals: [],
+          templates: [child0]
+        };
+      })();
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 1,
+              "column": 0
+            },
+            "end": {
+              "line": 41,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-modal-simple.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(1);
+          morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+          dom.insertBoundary(fragment, 0);
+          dom.insertBoundary(fragment, null);
+          return morphs;
+        },
+        statements: [["block", "if", [["get", "_renderInPlace", ["loc", [null, [2, 41], [2, 55]]], 0, 0, 0, 0]], [], 0, 1, ["loc", [null, [2, 2], [40, 23]]]]],
+        locals: [],
+        templates: [child0, child1]
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 41,
+            "column": 7
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-modal-simple.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["block", "if", [["get", "inDom", ["loc", [null, [1, 6], [1, 11]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [1, 0], [41, 7]]]]],
+      locals: [],
+      templates: [child0]
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-modal", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      var child0 = (function () {
+        var child0 = (function () {
+          return {
+            meta: {
+              "revision": "Ember@2.8.3",
+              "loc": {
+                "source": null,
+                "start": {
+                  "line": 3,
+                  "column": 4
+                },
+                "end": {
+                  "line": 26,
+                  "column": 4
+                }
+              },
+              "moduleName": "modules/ember-bootstrap/templates/components/bs-modal.hbs"
+            },
+            isEmpty: false,
+            arity: 0,
+            cachedFragment: null,
+            hasRendered: false,
+            buildFragment: function buildFragment(dom) {
+              var el0 = dom.createDocumentFragment();
+              var el1 = dom.createTextNode("      ");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createComment("");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createTextNode("\n");
+              dom.appendChild(el0, el1);
+              return el0;
+            },
+            buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+              var morphs = new Array(1);
+              morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+              return morphs;
+            },
+            statements: [["inline", "yield", [["subexpr", "hash", [], ["header", ["subexpr", "component", ["bs-modal/header"], ["title", ["subexpr", "@mut", [["get", "title", ["loc", [null, [19, 52], [19, 57]]], 0, 0, 0, 0]], [], [], 0, 0], "onClose", ["subexpr", "action", ["close"], [], ["loc", [null, [19, 66], [19, 82]]], 0, 0]], ["loc", [null, [19, 17], [19, 83]]], 0, 0], "body", ["subexpr", "component", ["bs-modal/body"], [], ["loc", [null, [20, 15], [20, 42]]], 0, 0], "footer", ["subexpr", "component", ["bs-modal/footer"], ["onClose", ["subexpr", "action", ["close"], [], ["loc", [null, [21, 54], [21, 70]]], 0, 0], "onSubmit", ["subexpr", "action", ["submit"], [], ["loc", [null, [21, 80], [21, 97]]], 0, 0]], ["loc", [null, [21, 17], [21, 98]]], 0, 0], "close", ["subexpr", "action", ["close"], [], ["loc", [null, [22, 16], [22, 32]]], 0, 0], "submit", ["subexpr", "action", ["submit"], [], ["loc", [null, [23, 17], [23, 34]]], 0, 0]], ["loc", [null, [18, 8], [24, 9]]], 0, 0]], [], ["loc", [null, [17, 6], [25, 8]]], 0, 0]],
+            locals: [],
+            templates: []
+          };
+        })();
+        var child1 = (function () {
+          return {
+            meta: {
+              "revision": "Ember@2.8.3",
+              "loc": {
+                "source": null,
+                "start": {
+                  "line": 29,
+                  "column": 6
+                },
+                "end": {
+                  "line": 31,
+                  "column": 6
+                }
+              },
+              "moduleName": "modules/ember-bootstrap/templates/components/bs-modal.hbs"
+            },
+            isEmpty: false,
+            arity: 0,
+            cachedFragment: null,
+            hasRendered: false,
+            buildFragment: function buildFragment(dom) {
+              var el0 = dom.createDocumentFragment();
+              var el1 = dom.createTextNode("        ");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createElement("div");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createTextNode("\n");
+              dom.appendChild(el0, el1);
+              return el0;
+            },
+            buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+              var element1 = dom.childAt(fragment, [1]);
+              var morphs = new Array(2);
+              morphs[0] = dom.createAttrMorph(element1, 'class');
+              morphs[1] = dom.createAttrMorph(element1, 'id');
+              return morphs;
+            },
+            statements: [["attribute", "class", ["concat", ["modal-backdrop ", ["subexpr", "if", [["get", "fade", ["loc", [null, [30, 40], [30, 44]]], 0, 0, 0, 0], "fade"], [], ["loc", [null, [30, 35], [30, 53]]], 0, 0], " ", ["subexpr", "if", [["get", "showModal", ["loc", [null, [30, 59], [30, 68]]], 0, 0, 0, 0], ["get", "showClass", ["loc", [null, [30, 69], [30, 78]]], 0, 0, 0, 0]], [], ["loc", [null, [30, 54], [30, 80]]], 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0], ["attribute", "id", ["concat", [["get", "backdropId", ["loc", [null, [30, 88], [30, 98]]], 0, 0, 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0]],
+            locals: [],
+            templates: []
+          };
+        })();
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": {
+              "source": null,
+              "start": {
+                "line": 2,
+                "column": 2
+              },
+              "end": {
+                "line": 33,
+                "column": 2
+              }
+            },
+            "moduleName": "modules/ember-bootstrap/templates/components/bs-modal.hbs"
+          },
+          isEmpty: false,
+          arity: 0,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createComment("");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createTextNode("\n    ");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createElement("div");
+            var el2 = dom.createTextNode("\n");
+            dom.appendChild(el1, el2);
+            var el2 = dom.createComment("");
+            dom.appendChild(el1, el2);
+            var el2 = dom.createTextNode("    ");
+            dom.appendChild(el1, el2);
+            dom.appendChild(el0, el1);
+            var el1 = dom.createTextNode("\n");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+            var morphs = new Array(2);
+            morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+            morphs[1] = dom.createMorphAt(dom.childAt(fragment, [2]), 1, 1);
+            dom.insertBoundary(fragment, 0);
+            return morphs;
+          },
+          statements: [["block", "bs-modal/dialog", [], ["onClose", ["subexpr", "action", ["close"], [], ["loc", [null, [4, 14], [4, 30]]], 0, 0], "fade", ["subexpr", "@mut", [["get", "fade", ["loc", [null, [5, 11], [5, 15]]], 0, 0, 0, 0]], [], [], 0, 0], "showModal", ["subexpr", "@mut", [["get", "showModal", ["loc", [null, [6, 16], [6, 25]]], 0, 0, 0, 0]], [], [], 0, 0], "id", ["subexpr", "@mut", [["get", "modalId", ["loc", [null, [7, 9], [7, 16]]], 0, 0, 0, 0]], [], [], 0, 0], "keyboard", ["subexpr", "@mut", [["get", "keyboard", ["loc", [null, [8, 15], [8, 23]]], 0, 0, 0, 0]], [], [], 0, 0], "size", ["subexpr", "@mut", [["get", "size", ["loc", [null, [9, 11], [9, 15]]], 0, 0, 0, 0]], [], [], 0, 0], "backdropClose", ["subexpr", "@mut", [["get", "backdropClose", ["loc", [null, [10, 20], [10, 33]]], 0, 0, 0, 0]], [], [], 0, 0], "class", ["subexpr", "@mut", [["get", "class", ["loc", [null, [11, 12], [11, 17]]], 0, 0, 0, 0]], [], [], 0, 0], "inDom", ["subexpr", "@mut", [["get", "inDom", ["loc", [null, [12, 12], [12, 17]]], 0, 0, 0, 0]], [], [], 0, 0], "paddingLeft", ["subexpr", "@mut", [["get", "paddingLeft", ["loc", [null, [13, 18], [13, 29]]], 0, 0, 0, 0]], [], [], 0, 0], "paddingRight", ["subexpr", "@mut", [["get", "paddingRight", ["loc", [null, [14, 19], [14, 31]]], 0, 0, 0, 0]], [], [], 0, 0], "centered", ["subexpr", "bs-eq", [["get", "position", ["loc", [null, [15, 22], [15, 30]]], 0, 0, 0, 0], "center"], [], ["loc", [null, [15, 15], [15, 40]]], 0, 0]], 0, null, ["loc", [null, [3, 4], [26, 24]]]], ["block", "if", [["get", "showBackdrop", ["loc", [null, [29, 12], [29, 24]]], 0, 0, 0, 0]], [], 1, null, ["loc", [null, [29, 6], [31, 13]]]]],
+          locals: [],
+          templates: [child0, child1]
+        };
+      })();
+      var child1 = (function () {
+        var child0 = (function () {
+          var child0 = (function () {
+            return {
+              meta: {
+                "revision": "Ember@2.8.3",
+                "loc": {
+                  "source": null,
+                  "start": {
+                    "line": 3,
+                    "column": 4
+                  },
+                  "end": {
+                    "line": 26,
+                    "column": 4
+                  }
+                },
+                "moduleName": "modules/ember-bootstrap/templates/components/bs-modal.hbs"
+              },
+              isEmpty: false,
+              arity: 0,
+              cachedFragment: null,
+              hasRendered: false,
+              buildFragment: function buildFragment(dom) {
+                var el0 = dom.createDocumentFragment();
+                var el1 = dom.createTextNode("      ");
+                dom.appendChild(el0, el1);
+                var el1 = dom.createComment("");
+                dom.appendChild(el0, el1);
+                var el1 = dom.createTextNode("\n");
+                dom.appendChild(el0, el1);
+                return el0;
+              },
+              buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+                var morphs = new Array(1);
+                morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+                return morphs;
+              },
+              statements: [["inline", "yield", [["subexpr", "hash", [], ["header", ["subexpr", "component", ["bs-modal/header"], ["title", ["subexpr", "@mut", [["get", "title", ["loc", [null, [19, 52], [19, 57]]], 0, 0, 0, 0]], [], [], 0, 0], "onClose", ["subexpr", "action", ["close"], [], ["loc", [null, [19, 66], [19, 82]]], 0, 0]], ["loc", [null, [19, 17], [19, 83]]], 0, 0], "body", ["subexpr", "component", ["bs-modal/body"], [], ["loc", [null, [20, 15], [20, 42]]], 0, 0], "footer", ["subexpr", "component", ["bs-modal/footer"], ["onClose", ["subexpr", "action", ["close"], [], ["loc", [null, [21, 54], [21, 70]]], 0, 0], "onSubmit", ["subexpr", "action", ["submit"], [], ["loc", [null, [21, 80], [21, 97]]], 0, 0]], ["loc", [null, [21, 17], [21, 98]]], 0, 0], "close", ["subexpr", "action", ["close"], [], ["loc", [null, [22, 16], [22, 32]]], 0, 0], "submit", ["subexpr", "action", ["submit"], [], ["loc", [null, [23, 17], [23, 34]]], 0, 0]], ["loc", [null, [18, 8], [24, 9]]], 0, 0]], [], ["loc", [null, [17, 6], [25, 8]]], 0, 0]],
+              locals: [],
+              templates: []
+            };
+          })();
+          var child1 = (function () {
+            return {
+              meta: {
+                "revision": "Ember@2.8.3",
+                "loc": {
+                  "source": null,
+                  "start": {
+                    "line": 29,
+                    "column": 6
+                  },
+                  "end": {
+                    "line": 31,
+                    "column": 6
+                  }
+                },
+                "moduleName": "modules/ember-bootstrap/templates/components/bs-modal.hbs"
+              },
+              isEmpty: false,
+              arity: 0,
+              cachedFragment: null,
+              hasRendered: false,
+              buildFragment: function buildFragment(dom) {
+                var el0 = dom.createDocumentFragment();
+                var el1 = dom.createTextNode("        ");
+                dom.appendChild(el0, el1);
+                var el1 = dom.createElement("div");
+                dom.appendChild(el0, el1);
+                var el1 = dom.createTextNode("\n");
+                dom.appendChild(el0, el1);
+                return el0;
+              },
+              buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+                var element0 = dom.childAt(fragment, [1]);
+                var morphs = new Array(2);
+                morphs[0] = dom.createAttrMorph(element0, 'class');
+                morphs[1] = dom.createAttrMorph(element0, 'id');
+                return morphs;
+              },
+              statements: [["attribute", "class", ["concat", ["modal-backdrop ", ["subexpr", "if", [["get", "fade", ["loc", [null, [30, 40], [30, 44]]], 0, 0, 0, 0], "fade"], [], ["loc", [null, [30, 35], [30, 53]]], 0, 0], " ", ["subexpr", "if", [["get", "showModal", ["loc", [null, [30, 59], [30, 68]]], 0, 0, 0, 0], ["get", "showClass", ["loc", [null, [30, 69], [30, 78]]], 0, 0, 0, 0]], [], ["loc", [null, [30, 54], [30, 80]]], 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0], ["attribute", "id", ["concat", [["get", "backdropId", ["loc", [null, [30, 88], [30, 98]]], 0, 0, 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0]],
+              locals: [],
+              templates: []
+            };
+          })();
+          return {
+            meta: {
+              "revision": "Ember@2.8.3",
+              "loc": {
+                "source": null,
+                "start": {
+                  "line": 2,
+                  "column": 2
+                },
+                "end": {
+                  "line": 33,
+                  "column": 2
+                }
+              },
+              "moduleName": "modules/ember-bootstrap/templates/components/bs-modal.hbs"
+            },
+            isEmpty: false,
+            arity: 0,
+            cachedFragment: null,
+            hasRendered: false,
+            buildFragment: function buildFragment(dom) {
+              var el0 = dom.createDocumentFragment();
+              var el1 = dom.createComment("");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createTextNode("\n    ");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createElement("div");
+              var el2 = dom.createTextNode("\n");
+              dom.appendChild(el1, el2);
+              var el2 = dom.createComment("");
+              dom.appendChild(el1, el2);
+              var el2 = dom.createTextNode("    ");
+              dom.appendChild(el1, el2);
+              dom.appendChild(el0, el1);
+              var el1 = dom.createTextNode("\n");
+              dom.appendChild(el0, el1);
+              return el0;
+            },
+            buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+              var morphs = new Array(2);
+              morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+              morphs[1] = dom.createMorphAt(dom.childAt(fragment, [2]), 1, 1);
+              dom.insertBoundary(fragment, 0);
+              return morphs;
+            },
+            statements: [["block", "bs-modal/dialog", [], ["onClose", ["subexpr", "action", ["close"], [], ["loc", [null, [4, 14], [4, 30]]], 0, 0], "fade", ["subexpr", "@mut", [["get", "fade", ["loc", [null, [5, 11], [5, 15]]], 0, 0, 0, 0]], [], [], 0, 0], "showModal", ["subexpr", "@mut", [["get", "showModal", ["loc", [null, [6, 16], [6, 25]]], 0, 0, 0, 0]], [], [], 0, 0], "id", ["subexpr", "@mut", [["get", "modalId", ["loc", [null, [7, 9], [7, 16]]], 0, 0, 0, 0]], [], [], 0, 0], "keyboard", ["subexpr", "@mut", [["get", "keyboard", ["loc", [null, [8, 15], [8, 23]]], 0, 0, 0, 0]], [], [], 0, 0], "size", ["subexpr", "@mut", [["get", "size", ["loc", [null, [9, 11], [9, 15]]], 0, 0, 0, 0]], [], [], 0, 0], "backdropClose", ["subexpr", "@mut", [["get", "backdropClose", ["loc", [null, [10, 20], [10, 33]]], 0, 0, 0, 0]], [], [], 0, 0], "class", ["subexpr", "@mut", [["get", "class", ["loc", [null, [11, 12], [11, 17]]], 0, 0, 0, 0]], [], [], 0, 0], "inDom", ["subexpr", "@mut", [["get", "inDom", ["loc", [null, [12, 12], [12, 17]]], 0, 0, 0, 0]], [], [], 0, 0], "paddingLeft", ["subexpr", "@mut", [["get", "paddingLeft", ["loc", [null, [13, 18], [13, 29]]], 0, 0, 0, 0]], [], [], 0, 0], "paddingRight", ["subexpr", "@mut", [["get", "paddingRight", ["loc", [null, [14, 19], [14, 31]]], 0, 0, 0, 0]], [], [], 0, 0], "centered", ["subexpr", "bs-eq", [["get", "position", ["loc", [null, [15, 22], [15, 30]]], 0, 0, 0, 0], "center"], [], ["loc", [null, [15, 15], [15, 40]]], 0, 0]], 0, null, ["loc", [null, [3, 4], [26, 24]]]], ["block", "if", [["get", "showBackdrop", ["loc", [null, [29, 12], [29, 24]]], 0, 0, 0, 0]], [], 1, null, ["loc", [null, [29, 6], [31, 13]]]]],
+            locals: [],
+            templates: [child0, child1]
+          };
+        })();
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": null,
+            "moduleName": "modules/ember-bootstrap/templates/components/bs-modal.hbs"
+          },
+          isEmpty: false,
+          arity: 0,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createComment("");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+            var morphs = new Array(1);
+            morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+            dom.insertBoundary(fragment, 0);
+            dom.insertBoundary(fragment, null);
+            return morphs;
+          },
+          statements: [["block", "ember-wormhole", [], ["destinationElement", ["subexpr", "@mut", [["get", "destinationElement", ["loc", [null, [2, 22], [2, 40]]], 0, 0, 0, 0]], [], [], 0, 0]], 0, null, []]],
+          locals: [],
+          templates: [child0]
+        };
+      })();
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 1,
+              "column": 0
+            },
+            "end": {
+              "line": 34,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-modal.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(1);
+          morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+          dom.insertBoundary(fragment, 0);
+          dom.insertBoundary(fragment, null);
+          return morphs;
+        },
+        statements: [["block", "if", [["get", "_renderInPlace", ["loc", [null, [2, 41], [2, 55]]], 0, 0, 0, 0]], [], 0, 1, ["loc", [null, [2, 2], [33, 23]]]]],
+        locals: [],
+        templates: [child0, child1]
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 35,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-modal.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["block", "if", [["get", "inDom", ["loc", [null, [1, 6], [1, 11]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [1, 0], [34, 7]]]]],
+      locals: [],
+      templates: [child0]
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-modal/body", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 1,
+            "column": 9
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-modal/body.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["content", "yield", ["loc", [null, [1, 0], [1, 9]]], 0, 0, 0, 0]],
+      locals: [],
+      templates: []
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-modal/dialog", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 5,
+            "column": 6
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-modal/dialog.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createElement("div");
+        var el2 = dom.createTextNode("\n  ");
+        dom.appendChild(el1, el2);
+        var el2 = dom.createElement("div");
+        dom.setAttribute(el2, "class", "modal-content");
+        var el3 = dom.createTextNode("\n    ");
+        dom.appendChild(el2, el3);
+        var el3 = dom.createComment("");
+        dom.appendChild(el2, el3);
+        var el3 = dom.createTextNode("\n  ");
+        dom.appendChild(el2, el3);
+        dom.appendChild(el1, el2);
+        var el2 = dom.createTextNode("\n");
+        dom.appendChild(el1, el2);
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var element0 = dom.childAt(fragment, [0]);
+        var morphs = new Array(2);
+        morphs[0] = dom.createAttrMorph(element0, 'class');
+        morphs[1] = dom.createMorphAt(dom.childAt(element0, [1]), 1, 1);
+        return morphs;
+      },
+      statements: [["attribute", "class", ["concat", ["modal-dialog ", ["get", "sizeClass", ["loc", [null, [1, 27], [1, 36]]], 0, 0, 0, 0], " ", ["subexpr", "if", [["get", "centered", ["loc", [null, [1, 44], [1, 52]]], 0, 0, 0, 0], "modal-dialog-centered"], [], ["loc", [null, [1, 39], [1, 78]]], 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0], ["content", "yield", ["loc", [null, [3, 4], [3, 13]]], 0, 0, 0, 0]],
+      locals: [],
+      templates: []
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-modal/footer", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 1,
+              "column": 0
+            },
+            "end": {
+              "line": 3,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-modal/footer.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(1);
+          morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+          return morphs;
+        },
+        statements: [["content", "yield", ["loc", [null, [2, 2], [2, 11]]], 0, 0, 0, 0]],
+        locals: [],
+        templates: []
+      };
+    })();
+    var child1 = (function () {
+      var child0 = (function () {
+        var child0 = (function () {
+          return {
+            meta: {
+              "revision": "Ember@2.8.3",
+              "loc": {
+                "source": null,
+                "start": {
+                  "line": 5,
+                  "column": 4
+                },
+                "end": {
+                  "line": 5,
+                  "column": 57
+                }
+              },
+              "moduleName": "modules/ember-bootstrap/templates/components/bs-modal/footer.hbs"
+            },
+            isEmpty: false,
+            arity: 0,
+            cachedFragment: null,
+            hasRendered: false,
+            buildFragment: function buildFragment(dom) {
+              var el0 = dom.createDocumentFragment();
+              var el1 = dom.createComment("");
+              dom.appendChild(el0, el1);
+              return el0;
+            },
+            buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+              var morphs = new Array(1);
+              morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+              dom.insertBoundary(fragment, 0);
+              dom.insertBoundary(fragment, null);
+              return morphs;
+            },
+            statements: [["content", "closeTitle", ["loc", [null, [5, 43], [5, 57]]], 0, 0, 0, 0]],
+            locals: [],
+            templates: []
+          };
+        })();
+        var child1 = (function () {
+          return {
+            meta: {
+              "revision": "Ember@2.8.3",
+              "loc": {
+                "source": null,
+                "start": {
+                  "line": 6,
+                  "column": 4
+                },
+                "end": {
+                  "line": 6,
+                  "column": 105
+                }
+              },
+              "moduleName": "modules/ember-bootstrap/templates/components/bs-modal/footer.hbs"
+            },
+            isEmpty: false,
+            arity: 0,
+            cachedFragment: null,
+            hasRendered: false,
+            buildFragment: function buildFragment(dom) {
+              var el0 = dom.createDocumentFragment();
+              var el1 = dom.createComment("");
+              dom.appendChild(el0, el1);
+              return el0;
+            },
+            buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+              var morphs = new Array(1);
+              morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+              dom.insertBoundary(fragment, 0);
+              dom.insertBoundary(fragment, null);
+              return morphs;
+            },
+            statements: [["content", "submitTitle", ["loc", [null, [6, 90], [6, 105]]], 0, 0, 0, 0]],
+            locals: [],
+            templates: []
+          };
+        })();
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": {
+              "source": null,
+              "start": {
+                "line": 4,
+                "column": 2
+              },
+              "end": {
+                "line": 7,
+                "column": 2
+              }
+            },
+            "moduleName": "modules/ember-bootstrap/templates/components/bs-modal/footer.hbs"
+          },
+          isEmpty: false,
+          arity: 0,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createTextNode("    ");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createComment("");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createTextNode("\n    ");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createComment("");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createTextNode("\n");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+            var morphs = new Array(2);
+            morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+            morphs[1] = dom.createMorphAt(fragment, 3, 3, contextualElement);
+            return morphs;
+          },
+          statements: [["block", "bs-button", [], ["onClick", ["subexpr", "action", [["get", "onClose", ["loc", [null, [5, 33], [5, 40]]], 0, 0, 0, 0]], [], ["loc", [null, [5, 25], [5, 41]]], 0, 0]], 0, null, ["loc", [null, [5, 4], [5, 71]]]], ["block", "bs-button", [], ["type", ["subexpr", "@mut", [["get", "submitButtonType", ["loc", [null, [6, 22], [6, 38]]], 0, 0, 0, 0]], [], [], 0, 0], "onClick", ["subexpr", "action", [["get", "onSubmit", ["loc", [null, [6, 55], [6, 63]]], 0, 0, 0, 0]], [], ["loc", [null, [6, 47], [6, 64]]], 0, 0], "disabled", ["subexpr", "@mut", [["get", "submitDisabled", ["loc", [null, [6, 74], [6, 88]]], 0, 0, 0, 0]], [], [], 0, 0]], 1, null, ["loc", [null, [6, 4], [6, 119]]]]],
+          locals: [],
+          templates: [child0, child1]
+        };
+      })();
+      var child1 = (function () {
+        var child0 = (function () {
+          return {
+            meta: {
+              "revision": "Ember@2.8.3",
+              "loc": {
+                "source": null,
+                "start": {
+                  "line": 8,
+                  "column": 4
+                },
+                "end": {
+                  "line": 8,
+                  "column": 72
+                }
+              },
+              "moduleName": "modules/ember-bootstrap/templates/components/bs-modal/footer.hbs"
+            },
+            isEmpty: false,
+            arity: 0,
+            cachedFragment: null,
+            hasRendered: false,
+            buildFragment: function buildFragment(dom) {
+              var el0 = dom.createDocumentFragment();
+              var el1 = dom.createComment("");
+              dom.appendChild(el0, el1);
+              return el0;
+            },
+            buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+              var morphs = new Array(1);
+              morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+              dom.insertBoundary(fragment, 0);
+              dom.insertBoundary(fragment, null);
+              return morphs;
+            },
+            statements: [["content", "closeTitle", ["loc", [null, [8, 58], [8, 72]]], 0, 0, 0, 0]],
+            locals: [],
+            templates: []
+          };
+        })();
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": {
+              "source": null,
+              "start": {
+                "line": 7,
+                "column": 2
+              },
+              "end": {
+                "line": 9,
+                "column": 2
+              }
+            },
+            "moduleName": "modules/ember-bootstrap/templates/components/bs-modal/footer.hbs"
+          },
+          isEmpty: false,
+          arity: 0,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createTextNode("    ");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createComment("");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createTextNode("\n");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+            var morphs = new Array(1);
+            morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+            return morphs;
+          },
+          statements: [["block", "bs-button", [], ["type", "primary", "onClick", ["subexpr", "action", [["get", "onClose", ["loc", [null, [8, 48], [8, 55]]], 0, 0, 0, 0]], [], ["loc", [null, [8, 40], [8, 56]]], 0, 0]], 0, null, ["loc", [null, [8, 4], [8, 86]]]]],
+          locals: [],
+          templates: [child0]
+        };
+      })();
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 3,
+              "column": 0
+            },
+            "end": {
+              "line": 10,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-modal/footer.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(1);
+          morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+          dom.insertBoundary(fragment, 0);
+          dom.insertBoundary(fragment, null);
+          return morphs;
+        },
+        statements: [["block", "if", [["get", "hasSubmitButton", ["loc", [null, [4, 8], [4, 23]]], 0, 0, 0, 0]], [], 0, 1, ["loc", [null, [4, 2], [9, 9]]]]],
+        locals: [],
+        templates: [child0, child1]
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 11,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-modal/footer.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["block", "if", [["get", "hasBlock", ["loc", [null, [1, 6], [1, 14]]], 0, 0, 0, 0]], [], 0, 1, ["loc", [null, [1, 0], [10, 7]]]]],
+      locals: [],
+      templates: [child0, child1]
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-modal/header", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 1,
+              "column": 0
+            },
+            "end": {
+              "line": 3,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-modal/header.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(1);
+          morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+          return morphs;
+        },
+        statements: [["inline", "bs-modal/header/close", [], ["onClick", ["subexpr", "action", [["get", "onClose", ["loc", [null, [2, 42], [2, 49]]], 0, 0, 0, 0]], [], ["loc", [null, [2, 34], [2, 50]]], 0, 0]], ["loc", [null, [2, 2], [2, 52]]], 0, 0]],
+        locals: [],
+        templates: []
+      };
+    })();
+    var child1 = (function () {
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 4,
+              "column": 0
+            },
+            "end": {
+              "line": 6,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-modal/header.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(1);
+          morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+          return morphs;
+        },
+        statements: [["content", "yield", ["loc", [null, [5, 2], [5, 11]]], 0, 0, 0, 0]],
+        locals: [],
+        templates: []
+      };
+    })();
+    var child2 = (function () {
+      var child0 = (function () {
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": {
+              "source": null,
+              "start": {
+                "line": 7,
+                "column": 2
+              },
+              "end": {
+                "line": 7,
+                "column": 37
+              }
+            },
+            "moduleName": "modules/ember-bootstrap/templates/components/bs-modal/header.hbs"
+          },
+          isEmpty: false,
+          arity: 0,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createComment("");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+            var morphs = new Array(1);
+            morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+            dom.insertBoundary(fragment, 0);
+            dom.insertBoundary(fragment, null);
+            return morphs;
+          },
+          statements: [["content", "title", ["loc", [null, [7, 28], [7, 37]]], 0, 0, 0, 0]],
+          locals: [],
+          templates: []
+        };
+      })();
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 6,
+              "column": 0
+            },
+            "end": {
+              "line": 8,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-modal/header.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(1);
+          morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+          return morphs;
+        },
+        statements: [["block", "bs-modal/header/title", [], [], 0, null, ["loc", [null, [7, 2], [7, 63]]]]],
+        locals: [],
+        templates: [child0]
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 9,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-modal/header.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(2);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        morphs[1] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["block", "if", [["get", "closeButton", ["loc", [null, [1, 6], [1, 17]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [1, 0], [3, 7]]]], ["block", "if", [["get", "hasBlock", ["loc", [null, [4, 6], [4, 14]]], 0, 0, 0, 0]], [], 1, 2, ["loc", [null, [4, 0], [8, 7]]]]],
+      locals: [],
+      templates: [child0, child1, child2]
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-modal/header/close", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 1,
+            "column": 39
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-modal/header/close.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createElement("span");
+        dom.setAttribute(el1, "aria-hidden", "true");
+        var el2 = dom.createTextNode("×");
+        dom.appendChild(el1, el2);
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes() {
+        return [];
+      },
+      statements: [],
+      locals: [],
+      templates: []
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-modal/header/title", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 2,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-modal/header/title.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createTextNode("\n");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        return morphs;
+      },
+      statements: [["content", "yield", ["loc", [null, [1, 0], [1, 9]]], 0, 0, 0, 0]],
+      locals: [],
+      templates: []
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-nav", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 8,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-nav.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createTextNode("\n");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        return morphs;
+      },
+      statements: [["inline", "yield", [["subexpr", "hash", [], ["item", ["subexpr", "component", [["get", "itemComponent", ["loc", [null, [3, 20], [3, 33]]], 0, 0, 0, 0]], [], ["loc", [null, [3, 9], [3, 34]]], 0, 0], "link-to", ["subexpr", "component", [["get", "linkToComponent", ["loc", [null, [4, 23], [4, 38]]], 0, 0, 0, 0]], [], ["loc", [null, [4, 12], [4, 39]]], 0, 0], "dropdown", ["subexpr", "component", [["get", "dropdownComponent", ["loc", [null, [5, 24], [5, 41]]], 0, 0, 0, 0]], ["inNav", true, "tagName", "li"], ["loc", [null, [5, 13], [5, 66]]], 0, 0]], ["loc", [null, [2, 2], [6, 3]]], 0, 0]], [], ["loc", [null, [1, 0], [7, 2]]], 0, 0]],
+      locals: [],
+      templates: []
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-nav/item", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 2,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-nav/item.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createTextNode("\n");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        return morphs;
+      },
+      statements: [["content", "yield", ["loc", [null, [1, 0], [1, 9]]], 0, 0, 0, 0]],
+      locals: [],
+      templates: []
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-navbar", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 12,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-navbar.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createElement("div");
+        var el2 = dom.createTextNode("\n  ");
+        dom.appendChild(el1, el2);
+        var el2 = dom.createComment("");
+        dom.appendChild(el1, el2);
+        var el2 = dom.createTextNode("\n");
+        dom.appendChild(el1, el2);
+        dom.appendChild(el0, el1);
+        var el1 = dom.createTextNode("\n");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var element0 = dom.childAt(fragment, [0]);
+        var morphs = new Array(2);
+        morphs[0] = dom.createAttrMorph(element0, 'class');
+        morphs[1] = dom.createMorphAt(element0, 1, 1);
+        return morphs;
+      },
+      statements: [["attribute", "class", ["subexpr", "if", [["get", "fluid", ["loc", [null, [1, 16], [1, 21]]], 0, 0, 0, 0], "container-fluid", "container"], [], ["loc", [null, [null, null], [1, 53]]], 0, 0], 0, 0, 0, 0], ["inline", "yield", [["subexpr", "hash", [], ["toggle", ["subexpr", "component", ["bs-navbar/toggle"], ["onClick", ["subexpr", "action", ["toggleNavbar"], [], ["loc", [null, [4, 51], [4, 74]]], 0, 0], "collapsed", ["subexpr", "@mut", [["get", "_collapsed", ["loc", [null, [4, 85], [4, 95]]], 0, 0, 0, 0]], [], [], 0, 0]], ["loc", [null, [4, 13], [4, 96]]], 0, 0], "content", ["subexpr", "component", ["bs-navbar/content"], ["collapsed", ["subexpr", "@mut", [["get", "_collapsed", ["loc", [null, [5, 55], [5, 65]]], 0, 0, 0, 0]], [], [], 0, 0], "onHidden", ["subexpr", "@mut", [["get", "onCollapsed", ["loc", [null, [5, 75], [5, 86]]], 0, 0, 0, 0]], [], [], 0, 0], "onShown", ["subexpr", "@mut", [["get", "onExpanded", ["loc", [null, [5, 95], [5, 105]]], 0, 0, 0, 0]], [], [], 0, 0]], ["loc", [null, [5, 14], [5, 106]]], 0, 0], "nav", ["subexpr", "component", ["bs-navbar/nav"], ["linkToComponent", ["subexpr", "component", ["bs-navbar/link-to"], ["onCollapse", ["subexpr", "action", ["collapse"], [], ["loc", [null, [6, 95], [6, 114]]], 0, 0]], ["loc", [null, [6, 53], [6, 115]]], 0, 0]], ["loc", [null, [6, 10], [6, 116]]], 0, 0], "collapse", ["subexpr", "action", ["collapse"], [], ["loc", [null, [7, 15], [7, 34]]], 0, 0], "expand", ["subexpr", "action", ["expand"], [], ["loc", [null, [8, 13], [8, 30]]], 0, 0]], ["loc", [null, [3, 4], [9, 5]]], 0, 0]], [], ["loc", [null, [2, 2], [10, 4]]], 0, 0]],
+      locals: [],
+      templates: []
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-navbar/content", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 2,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-navbar/content.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createTextNode("\n");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        return morphs;
+      },
+      statements: [["content", "yield", ["loc", [null, [1, 0], [1, 9]]], 0, 0, 0, 0]],
+      locals: [],
+      templates: []
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-navbar/toggle", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 1,
+              "column": 0
+            },
+            "end": {
+              "line": 3,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-navbar/toggle.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(1);
+          morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+          return morphs;
+        },
+        statements: [["content", "yield", ["loc", [null, [2, 2], [2, 11]]], 0, 0, 0, 0]],
+        locals: [],
+        templates: []
+      };
+    })();
+    var child1 = (function () {
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 3,
+              "column": 0
+            },
+            "end": {
+              "line": 8,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-navbar/toggle.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("span");
+          dom.setAttribute(el1, "class", "sr-only");
+          var el2 = dom.createTextNode("Toggle navigation");
+          dom.appendChild(el1, el2);
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("span");
+          dom.setAttribute(el1, "class", "icon-bar");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("span");
+          dom.setAttribute(el1, "class", "icon-bar");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("span");
+          dom.setAttribute(el1, "class", "icon-bar");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes() {
+          return [];
+        },
+        statements: [],
+        locals: [],
+        templates: []
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 9,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-navbar/toggle.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["block", "if", [["get", "hasBlock", ["loc", [null, [1, 6], [1, 14]]], 0, 0, 0, 0]], [], 0, 1, ["loc", [null, [1, 0], [8, 7]]]]],
+      locals: [],
+      templates: [child0, child1]
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-popover", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      var child0 = (function () {
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": {
+              "source": null,
+              "start": {
+                "line": 2,
+                "column": 2
+              },
+              "end": {
+                "line": 17,
+                "column": 2
+              }
+            },
+            "moduleName": "modules/ember-bootstrap/templates/components/bs-popover.hbs"
+          },
+          isEmpty: false,
+          arity: 0,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createTextNode("    ");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createComment("");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createTextNode("\n");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+            var morphs = new Array(1);
+            morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+            return morphs;
+          },
+          statements: [["content", "yield", ["loc", [null, [16, 4], [16, 13]]], 0, 0, 0, 0]],
+          locals: [],
+          templates: []
+        };
+      })();
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 1,
+              "column": 0
+            },
+            "end": {
+              "line": 18,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-popover.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(1);
+          morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+          dom.insertBoundary(fragment, 0);
+          dom.insertBoundary(fragment, null);
+          return morphs;
+        },
+        statements: [["block", "bs-popover/element", [], ["id", ["subexpr", "@mut", [["get", "overlayId", ["loc", [null, [3, 7], [3, 16]]], 0, 0, 0, 0]], [], [], 0, 0], "parent", ["subexpr", "@mut", [["get", "this", ["loc", [null, [4, 11], [4, 15]]], 0, 0, 0, 0]], [], [], 0, 0], "placement", ["subexpr", "@mut", [["get", "placement", ["loc", [null, [5, 14], [5, 23]]], 0, 0, 0, 0]], [], [], 0, 0], "fade", ["subexpr", "@mut", [["get", "fade", ["loc", [null, [6, 9], [6, 13]]], 0, 0, 0, 0]], [], [], 0, 0], "showHelp", ["subexpr", "@mut", [["get", "showHelp", ["loc", [null, [7, 13], [7, 21]]], 0, 0, 0, 0]], [], [], 0, 0], "title", ["subexpr", "@mut", [["get", "title", ["loc", [null, [8, 10], [8, 15]]], 0, 0, 0, 0]], [], [], 0, 0], "class", ["subexpr", "@mut", [["get", "class", ["loc", [null, [9, 10], [9, 15]]], 0, 0, 0, 0]], [], [], 0, 0], "renderInPlace", ["subexpr", "@mut", [["get", "_renderInPlace", ["loc", [null, [10, 18], [10, 32]]], 0, 0, 0, 0]], [], [], 0, 0], "popperTarget", ["subexpr", "@mut", [["get", "triggerTargetElement", ["loc", [null, [11, 17], [11, 37]]], 0, 0, 0, 0]], [], [], 0, 0], "autoPlacement", ["subexpr", "@mut", [["get", "autoPlacement", ["loc", [null, [12, 18], [12, 31]]], 0, 0, 0, 0]], [], [], 0, 0], "viewportElement", ["subexpr", "@mut", [["get", "viewportElement", ["loc", [null, [13, 20], [13, 35]]], 0, 0, 0, 0]], [], [], 0, 0], "viewportPadding", ["subexpr", "@mut", [["get", "viewportPadding", ["loc", [null, [14, 20], [14, 35]]], 0, 0, 0, 0]], [], [], 0, 0]], 0, null, ["loc", [null, [2, 2], [17, 25]]]]],
+        locals: [],
+        templates: [child0]
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 19,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-popover.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["block", "if", [["get", "inDom", ["loc", [null, [1, 6], [1, 11]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [1, 0], [18, 7]]]]],
+      locals: [],
+      templates: [child0]
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-popover/element", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      var child0 = (function () {
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": {
+              "source": null,
+              "start": {
+                "line": 14,
+                "column": 2
+              },
+              "end": {
+                "line": 16,
+                "column": 2
+              }
+            },
+            "moduleName": "modules/ember-bootstrap/templates/components/bs-popover/element.hbs"
+          },
+          isEmpty: false,
+          arity: 0,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createTextNode("    ");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createElement("h3");
+            var el2 = dom.createComment("");
+            dom.appendChild(el1, el2);
+            dom.appendChild(el0, el1);
+            var el1 = dom.createTextNode("\n");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+            var element0 = dom.childAt(fragment, [1]);
+            var morphs = new Array(2);
+            morphs[0] = dom.createAttrMorph(element0, 'class');
+            morphs[1] = dom.createMorphAt(element0, 0, 0);
+            return morphs;
+          },
+          statements: [["attribute", "class", ["get", "titleClass", ["loc", [null, [15, 16], [15, 26]]], 0, 0, 0, 0], 0, 0, 0, 0], ["content", "title", ["loc", [null, [15, 29], [15, 38]]], 0, 0, 0, 0]],
+          locals: [],
+          templates: []
+        };
+      })();
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 1,
+              "column": 0
+            },
+            "end": {
+              "line": 18,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-popover/element.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("div");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("div");
+          var el2 = dom.createComment("");
+          dom.appendChild(el1, el2);
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var element1 = dom.childAt(fragment, [1]);
+          var element2 = dom.childAt(fragment, [5]);
+          var morphs = new Array(4);
+          morphs[0] = dom.createAttrMorph(element1, 'class');
+          morphs[1] = dom.createMorphAt(fragment, 3, 3, contextualElement);
+          morphs[2] = dom.createAttrMorph(element2, 'class');
+          morphs[3] = dom.createMorphAt(element2, 0, 0);
+          return morphs;
+        },
+        statements: [["attribute", "class", ["get", "arrowClass", ["loc", [null, [13, 15], [13, 25]]], 0, 0, 0, 0], 0, 0, 0, 0], ["block", "if", [["get", "hasTitle", ["loc", [null, [14, 8], [14, 16]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [14, 2], [16, 9]]]], ["attribute", "class", ["get", "contentClass", ["loc", [null, [17, 15], [17, 27]]], 0, 0, 0, 0], 0, 0, 0, 0], ["content", "yield", ["loc", [null, [17, 30], [17, 39]]], 0, 0, 0, 0]],
+        locals: [],
+        templates: [child0]
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 18,
+            "column": 17
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-popover/element.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["block", "ember-popper", [], ["id", ["subexpr", "@mut", [["get", "id", ["loc", [null, [2, 5], [2, 7]]], 0, 0, 0, 0]], [], [], 0, 0], "class", ["subexpr", "@mut", [["get", "popperClass", ["loc", [null, [3, 8], [3, 19]]], 0, 0, 0, 0]], [], [], 0, 0], "ariaRole", ["subexpr", "@mut", [["get", "ariaRole", ["loc", [null, [4, 11], [4, 19]]], 0, 0, 0, 0]], [], [], 0, 0], "placement", ["subexpr", "@mut", [["get", "placement", ["loc", [null, [5, 12], [5, 21]]], 0, 0, 0, 0]], [], [], 0, 0], "renderInPlace", ["subexpr", "@mut", [["get", "renderInPlace", ["loc", [null, [6, 16], [6, 29]]], 0, 0, 0, 0]], [], [], 0, 0], "popperTarget", ["subexpr", "@mut", [["get", "popperTarget", ["loc", [null, [7, 15], [7, 27]]], 0, 0, 0, 0]], [], [], 0, 0], "modifiers", ["subexpr", "@mut", [["get", "popperModifiers", ["loc", [null, [8, 12], [8, 27]]], 0, 0, 0, 0]], [], [], 0, 0], "popperContainer", "#ember-bootstrap-wormhole", "onCreate", ["subexpr", "action", ["updatePlacement"], [], ["loc", [null, [10, 11], [10, 37]]], 0, 0], "onUpdate", ["subexpr", "action", ["updatePlacement"], [], ["loc", [null, [11, 11], [11, 37]]], 0, 0]], 0, null, ["loc", [null, [1, 0], [18, 17]]]]],
+      locals: [],
+      templates: [child0]
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-progress", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 6,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-progress.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createTextNode("\n");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        return morphs;
+      },
+      statements: [["inline", "yield", [["subexpr", "hash", [], ["bar", ["subexpr", "component", ["bs-progress/bar"], [], ["loc", [null, [3, 8], [3, 37]]], 0, 0]], ["loc", [null, [2, 2], [4, 3]]], 0, 0]], [], ["loc", [null, [1, 0], [5, 2]]], 0, 0]],
+      locals: [],
+      templates: []
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-progress/bar", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      var child0 = (function () {
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": {
+              "source": null,
+              "start": {
+                "line": 2,
+                "column": 2
+              },
+              "end": {
+                "line": 4,
+                "column": 2
+              }
+            },
+            "moduleName": "modules/ember-bootstrap/templates/components/bs-progress/bar.hbs"
+          },
+          isEmpty: false,
+          arity: 0,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createTextNode("    ");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createComment("");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createTextNode("\n");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+            var morphs = new Array(1);
+            morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+            return morphs;
+          },
+          statements: [["inline", "yield", [["get", "percentRounded", ["loc", [null, [3, 12], [3, 26]]], 0, 0, 0, 0]], [], ["loc", [null, [3, 4], [3, 28]]], 0, 0]],
+          locals: [],
+          templates: []
+        };
+      })();
+      var child1 = (function () {
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": {
+              "source": null,
+              "start": {
+                "line": 4,
+                "column": 2
+              },
+              "end": {
+                "line": 6,
+                "column": 2
+              }
+            },
+            "moduleName": "modules/ember-bootstrap/templates/components/bs-progress/bar.hbs"
+          },
+          isEmpty: false,
+          arity: 0,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createTextNode("    ");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createComment("");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createTextNode("%\n");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+            var morphs = new Array(1);
+            morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+            return morphs;
+          },
+          statements: [["content", "percentRounded", ["loc", [null, [5, 4], [5, 22]]], 0, 0, 0, 0]],
+          locals: [],
+          templates: []
+        };
+      })();
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 1,
+              "column": 0
+            },
+            "end": {
+              "line": 7,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-progress/bar.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(1);
+          morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+          dom.insertBoundary(fragment, 0);
+          dom.insertBoundary(fragment, null);
+          return morphs;
+        },
+        statements: [["block", "if", [["get", "hasBlock", ["loc", [null, [2, 8], [2, 16]]], 0, 0, 0, 0]], [], 0, 1, ["loc", [null, [2, 2], [6, 9]]]]],
+        locals: [],
+        templates: [child0, child1]
+      };
+    })();
+    var child1 = (function () {
+      var child0 = (function () {
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": {
+              "source": null,
+              "start": {
+                "line": 8,
+                "column": 2
+              },
+              "end": {
+                "line": 10,
+                "column": 2
+              }
+            },
+            "moduleName": "modules/ember-bootstrap/templates/components/bs-progress/bar.hbs"
+          },
+          isEmpty: false,
+          arity: 0,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createTextNode("    ");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createElement("span");
+            dom.setAttribute(el1, "class", "sr-only");
+            var el2 = dom.createComment("");
+            dom.appendChild(el1, el2);
+            dom.appendChild(el0, el1);
+            var el1 = dom.createTextNode("\n");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+            var morphs = new Array(1);
+            morphs[0] = dom.createMorphAt(dom.childAt(fragment, [1]), 0, 0);
+            return morphs;
+          },
+          statements: [["inline", "yield", [["get", "percentRounded", ["loc", [null, [9, 34], [9, 48]]], 0, 0, 0, 0]], [], ["loc", [null, [9, 26], [9, 50]]], 0, 0]],
+          locals: [],
+          templates: []
+        };
+      })();
+      var child1 = (function () {
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": {
+              "source": null,
+              "start": {
+                "line": 10,
+                "column": 2
+              },
+              "end": {
+                "line": 12,
+                "column": 2
+              }
+            },
+            "moduleName": "modules/ember-bootstrap/templates/components/bs-progress/bar.hbs"
+          },
+          isEmpty: false,
+          arity: 0,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createTextNode("    ");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createElement("span");
+            dom.setAttribute(el1, "class", "sr-only");
+            var el2 = dom.createComment("");
+            dom.appendChild(el1, el2);
+            var el2 = dom.createTextNode("%");
+            dom.appendChild(el1, el2);
+            dom.appendChild(el0, el1);
+            var el1 = dom.createTextNode("\n");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+            var morphs = new Array(1);
+            morphs[0] = dom.createMorphAt(dom.childAt(fragment, [1]), 0, 0);
+            return morphs;
+          },
+          statements: [["content", "percentRounded", ["loc", [null, [11, 26], [11, 44]]], 0, 0, 0, 0]],
+          locals: [],
+          templates: []
+        };
+      })();
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 7,
+              "column": 0
+            },
+            "end": {
+              "line": 14,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-progress/bar.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(1);
+          morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+          dom.insertBoundary(fragment, 0);
+          return morphs;
+        },
+        statements: [["block", "if", [["get", "hasBlock", ["loc", [null, [8, 8], [8, 16]]], 0, 0, 0, 0]], [], 0, 1, ["loc", [null, [8, 2], [12, 9]]]]],
+        locals: [],
+        templates: [child0, child1]
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 15,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-progress/bar.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["block", "if", [["get", "showLabel", ["loc", [null, [1, 6], [1, 15]]], 0, 0, 0, 0]], [], 0, 1, ["loc", [null, [1, 0], [14, 7]]]]],
+      locals: [],
+      templates: [child0, child1]
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-tab", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 1,
+              "column": 0
+            },
+            "end": {
+              "line": 9,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-tab.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(1);
+          morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+          return morphs;
+        },
+        statements: [["inline", "yield", [["subexpr", "hash", [], ["pane", ["subexpr", "component", ["bs-tab/pane"], ["parent", ["subexpr", "@mut", [["get", "this", ["loc", [null, [4, 43], [4, 47]]], 0, 0, 0, 0]], [], [], 0, 0], "activeId", ["subexpr", "@mut", [["get", "isActiveId", ["loc", [null, [4, 57], [4, 67]]], 0, 0, 0, 0]], [], [], 0, 0], "fade", ["subexpr", "@mut", [["get", "fade", ["loc", [null, [4, 73], [4, 77]]], 0, 0, 0, 0]], [], [], 0, 0], "fadeTransition", ["subexpr", "@mut", [["get", "fadeTransition", ["loc", [null, [4, 93], [4, 107]]], 0, 0, 0, 0]], [], [], 0, 0]], ["loc", [null, [4, 11], [4, 108]]], 0, 0], "activeId", ["get", "isActiveId", ["loc", [null, [5, 15], [5, 25]]], 0, 0, 0, 0], "select", ["subexpr", "action", ["select"], [], ["loc", [null, [6, 13], [6, 30]]], 0, 0]], ["loc", [null, [3, 4], [7, 5]]], 0, 0]], [], ["loc", [null, [2, 2], [8, 4]]], 0, 0]],
+        locals: [],
+        templates: []
+      };
+    })();
+    var child1 = (function () {
+      var child0 = (function () {
+        var child0 = (function () {
+          var child0 = (function () {
+            var child0 = (function () {
+              var child0 = (function () {
+                return {
+                  meta: {
+                    "revision": "Ember@2.8.3",
+                    "loc": {
+                      "source": null,
+                      "start": {
+                        "line": 14,
+                        "column": 10
+                      },
+                      "end": {
+                        "line": 14,
+                        "column": 71
+                      }
+                    },
+                    "moduleName": "modules/ember-bootstrap/templates/components/bs-tab.hbs"
+                  },
+                  isEmpty: false,
+                  arity: 0,
+                  cachedFragment: null,
+                  hasRendered: false,
+                  buildFragment: function buildFragment(dom) {
+                    var el0 = dom.createDocumentFragment();
+                    var el1 = dom.createComment("");
+                    dom.appendChild(el0, el1);
+                    var el1 = dom.createTextNode(" ");
+                    dom.appendChild(el0, el1);
+                    var el1 = dom.createElement("span");
+                    dom.setAttribute(el1, "class", "caret");
+                    dom.appendChild(el0, el1);
+                    return el0;
+                  },
+                  buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+                    var morphs = new Array(1);
+                    morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+                    dom.insertBoundary(fragment, 0);
+                    return morphs;
+                  },
+                  statements: [["content", "item.groupTitle", ["loc", [null, [14, 24], [14, 43]]], 0, 0, 0, 0]],
+                  locals: [],
+                  templates: []
+                };
+              })();
+              var child1 = (function () {
+                var child0 = (function () {
+                  var child0 = (function () {
+                    return {
+                      meta: {
+                        "revision": "Ember@2.8.3",
+                        "loc": {
+                          "source": null,
+                          "start": {
+                            "line": 17,
+                            "column": 14
+                          },
+                          "end": {
+                            "line": 21,
+                            "column": 14
+                          }
+                        },
+                        "moduleName": "modules/ember-bootstrap/templates/components/bs-tab.hbs"
+                      },
+                      isEmpty: false,
+                      arity: 0,
+                      cachedFragment: null,
+                      hasRendered: false,
+                      buildFragment: function buildFragment(dom) {
+                        var el0 = dom.createDocumentFragment();
+                        var el1 = dom.createTextNode("                ");
+                        dom.appendChild(el0, el1);
+                        var el1 = dom.createElement("a");
+                        dom.setAttribute(el1, "role", "tab");
+                        var el2 = dom.createTextNode("\n                  ");
+                        dom.appendChild(el1, el2);
+                        var el2 = dom.createComment("");
+                        dom.appendChild(el1, el2);
+                        var el2 = dom.createTextNode("\n                ");
+                        dom.appendChild(el1, el2);
+                        dom.appendChild(el0, el1);
+                        var el1 = dom.createTextNode("\n");
+                        dom.appendChild(el0, el1);
+                        return el0;
+                      },
+                      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+                        var element1 = dom.childAt(fragment, [1]);
+                        var morphs = new Array(4);
+                        morphs[0] = dom.createAttrMorph(element1, 'href');
+                        morphs[1] = dom.createAttrMorph(element1, 'class');
+                        morphs[2] = dom.createElementMorph(element1);
+                        morphs[3] = dom.createMorphAt(element1, 1, 1);
+                        return morphs;
+                      },
+                      statements: [["attribute", "href", ["concat", ["#", ["get", "subItem.elementId", ["loc", [null, [18, 28], [18, 45]]], 0, 0, 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0], ["attribute", "class", ["subexpr", "if", [["subexpr", "bs-eq", [["get", "isActiveId", ["loc", [null, [18, 78], [18, 88]]], 0, 0, 0, 0], ["get", "subItem.elementId", ["loc", [null, [18, 89], [18, 106]]], 0, 0, 0, 0]], [], ["loc", [null, [18, 71], [18, 107]]], 0, 0], "nav-link active", "nav-link"], [], ["loc", [null, [null, null], [18, 138]]], 0, 0], 0, 0, 0, 0], ["element", "action", ["select", ["get", "subItem.elementId", ["loc", [null, [18, 157], [18, 174]]], 0, 0, 0, 0]], [], ["loc", [null, [18, 139], [18, 176]]], 0, 0], ["content", "subItem.title", ["loc", [null, [19, 18], [19, 35]]], 0, 0, 0, 0]],
+                      locals: [],
+                      templates: []
+                    };
+                  })();
+                  return {
+                    meta: {
+                      "revision": "Ember@2.8.3",
+                      "loc": {
+                        "source": null,
+                        "start": {
+                          "line": 16,
+                          "column": 12
+                        },
+                        "end": {
+                          "line": 22,
+                          "column": 12
+                        }
+                      },
+                      "moduleName": "modules/ember-bootstrap/templates/components/bs-tab.hbs"
+                    },
+                    isEmpty: false,
+                    arity: 1,
+                    cachedFragment: null,
+                    hasRendered: false,
+                    buildFragment: function buildFragment(dom) {
+                      var el0 = dom.createDocumentFragment();
+                      var el1 = dom.createComment("");
+                      dom.appendChild(el0, el1);
+                      return el0;
+                    },
+                    buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+                      var morphs = new Array(1);
+                      morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+                      dom.insertBoundary(fragment, 0);
+                      dom.insertBoundary(fragment, null);
+                      return morphs;
+                    },
+                    statements: [["block", "menu.item", [], ["class", ["subexpr", "if", [["subexpr", "bs-eq", [["get", "isActiveId", ["loc", [null, [17, 44], [17, 54]]], 0, 0, 0, 0], ["get", "subItem.elementId", ["loc", [null, [17, 55], [17, 72]]], 0, 0, 0, 0]], [], ["loc", [null, [17, 37], [17, 73]]], 0, 0], "active"], [], ["loc", [null, [17, 33], [17, 83]]], 0, 0]], 0, null, ["loc", [null, [17, 14], [21, 28]]]]],
+                    locals: ["subItem"],
+                    templates: [child0]
+                  };
+                })();
+                return {
+                  meta: {
+                    "revision": "Ember@2.8.3",
+                    "loc": {
+                      "source": null,
+                      "start": {
+                        "line": 15,
+                        "column": 10
+                      },
+                      "end": {
+                        "line": 23,
+                        "column": 10
+                      }
+                    },
+                    "moduleName": "modules/ember-bootstrap/templates/components/bs-tab.hbs"
+                  },
+                  isEmpty: false,
+                  arity: 1,
+                  cachedFragment: null,
+                  hasRendered: false,
+                  buildFragment: function buildFragment(dom) {
+                    var el0 = dom.createDocumentFragment();
+                    var el1 = dom.createComment("");
+                    dom.appendChild(el0, el1);
+                    return el0;
+                  },
+                  buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+                    var morphs = new Array(1);
+                    morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+                    dom.insertBoundary(fragment, 0);
+                    dom.insertBoundary(fragment, null);
+                    return morphs;
+                  },
+                  statements: [["block", "each", [["get", "item.children", ["loc", [null, [16, 20], [16, 33]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [16, 12], [22, 21]]]]],
+                  locals: ["menu"],
+                  templates: [child0]
+                };
+              })();
+              return {
+                meta: {
+                  "revision": "Ember@2.8.3",
+                  "loc": {
+                    "source": null,
+                    "start": {
+                      "line": 13,
+                      "column": 8
+                    },
+                    "end": {
+                      "line": 24,
+                      "column": 8
+                    }
+                  },
+                  "moduleName": "modules/ember-bootstrap/templates/components/bs-tab.hbs"
+                },
+                isEmpty: false,
+                arity: 1,
+                cachedFragment: null,
+                hasRendered: false,
+                buildFragment: function buildFragment(dom) {
+                  var el0 = dom.createDocumentFragment();
+                  var el1 = dom.createTextNode("          ");
+                  dom.appendChild(el0, el1);
+                  var el1 = dom.createComment("");
+                  dom.appendChild(el0, el1);
+                  var el1 = dom.createTextNode("\n");
+                  dom.appendChild(el0, el1);
+                  var el1 = dom.createComment("");
+                  dom.appendChild(el0, el1);
+                  return el0;
+                },
+                buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+                  var morphs = new Array(2);
+                  morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+                  morphs[1] = dom.createMorphAt(fragment, 3, 3, contextualElement);
+                  dom.insertBoundary(fragment, null);
+                  return morphs;
+                },
+                statements: [["block", "dd.toggle", [], [], 0, null, ["loc", [null, [14, 10], [14, 85]]]], ["block", "dd.menu", [], [], 1, null, ["loc", [null, [15, 10], [23, 22]]]]],
+                locals: ["dd"],
+                templates: [child0, child1]
+              };
+            })();
+            return {
+              meta: {
+                "revision": "Ember@2.8.3",
+                "loc": {
+                  "source": null,
+                  "start": {
+                    "line": 12,
+                    "column": 6
+                  },
+                  "end": {
+                    "line": 25,
+                    "column": 6
+                  }
+                },
+                "moduleName": "modules/ember-bootstrap/templates/components/bs-tab.hbs"
+              },
+              isEmpty: false,
+              arity: 0,
+              cachedFragment: null,
+              hasRendered: false,
+              buildFragment: function buildFragment(dom) {
+                var el0 = dom.createDocumentFragment();
+                var el1 = dom.createComment("");
+                dom.appendChild(el0, el1);
+                return el0;
+              },
+              buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+                var morphs = new Array(1);
+                morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+                dom.insertBoundary(fragment, 0);
+                dom.insertBoundary(fragment, null);
+                return morphs;
+              },
+              statements: [["block", "nav.dropdown", [], ["class", ["subexpr", "if", [["subexpr", "bs-contains", [["get", "item.childIds", ["loc", [null, [13, 47], [13, 60]]], 0, 0, 0, 0], ["get", "isActiveId", ["loc", [null, [13, 61], [13, 71]]], 0, 0, 0, 0]], [], ["loc", [null, [13, 34], [13, 72]]], 0, 0], "active"], [], ["loc", [null, [13, 30], [13, 82]]], 0, 0]], 0, null, ["loc", [null, [13, 8], [24, 25]]]]],
+              locals: [],
+              templates: [child0]
+            };
+          })();
+          var child1 = (function () {
+            var child0 = (function () {
+              return {
+                meta: {
+                  "revision": "Ember@2.8.3",
+                  "loc": {
+                    "source": null,
+                    "start": {
+                      "line": 26,
+                      "column": 8
+                    },
+                    "end": {
+                      "line": 30,
+                      "column": 8
+                    }
+                  },
+                  "moduleName": "modules/ember-bootstrap/templates/components/bs-tab.hbs"
+                },
+                isEmpty: false,
+                arity: 0,
+                cachedFragment: null,
+                hasRendered: false,
+                buildFragment: function buildFragment(dom) {
+                  var el0 = dom.createDocumentFragment();
+                  var el1 = dom.createTextNode("          ");
+                  dom.appendChild(el0, el1);
+                  var el1 = dom.createElement("a");
+                  dom.setAttribute(el1, "role", "tab");
+                  var el2 = dom.createTextNode("\n            ");
+                  dom.appendChild(el1, el2);
+                  var el2 = dom.createComment("");
+                  dom.appendChild(el1, el2);
+                  var el2 = dom.createTextNode("\n          ");
+                  dom.appendChild(el1, el2);
+                  dom.appendChild(el0, el1);
+                  var el1 = dom.createTextNode("\n");
+                  dom.appendChild(el0, el1);
+                  return el0;
+                },
+                buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+                  var element0 = dom.childAt(fragment, [1]);
+                  var morphs = new Array(4);
+                  morphs[0] = dom.createAttrMorph(element0, 'href');
+                  morphs[1] = dom.createAttrMorph(element0, 'class');
+                  morphs[2] = dom.createElementMorph(element0);
+                  morphs[3] = dom.createMorphAt(element0, 1, 1);
+                  return morphs;
+                },
+                statements: [["attribute", "href", ["concat", ["#", ["get", "item.elementId", ["loc", [null, [27, 22], [27, 36]]], 0, 0, 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0], ["attribute", "class", ["subexpr", "if", [["subexpr", "bs-eq", [["get", "isActiveId", ["loc", [null, [27, 69], [27, 79]]], 0, 0, 0, 0], ["get", "item.elementId", ["loc", [null, [27, 80], [27, 94]]], 0, 0, 0, 0]], [], ["loc", [null, [27, 62], [27, 95]]], 0, 0], "nav-link active", "nav-link"], [], ["loc", [null, [null, null], [27, 126]]], 0, 0], 0, 0, 0, 0], ["element", "action", ["select", ["get", "item.elementId", ["loc", [null, [27, 145], [27, 159]]], 0, 0, 0, 0]], [], ["loc", [null, [27, 127], [27, 161]]], 0, 0], ["content", "item.title", ["loc", [null, [28, 12], [28, 26]]], 0, 0, 0, 0]],
+                locals: [],
+                templates: []
+              };
+            })();
+            return {
+              meta: {
+                "revision": "Ember@2.8.3",
+                "loc": {
+                  "source": null,
+                  "start": {
+                    "line": 25,
+                    "column": 6
+                  },
+                  "end": {
+                    "line": 31,
+                    "column": 6
+                  }
+                },
+                "moduleName": "modules/ember-bootstrap/templates/components/bs-tab.hbs"
+              },
+              isEmpty: false,
+              arity: 0,
+              cachedFragment: null,
+              hasRendered: false,
+              buildFragment: function buildFragment(dom) {
+                var el0 = dom.createDocumentFragment();
+                var el1 = dom.createComment("");
+                dom.appendChild(el0, el1);
+                return el0;
+              },
+              buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+                var morphs = new Array(1);
+                morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+                dom.insertBoundary(fragment, 0);
+                dom.insertBoundary(fragment, null);
+                return morphs;
+              },
+              statements: [["block", "nav.item", [], ["active", ["subexpr", "bs-eq", [["get", "item.elementId", ["loc", [null, [26, 34], [26, 48]]], 0, 0, 0, 0], ["get", "isActiveId", ["loc", [null, [26, 49], [26, 59]]], 0, 0, 0, 0]], [], ["loc", [null, [26, 27], [26, 60]]], 0, 0]], 0, null, ["loc", [null, [26, 8], [30, 21]]]]],
+              locals: [],
+              templates: [child0]
+            };
+          })();
+          return {
+            meta: {
+              "revision": "Ember@2.8.3",
+              "loc": {
+                "source": null,
+                "start": {
+                  "line": 11,
+                  "column": 4
+                },
+                "end": {
+                  "line": 32,
+                  "column": 4
+                }
+              },
+              "moduleName": "modules/ember-bootstrap/templates/components/bs-tab.hbs"
+            },
+            isEmpty: false,
+            arity: 1,
+            cachedFragment: null,
+            hasRendered: false,
+            buildFragment: function buildFragment(dom) {
+              var el0 = dom.createDocumentFragment();
+              var el1 = dom.createComment("");
+              dom.appendChild(el0, el1);
+              return el0;
+            },
+            buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+              var morphs = new Array(1);
+              morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+              dom.insertBoundary(fragment, 0);
+              dom.insertBoundary(fragment, null);
+              return morphs;
+            },
+            statements: [["block", "if", [["get", "item.isGroup", ["loc", [null, [12, 12], [12, 24]]], 0, 0, 0, 0]], [], 0, 1, ["loc", [null, [12, 6], [31, 13]]]]],
+            locals: ["item"],
+            templates: [child0, child1]
+          };
+        })();
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": {
+              "source": null,
+              "start": {
+                "line": 10,
+                "column": 2
+              },
+              "end": {
+                "line": 33,
+                "column": 2
+              }
+            },
+            "moduleName": "modules/ember-bootstrap/templates/components/bs-tab.hbs"
+          },
+          isEmpty: false,
+          arity: 1,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createComment("");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+            var morphs = new Array(1);
+            morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+            dom.insertBoundary(fragment, 0);
+            dom.insertBoundary(fragment, null);
+            return morphs;
+          },
+          statements: [["block", "each", [["get", "navItems", ["loc", [null, [11, 12], [11, 20]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [11, 4], [32, 13]]]]],
+          locals: ["nav"],
+          templates: [child0]
+        };
+      })();
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 9,
+              "column": 0
+            },
+            "end": {
+              "line": 44,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-tab.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("div");
+          dom.setAttribute(el1, "class", "tab-content");
+          var el2 = dom.createTextNode("\n    ");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createComment("");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createTextNode("\n  ");
+          dom.appendChild(el1, el2);
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(2);
+          morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+          morphs[1] = dom.createMorphAt(dom.childAt(fragment, [2]), 1, 1);
+          dom.insertBoundary(fragment, 0);
+          return morphs;
+        },
+        statements: [["block", "bs-nav", [], ["type", ["subexpr", "@mut", [["get", "type", ["loc", [null, [10, 17], [10, 21]]], 0, 0, 0, 0]], [], [], 0, 0]], 0, null, ["loc", [null, [10, 2], [33, 13]]]], ["inline", "yield", [["subexpr", "hash", [], ["pane", ["subexpr", "component", ["bs-tab/pane"], ["parent", ["subexpr", "@mut", [["get", "this", ["loc", [null, [38, 45], [38, 49]]], 0, 0, 0, 0]], [], [], 0, 0], "activeId", ["subexpr", "@mut", [["get", "isActiveId", ["loc", [null, [38, 59], [38, 69]]], 0, 0, 0, 0]], [], [], 0, 0], "fade", ["subexpr", "@mut", [["get", "fade", ["loc", [null, [38, 75], [38, 79]]], 0, 0, 0, 0]], [], [], 0, 0], "fadeTransition", ["subexpr", "@mut", [["get", "fadeTransition", ["loc", [null, [38, 95], [38, 109]]], 0, 0, 0, 0]], [], [], 0, 0]], ["loc", [null, [38, 13], [38, 110]]], 0, 0], "activeId", ["get", "isActiveId", ["loc", [null, [39, 17], [39, 27]]], 0, 0, 0, 0], "select", ["subexpr", "action", ["select"], [], ["loc", [null, [40, 15], [40, 32]]], 0, 0]], ["loc", [null, [37, 6], [41, 7]]], 0, 0]], [], ["loc", [null, [36, 4], [42, 6]]], 0, 0]],
+        locals: [],
+        templates: [child0]
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 44,
+            "column": 7
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-tab.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["block", "if", [["get", "customTabs", ["loc", [null, [1, 6], [1, 16]]], 0, 0, 0, 0]], [], 0, 1, ["loc", [null, [1, 0], [44, 7]]]]],
+      locals: [],
+      templates: [child0, child1]
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-tab/pane", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 2,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-tab/pane.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createTextNode("\n");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        return morphs;
+      },
+      statements: [["content", "yield", ["loc", [null, [1, 0], [1, 9]]], 0, 0, 0, 0]],
+      locals: [],
+      templates: []
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-tooltip", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      var child0 = (function () {
+        var child0 = (function () {
+          return {
+            meta: {
+              "revision": "Ember@2.8.3",
+              "loc": {
+                "source": null,
+                "start": {
+                  "line": 14,
+                  "column": 4
+                },
+                "end": {
+                  "line": 16,
+                  "column": 4
+                }
+              },
+              "moduleName": "modules/ember-bootstrap/templates/components/bs-tooltip.hbs"
+            },
+            isEmpty: false,
+            arity: 0,
+            cachedFragment: null,
+            hasRendered: false,
+            buildFragment: function buildFragment(dom) {
+              var el0 = dom.createDocumentFragment();
+              var el1 = dom.createTextNode("      ");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createComment("");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createTextNode("\n");
+              dom.appendChild(el0, el1);
+              return el0;
+            },
+            buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+              var morphs = new Array(1);
+              morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+              return morphs;
+            },
+            statements: [["content", "yield", ["loc", [null, [15, 6], [15, 15]]], 0, 0, 0, 0]],
+            locals: [],
+            templates: []
+          };
+        })();
+        var child1 = (function () {
+          return {
+            meta: {
+              "revision": "Ember@2.8.3",
+              "loc": {
+                "source": null,
+                "start": {
+                  "line": 16,
+                  "column": 4
+                },
+                "end": {
+                  "line": 18,
+                  "column": 4
+                }
+              },
+              "moduleName": "modules/ember-bootstrap/templates/components/bs-tooltip.hbs"
+            },
+            isEmpty: false,
+            arity: 0,
+            cachedFragment: null,
+            hasRendered: false,
+            buildFragment: function buildFragment(dom) {
+              var el0 = dom.createDocumentFragment();
+              var el1 = dom.createTextNode("      ");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createComment("");
+              dom.appendChild(el0, el1);
+              var el1 = dom.createTextNode("\n");
+              dom.appendChild(el0, el1);
+              return el0;
+            },
+            buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+              var morphs = new Array(1);
+              morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+              return morphs;
+            },
+            statements: [["content", "title", ["loc", [null, [17, 6], [17, 15]]], 0, 0, 0, 0]],
+            locals: [],
+            templates: []
+          };
+        })();
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": {
+              "source": null,
+              "start": {
+                "line": 2,
+                "column": 2
+              },
+              "end": {
+                "line": 19,
+                "column": 2
+              }
+            },
+            "moduleName": "modules/ember-bootstrap/templates/components/bs-tooltip.hbs"
+          },
+          isEmpty: false,
+          arity: 0,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createComment("");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+            var morphs = new Array(1);
+            morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+            dom.insertBoundary(fragment, 0);
+            dom.insertBoundary(fragment, null);
+            return morphs;
+          },
+          statements: [["block", "if", [["get", "hasBlock", ["loc", [null, [14, 10], [14, 18]]], 0, 0, 0, 0]], [], 0, 1, ["loc", [null, [14, 4], [18, 11]]]]],
+          locals: [],
+          templates: [child0, child1]
+        };
+      })();
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 1,
+              "column": 0
+            },
+            "end": {
+              "line": 20,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-tooltip.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createComment("");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(1);
+          morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+          dom.insertBoundary(fragment, 0);
+          dom.insertBoundary(fragment, null);
+          return morphs;
+        },
+        statements: [["block", "bs-tooltip/element", [], ["id", ["subexpr", "@mut", [["get", "overlayId", ["loc", [null, [3, 7], [3, 16]]], 0, 0, 0, 0]], [], [], 0, 0], "placement", ["subexpr", "@mut", [["get", "placement", ["loc", [null, [4, 14], [4, 23]]], 0, 0, 0, 0]], [], [], 0, 0], "fade", ["subexpr", "@mut", [["get", "fade", ["loc", [null, [5, 9], [5, 13]]], 0, 0, 0, 0]], [], [], 0, 0], "showHelp", ["subexpr", "@mut", [["get", "showHelp", ["loc", [null, [6, 13], [6, 21]]], 0, 0, 0, 0]], [], [], 0, 0], "class", ["subexpr", "@mut", [["get", "class", ["loc", [null, [7, 10], [7, 15]]], 0, 0, 0, 0]], [], [], 0, 0], "renderInPlace", ["subexpr", "@mut", [["get", "_renderInPlace", ["loc", [null, [8, 18], [8, 32]]], 0, 0, 0, 0]], [], [], 0, 0], "popperTarget", ["subexpr", "@mut", [["get", "triggerTargetElement", ["loc", [null, [9, 17], [9, 37]]], 0, 0, 0, 0]], [], [], 0, 0], "autoPlacement", ["subexpr", "@mut", [["get", "autoPlacement", ["loc", [null, [10, 18], [10, 31]]], 0, 0, 0, 0]], [], [], 0, 0], "viewportElement", ["subexpr", "@mut", [["get", "viewportElement", ["loc", [null, [11, 20], [11, 35]]], 0, 0, 0, 0]], [], [], 0, 0], "viewportPadding", ["subexpr", "@mut", [["get", "viewportPadding", ["loc", [null, [12, 20], [12, 35]]], 0, 0, 0, 0]], [], [], 0, 0]], 0, null, ["loc", [null, [2, 2], [19, 25]]]]],
+        locals: [],
+        templates: [child0]
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 21,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-tooltip.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["block", "if", [["get", "inDom", ["loc", [null, [1, 6], [1, 11]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [1, 0], [20, 7]]]]],
+      locals: [],
+      templates: [child0]
+    };
+  })());
+});
+define("ember-bootstrap/templates/components/bs-tooltip/element", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 1,
+              "column": 0
+            },
+            "end": {
+              "line": 17,
+              "column": 0
+            }
+          },
+          "moduleName": "modules/ember-bootstrap/templates/components/bs-tooltip/element.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("div");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n  ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("div");
+          dom.setAttribute(el1, "class", "tooltip-inner");
+          var el2 = dom.createTextNode("\n    ");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createComment("");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createTextNode("\n  ");
+          dom.appendChild(el1, el2);
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var element0 = dom.childAt(fragment, [1]);
+          var morphs = new Array(2);
+          morphs[0] = dom.createAttrMorph(element0, 'class');
+          morphs[1] = dom.createMorphAt(dom.childAt(fragment, [3]), 1, 1);
+          return morphs;
+        },
+        statements: [["attribute", "class", ["get", "arrowClass", ["loc", [null, [13, 15], [13, 25]]], 0, 0, 0, 0], 0, 0, 0, 0], ["content", "yield", ["loc", [null, [15, 4], [15, 13]]], 0, 0, 0, 0]],
+        locals: [],
+        templates: []
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 17,
+            "column": 17
+          }
+        },
+        "moduleName": "modules/ember-bootstrap/templates/components/bs-tooltip/element.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["block", "ember-popper", [], ["id", ["subexpr", "@mut", [["get", "id", ["loc", [null, [2, 5], [2, 7]]], 0, 0, 0, 0]], [], [], 0, 0], "class", ["subexpr", "@mut", [["get", "popperClass", ["loc", [null, [3, 8], [3, 19]]], 0, 0, 0, 0]], [], [], 0, 0], "ariaRole", ["subexpr", "@mut", [["get", "ariaRole", ["loc", [null, [4, 11], [4, 19]]], 0, 0, 0, 0]], [], [], 0, 0], "placement", ["subexpr", "@mut", [["get", "placement", ["loc", [null, [5, 12], [5, 21]]], 0, 0, 0, 0]], [], [], 0, 0], "renderInPlace", ["subexpr", "@mut", [["get", "renderInPlace", ["loc", [null, [6, 16], [6, 29]]], 0, 0, 0, 0]], [], [], 0, 0], "popperTarget", ["subexpr", "@mut", [["get", "popperTarget", ["loc", [null, [7, 15], [7, 27]]], 0, 0, 0, 0]], [], [], 0, 0], "modifiers", ["subexpr", "@mut", [["get", "popperModifiers", ["loc", [null, [8, 12], [8, 27]]], 0, 0, 0, 0]], [], [], 0, 0], "popperContainer", "#ember-bootstrap-wormhole", "onCreate", ["subexpr", "action", ["updatePlacement"], [], ["loc", [null, [10, 11], [10, 37]]], 0, 0], "onUpdate", ["subexpr", "action", ["updatePlacement"], [], ["loc", [null, [11, 11], [11, 37]]], 0, 0]], 0, null, ["loc", [null, [1, 0], [17, 17]]]]],
+      locals: [],
+      templates: [child0]
+    };
+  })());
+});
+define('ember-bootstrap/utils/dom', ['exports'], function (exports) {
+  'use strict';
+
+  exports.findElementById = findElementById;
+  exports.getDOM = getDOM;
+
+  function childNodesOfElement(element) {
+    var children = [];
+    var child = element.firstChild;
+    while (child) {
+      children.push(child);
+      child = child.nextSibling;
+    }
+    return children;
+  } /*
+     * Implement some helpers methods for interacting with the DOM,
+     * be it Fastboot's SimpleDOM or the browser's version.
+     *
+     * Credit to https://github.com/yapplabs/ember-wormhole, from where this has been shamelessly stolen.
+     */
+
+  function findElementById(doc, id) {
+    if (doc.getElementById) {
+      return doc.getElementById(id);
+    }
+
+    var nodes = childNodesOfElement(doc);
+    var node = void 0;
+
+    while (nodes.length) {
+      node = nodes.shift();
+
+      if (node.getAttribute && node.getAttribute('id') === id) {
+        return node;
+      }
+      nodes = childNodesOfElement(node).concat(nodes);
+    }
+  }
+
+  // Private Ember API usage. Get the dom implementation used by the current
+  // renderer, be it native browser DOM or Fastboot SimpleDOM
+
+  function getDOM(context) {
+    var renderer = context.renderer;
+
+    if (!renderer._dom) {
+      // pre glimmer2
+      var container = Ember.getOwner ? Ember.getOwner(context) : context.container;
+      var documentService = container.lookup('service:-document');
+
+      if (documentService) {
+        return documentService;
+      }
+
+      renderer = container.lookup('renderer:-dom');
+    }
+
+    if (renderer._dom && renderer._dom.document) {
+      return renderer._dom.document;
+    } else {
+      throw new Error('Could not get DOM');
+    }
+  }
+});
+define('ember-bootstrap/utils/get-parent', ['exports'], function (exports) {
+  'use strict';
+
+  exports['default'] = getParent;
+
+  function getParent(view) {
+    if (Ember.get(view, 'tagName') === '') {
+      // Beware: use of private API! :(
+      if (Ember.ViewUtils && Ember.ViewUtils.getViewBounds) {
+        return Ember.ViewUtils.getViewBounds(view).parentElement;
+      } else {
+        return view._renderNode.contextualElement;
+      }
+    } else {
+      return Ember.get(view, 'element').parentNode;
+    }
+  }
+});
+define("ember-bootstrap/utils/listen-to-cp", ["exports"], function (exports) {
+
+  /**
+   * CP macro that listens to dependent (external) property, but allows overriding it locally without violating DDAU
+   * By using a simple setter it will still trigger on changes of the dependent property even when being set before.
+   *
+   * Kudos to @fsmanuel for coming up with this solution.
+   *
+   * @method
+   * @return {boolean}
+   * @param {string} dependentKey
+   * @param {*} defaultValue
+   * @private
+   */
+  "use strict";
+
+  exports["default"] = function (dependentKey) {
+    var defaultValue = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : null;
+
+    return Ember.computed(dependentKey, {
+      get: function get() {
+        return Ember.getWithDefault(this, dependentKey, defaultValue);
+      },
+      set: function set(key, value) {
+        // eslint-disable-line no-unused-vars
+        return value;
+      }
+    });
+  };
+});
+define('ember-bootstrap/utils/transition-end', ['exports', 'ember-bootstrap/utils/transition-support'], function (exports, _emberBootstrapUtilsTransitionSupport) {
+  'use strict';
+
+  exports['default'] = onTransitionEnd;
+
+  function onTransitionEnd(node, handler, context) {
+    var duration = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : 0;
+
+    if (!node) {
+      return;
+    }
+    var fakeEvent = {
+      target: node,
+      currentTarget: node
+    };
+    var backup = void 0;
+
+    if (_emberBootstrapUtilsTransitionSupport['default']) {
+      node.addEventListener(_emberBootstrapUtilsTransitionSupport['default'], done, false);
+
+      backup = Ember.run.later(this, done, fakeEvent, duration);
+    } else {
+      Ember.run.later(this, done, fakeEvent, 0);
+    }
+
+    function done(event) {
+      if (backup) {
+        Ember.run.cancel(backup);
+      }
+      node.removeEventListener(_emberBootstrapUtilsTransitionSupport['default'], done);
+      Ember.run.join(context, handler, event);
+    }
+  }
+});
+define('ember-bootstrap/utils/transition-support', ['exports'], function (exports) {
+  'use strict';
+
+  function transitionSupport() {
+    var el = document.createElement('bootstrap');
+
+    var transEndEventNames = {
+      transition: 'transitionend',
+      WebkitTransition: 'webkitTransitionEnd',
+      MozTransition: 'transitionend',
+      OTransition: 'oTransitionEnd otransitionend'
+    };
+
+    for (var name in transEndEventNames) {
+      if (el.style[name] !== undefined) {
+        return transEndEventNames[name];
+      }
+    }
+
+    return false;
+  }
+
+  exports['default'] = typeof document !== 'undefined' && transitionSupport();
+});
 define('ember-cli-app-version/components/app-version', ['exports', 'ember', 'ember-cli-app-version/templates/app-version'], function (exports, _ember, _emberCliAppVersionTemplatesAppVersion) {
   'use strict';
 
@@ -66536,6 +87295,2722 @@ define("ember-cli-app-version/templates/app-version", ["exports"], function (exp
       templates: []
     };
   })());
+});
+define('ember-concurrency/-buffer-policy', ['exports'], function (exports) {
+  'use strict';
+
+  function _toConsumableArray(arr) {
+    if (Array.isArray(arr)) {
+      for (var i = 0, arr2 = Array(arr.length); i < arr.length; i++) {
+        arr2[i] = arr[i];
+      }return arr2;
+    } else {
+      return Array.from(arr);
+    }
+  }
+
+  var saturateActiveQueue = function saturateActiveQueue(scheduler) {
+    while (scheduler.activeTaskInstances.length < scheduler.maxConcurrency) {
+      var taskInstance = scheduler.queuedTaskInstances.shift();
+      if (!taskInstance) {
+        break;
+      }
+      scheduler.activeTaskInstances.push(taskInstance);
+    }
+  };
+
+  function numPerformSlots(scheduler) {
+    return scheduler.maxConcurrency - scheduler.queuedTaskInstances.length - scheduler.activeTaskInstances.length;
+  }
+
+  var enqueueTasksPolicy = {
+    requiresUnboundedConcurrency: true,
+    schedule: function schedule(scheduler) {
+      // [a,b,_] [c,d,e,f] becomes
+      // [a,b,c] [d,e,f]
+      saturateActiveQueue(scheduler);
+    },
+    getNextPerformStatus: function getNextPerformStatus(scheduler) {
+      return numPerformSlots(scheduler) > 0 ? 'succeed' : 'enqueue';
+    }
+  };
+
+  exports.enqueueTasksPolicy = enqueueTasksPolicy;
+  var dropQueuedTasksPolicy = {
+    cancelReason: 'it belongs to a \'drop\' Task that was already running',
+    schedule: function schedule(scheduler) {
+      // [a,b,_] [c,d,e,f] becomes
+      // [a,b,c] []
+      saturateActiveQueue(scheduler);
+      scheduler.spliceTaskInstances(this.cancelReason, scheduler.queuedTaskInstances, 0, scheduler.queuedTaskInstances.length);
+    },
+    getNextPerformStatus: function getNextPerformStatus(scheduler) {
+      return numPerformSlots(scheduler) > 0 ? 'succeed' : 'drop';
+    }
+  };
+
+  exports.dropQueuedTasksPolicy = dropQueuedTasksPolicy;
+  var cancelOngoingTasksPolicy = {
+    cancelReason: 'it belongs to a \'restartable\' Task that was .perform()ed again',
+    schedule: function schedule(scheduler) {
+      // [a,b,_] [c,d,e,f] becomes
+      // [d,e,f] []
+      var activeTaskInstances = scheduler.activeTaskInstances;
+      var queuedTaskInstances = scheduler.queuedTaskInstances;
+      activeTaskInstances.push.apply(activeTaskInstances, _toConsumableArray(queuedTaskInstances));
+      queuedTaskInstances.length = 0;
+
+      var numToShift = Math.max(0, activeTaskInstances.length - scheduler.maxConcurrency);
+      scheduler.spliceTaskInstances(this.cancelReason, activeTaskInstances, 0, numToShift);
+    },
+    getNextPerformStatus: function getNextPerformStatus(scheduler) {
+      return numPerformSlots(scheduler) > 0 ? 'succeed' : 'cancel_previous';
+    }
+  };
+
+  exports.cancelOngoingTasksPolicy = cancelOngoingTasksPolicy;
+  var dropButKeepLatestPolicy = {
+    cancelReason: 'it belongs to a \'keepLatest\' Task that was already running',
+    schedule: function schedule(scheduler) {
+      // [a,b,_] [c,d,e,f] becomes
+      // [d,e,f] []
+      saturateActiveQueue(scheduler);
+      scheduler.spliceTaskInstances(this.cancelReason, scheduler.queuedTaskInstances, 0, scheduler.queuedTaskInstances.length - 1);
+    }
+  };
+  exports.dropButKeepLatestPolicy = dropButKeepLatestPolicy;
+});
+define('ember-concurrency/-cancelable-promise-helpers', ['exports', 'ember-concurrency/-task-instance', 'ember-concurrency/utils'], function (exports, _emberConcurrencyTaskInstance, _emberConcurrencyUtils) {
+  'use strict';
+
+  var _marked = /*#__PURE__*/regeneratorRuntime.mark(resolver);
+
+  var asyncAll = taskAwareVariantOf(Ember.RSVP.Promise, 'all', identity);
+
+  function resolver(value) {
+    return regeneratorRuntime.wrap(function resolver$(_context) {
+      while (1) {
+        switch (_context.prev = _context.next) {
+          case 0:
+            return _context.abrupt('return', value);
+
+          case 1:
+          case 'end':
+            return _context.stop();
+        }
+      }
+    }, _marked, this);
+  }
+
+  /**
+   * A cancelation-aware variant of [Promise.all](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise/all).
+   * The normal version of a `Promise.all` just returns a regular, uncancelable
+   * Promise. The `ember-concurrency` variant of `all()` has the following
+   * additional behavior:
+   *
+   * - if the task that `yield`ed `all()` is canceled, any of the
+   *   {@linkcode TaskInstance}s passed in to `all` will be canceled
+   * - if any of the {@linkcode TaskInstance}s (or regular promises) passed in reject (or
+   *   are canceled), all of the other unfinished `TaskInstance`s will
+   *   be automatically canceled.
+   *
+   * [Check out the "Awaiting Multiple Child Tasks example"](/#/docs/examples/joining-tasks)
+   */
+  var all = function all(things) {
+    if (things.length === 0) {
+      return things;
+    }
+
+    for (var i = 0; i < things.length; ++i) {
+      var t = things[i];
+      if (!(t && t[_emberConcurrencyUtils.yieldableSymbol])) {
+        return asyncAll(things);
+      }
+    }
+
+    var isAsync = false;
+    var taskInstances = things.map(function (thing) {
+      var ti = _emberConcurrencyTaskInstance['default'].create({
+        // TODO: consider simpler iterator than full on generator fn?
+        fn: resolver,
+        args: [thing]
+      })._start();
+
+      if (ti._completionState !== 1) {
+        isAsync = true;
+      }
+      return ti;
+    });
+
+    if (isAsync) {
+      return asyncAll(taskInstances);
+    } else {
+      return taskInstances.map(function (ti) {
+        return ti.value;
+      });
+    }
+  };
+
+  exports.all = all;
+  /**
+   * A cancelation-aware variant of [RSVP.allSettled](http://emberjs.com/api/classes/RSVP.html#method_allSettled).
+   * The normal version of a `RSVP.allSettled` just returns a regular, uncancelable
+   * Promise. The `ember-concurrency` variant of `allSettled()` has the following
+   * additional behavior:
+   *
+   * - if the task that `yield`ed `allSettled()` is canceled, any of the
+   *   {@linkcode TaskInstance}s passed in to `allSettled` will be canceled
+   */
+  var allSettled = taskAwareVariantOf(Ember.RSVP, 'allSettled', identity);
+
+  exports.allSettled = allSettled;
+  /**
+   * A cancelation-aware variant of [Promise.race](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise/race).
+   * The normal version of a `Promise.race` just returns a regular, uncancelable
+   * Promise. The `ember-concurrency` variant of `race()` has the following
+   * additional behavior:
+   *
+   * - if the task that `yield`ed `race()` is canceled, any of the
+   *   {@linkcode TaskInstance}s passed in to `race` will be canceled
+   * - once any of the tasks/promises passed in complete (either success, failure,
+   *   or cancelation), any of the {@linkcode TaskInstance}s passed in will be canceled
+   *
+   * [Check out the "Awaiting Multiple Child Tasks example"](/#/docs/examples/joining-tasks)
+   */
+  var race = taskAwareVariantOf(Ember.RSVP.Promise, 'race', identity);
+
+  exports.race = race;
+  /**
+   * A cancelation-aware variant of [RSVP.hash](http://emberjs.com/api/classes/RSVP.html#hash).
+   * The normal version of a `RSVP.hash` just returns a regular, uncancelable
+   * Promise. The `ember-concurrency` variant of `hash()` has the following
+   * additional behavior:
+   *
+   * - if the task that `yield`ed `hash()` is canceled, any of the
+   *   {@linkcode TaskInstance}s passed in to `allSettled` will be canceled
+   * - if any of the items rejects/cancels, all other cancelable items
+   *   (e.g. {@linkcode TaskInstance}s) will be canceled
+   */
+  var hash = taskAwareVariantOf(Ember.RSVP, 'hash', getValues);
+
+  exports.hash = hash;
+  function identity(obj) {
+    return obj;
+  }
+
+  function getValues(obj) {
+    return Object.keys(obj).map(function (k) {
+      return obj[k];
+    });
+  }
+
+  function taskAwareVariantOf(obj, method, getItems) {
+    return function (thing) {
+      var items = getItems(thing);
+      var defer = Ember.RSVP.defer();
+
+      obj[method](thing).then(defer.resolve, defer.reject);
+
+      var hasCancelled = false;
+      var cancelAll = function cancelAll() {
+        if (hasCancelled) {
+          return;
+        }
+        hasCancelled = true;
+        items.forEach(function (it) {
+          if (it) {
+            if (it instanceof _emberConcurrencyTaskInstance['default']) {
+              it.cancel();
+            } else if (typeof it.__ec_cancel__ === 'function') {
+              it.__ec_cancel__();
+            }
+          }
+        });
+      };
+
+      var promise = defer.promise['finally'](cancelAll);
+      promise.__ec_cancel__ = cancelAll;
+      return promise;
+    };
+  }
+});
+define('ember-concurrency/-encapsulated-task', ['exports', 'ember-concurrency/-task-instance'], function (exports, _emberConcurrencyTaskInstance) {
+  'use strict';
+
+  exports['default'] = _emberConcurrencyTaskInstance['default'].extend({
+    _makeIterator: function _makeIterator() {
+      var perform = this.get('perform');
+      true && !(typeof perform === 'function') && Ember.assert("The object passed to `task()` must define a `perform` generator function, e.g. `perform: function * (a,b,c) {...}`, or better yet `*perform(a,b,c) {...}`", typeof perform === 'function');
+
+      return perform.apply(this, this.args);
+    },
+
+    perform: null
+  });
+});
+define('ember-concurrency/-helpers', ['exports'], function (exports) {
+  'use strict';
+
+  exports.taskHelperClosure = taskHelperClosure;
+  function _toConsumableArray(arr) {
+    if (Array.isArray(arr)) {
+      for (var i = 0, arr2 = Array(arr.length); i < arr.length; i++) {
+        arr2[i] = arr[i];
+      }return arr2;
+    } else {
+      return Array.from(arr);
+    }
+  }
+
+  function taskHelperClosure(helperName, taskMethod, _args, hash) {
+    var task = _args[0];
+    var outerArgs = _args.slice(1);
+
+    return Ember.run.bind(null, function () {
+      if (!task || typeof task[taskMethod] !== 'function') {
+        true && !false && Ember.assert('The first argument passed to the `' + helperName + '` helper should be a Task object (without quotes); you passed ' + task, false);
+
+        return;
+      }
+
+      for (var _len = arguments.length, innerArgs = Array(_len), _key = 0; _key < _len; _key++) {
+        innerArgs[_key] = arguments[_key];
+      }
+
+      if (hash && hash.value) {
+        var event = innerArgs.pop();
+        innerArgs.push(Ember.get(event, hash.value));
+      }
+
+      return task[taskMethod].apply(task, _toConsumableArray(outerArgs).concat(innerArgs));
+    });
+  }
+});
+define('ember-concurrency/-property-modifiers-mixin', ['exports', 'ember-concurrency/-scheduler', 'ember-concurrency/-buffer-policy'], function (exports, _emberConcurrencyScheduler, _emberConcurrencyBufferPolicy) {
+  'use strict';
+
+  exports.resolveScheduler = resolveScheduler;
+  var propertyModifiers = {
+    // by default, task(...) expands to task(...).enqueue().maxConcurrency(Infinity)
+    _bufferPolicy: _emberConcurrencyBufferPolicy.enqueueTasksPolicy,
+    _maxConcurrency: Infinity,
+    _taskGroupPath: null,
+    _hasUsedModifier: false,
+    _hasSetBufferPolicy: false,
+    _hasEnabledEvents: false,
+
+    restartable: function restartable() {
+      return setBufferPolicy(this, _emberConcurrencyBufferPolicy.cancelOngoingTasksPolicy);
+    },
+    enqueue: function enqueue() {
+      return setBufferPolicy(this, _emberConcurrencyBufferPolicy.enqueueTasksPolicy);
+    },
+    drop: function drop() {
+      return setBufferPolicy(this, _emberConcurrencyBufferPolicy.dropQueuedTasksPolicy);
+    },
+    keepLatest: function keepLatest() {
+      return setBufferPolicy(this, _emberConcurrencyBufferPolicy.dropButKeepLatestPolicy);
+    },
+    maxConcurrency: function maxConcurrency(n) {
+      this._hasUsedModifier = true;
+      this._maxConcurrency = n;
+      assertModifiersNotMixedWithGroup(this);
+      return this;
+    },
+    group: function group(taskGroupPath) {
+      this._taskGroupPath = taskGroupPath;
+      assertModifiersNotMixedWithGroup(this);
+      return this;
+    },
+    evented: function evented() {
+      this._hasEnabledEvents = true;
+      return this;
+    },
+    debug: function debug() {
+      this._debug = true;
+      return this;
+    }
+  };
+
+  exports.propertyModifiers = propertyModifiers;
+  function setBufferPolicy(obj, policy) {
+    obj._hasSetBufferPolicy = true;
+    obj._hasUsedModifier = true;
+    obj._bufferPolicy = policy;
+    assertModifiersNotMixedWithGroup(obj);
+
+    if (obj._maxConcurrency === Infinity) {
+      obj._maxConcurrency = 1;
+    }
+
+    return obj;
+  }
+
+  function assertModifiersNotMixedWithGroup(obj) {
+    true && !(!obj._hasUsedModifier || !obj._taskGroupPath) && Ember.assert('ember-concurrency does not currently support using both .group() with other task modifiers (e.g. drop(), enqueue(), restartable())', !obj._hasUsedModifier || !obj._taskGroupPath);
+  }
+
+  function resolveScheduler(propertyObj, obj, TaskGroup) {
+    if (propertyObj._taskGroupPath) {
+      var taskGroup = obj.get(propertyObj._taskGroupPath);
+      true && !(taskGroup instanceof TaskGroup) && Ember.assert('Expected path \'' + propertyObj._taskGroupPath + '\' to resolve to a TaskGroup object, but instead was ' + taskGroup, taskGroup instanceof TaskGroup);
+
+      return taskGroup._scheduler;
+    } else {
+      return _emberConcurrencyScheduler['default'].create({
+        bufferPolicy: propertyObj._bufferPolicy,
+        maxConcurrency: propertyObj._maxConcurrency
+      });
+    }
+  }
+});
+define('ember-concurrency/-scheduler', ['exports'], function (exports) {
+  'use strict';
+
+  var SEEN_INDEX = 0;
+
+  var Scheduler = Ember.Object.extend({
+    lastPerformed: null,
+    lastStarted: null,
+    lastRunning: null,
+    lastSuccessful: null,
+    lastComplete: null,
+    lastErrored: null,
+    lastCanceled: null,
+    lastIncomplete: null,
+    performCount: 0,
+
+    boundHandleFulfill: null,
+    boundHandleReject: null,
+
+    init: function init() {
+      this._super.apply(this, arguments);
+      this.activeTaskInstances = [];
+      this.queuedTaskInstances = [];
+    },
+    cancelAll: function cancelAll(reason) {
+      var seen = [];
+      this.spliceTaskInstances(reason, this.activeTaskInstances, 0, this.activeTaskInstances.length, seen);
+      this.spliceTaskInstances(reason, this.queuedTaskInstances, 0, this.queuedTaskInstances.length, seen);
+      flushTaskCounts(seen);
+    },
+    spliceTaskInstances: function spliceTaskInstances(cancelReason, taskInstances, index, count, seen) {
+      for (var i = index; i < index + count; ++i) {
+        var taskInstance = taskInstances[i];
+
+        if (!taskInstance.hasStarted) {
+          // This tracking logic is kinda spread all over the place...
+          // maybe TaskInstances themselves could notify
+          // some delegate of queued state changes upon cancelation?
+          taskInstance.task.decrementProperty('numQueued');
+        }
+
+        taskInstance.cancel(cancelReason);
+        if (seen) {
+          seen.push(taskInstance.task);
+        }
+      }
+      taskInstances.splice(index, count);
+    },
+    schedule: function schedule(taskInstance) {
+      Ember.set(this, 'lastPerformed', taskInstance);
+      this.incrementProperty('performCount');
+      taskInstance.task.incrementProperty('numQueued');
+      this.queuedTaskInstances.push(taskInstance);
+      this._flushQueues();
+    },
+    _flushQueues: function _flushQueues() {
+      var seen = [];
+
+      for (var i = 0; i < this.activeTaskInstances.length; ++i) {
+        seen.push(this.activeTaskInstances[i].task);
+      }
+
+      this.activeTaskInstances = filterFinished(this.activeTaskInstances);
+
+      this.bufferPolicy.schedule(this);
+
+      var lastStarted = null;
+      for (var _i = 0; _i < this.activeTaskInstances.length; ++_i) {
+        var taskInstance = this.activeTaskInstances[_i];
+        if (!taskInstance.hasStarted) {
+          this._startTaskInstance(taskInstance);
+          lastStarted = taskInstance;
+        }
+        seen.push(taskInstance.task);
+      }
+
+      if (lastStarted) {
+        Ember.set(this, 'lastStarted', lastStarted);
+      }
+      Ember.set(this, 'lastRunning', lastStarted);
+
+      for (var _i2 = 0; _i2 < this.queuedTaskInstances.length; ++_i2) {
+        seen.push(this.queuedTaskInstances[_i2].task);
+      }
+
+      flushTaskCounts(seen);
+      Ember.set(this, 'concurrency', this.activeTaskInstances.length);
+    },
+    _startTaskInstance: function _startTaskInstance(taskInstance) {
+      var _this = this;
+
+      var task = taskInstance.task;
+      task.decrementProperty('numQueued');
+      task.incrementProperty('numRunning');
+
+      taskInstance._start()._onFinalize(function () {
+        task.decrementProperty('numRunning');
+        var state = taskInstance._completionState;
+        Ember.set(_this, 'lastComplete', taskInstance);
+        if (state === 1) {
+          Ember.set(_this, 'lastSuccessful', taskInstance);
+        } else {
+          if (state === 2) {
+            Ember.set(_this, 'lastErrored', taskInstance);
+          } else if (state === 3) {
+            Ember.set(_this, 'lastCanceled', taskInstance);
+          }
+          Ember.set(_this, 'lastIncomplete', taskInstance);
+        }
+        Ember.run.once(_this, _this._flushQueues);
+      });
+    }
+  });
+
+  function flushTaskCounts(tasks) {
+    SEEN_INDEX++;
+    for (var i = 0, l = tasks.length; i < l; ++i) {
+      var task = tasks[i];
+      if (task._seenIndex < SEEN_INDEX) {
+        task._seenIndex = SEEN_INDEX;
+        updateTaskChainCounts(task);
+      }
+    }
+  }
+
+  function updateTaskChainCounts(task) {
+    var numRunning = task.numRunning;
+    var numQueued = task.numQueued;
+    var taskGroup = task.get('group');
+
+    while (taskGroup) {
+      Ember.set(taskGroup, 'numRunning', numRunning);
+      Ember.set(taskGroup, 'numQueued', numQueued);
+      taskGroup = taskGroup.get('group');
+    }
+  }
+
+  function filterFinished(taskInstances) {
+    var ret = [];
+    for (var i = 0, l = taskInstances.length; i < l; ++i) {
+      var taskInstance = taskInstances[i];
+      if (Ember.get(taskInstance, 'isFinished') === false) {
+        ret.push(taskInstance);
+      }
+    }
+    return ret;
+  }
+
+  exports['default'] = Scheduler;
+});
+define('ember-concurrency/-task-group', ['exports', 'ember-concurrency/utils', 'ember-concurrency/-task-state-mixin', 'ember-concurrency/-property-modifiers-mixin'], function (exports, _emberConcurrencyUtils, _emberConcurrencyTaskStateMixin, _emberConcurrencyPropertyModifiersMixin) {
+  'use strict';
+
+  exports.TaskGroupProperty = TaskGroupProperty;
+  var TaskGroup = Ember.Object.extend(_emberConcurrencyTaskStateMixin['default'], {
+    isTaskGroup: true,
+
+    toString: function toString() {
+      return '<TaskGroup:' + this._propertyName + '>';
+    },
+
+    _numRunningOrNumQueued: Ember.computed.or('numRunning', 'numQueued'),
+    isRunning: Ember.computed.bool('_numRunningOrNumQueued'),
+    isQueued: false
+  });
+
+  exports.TaskGroup = TaskGroup;
+
+  function TaskGroupProperty() {
+    for (var _len = arguments.length, decorators = Array(_len), _key = 0; _key < _len; _key++) {
+      decorators[_key] = arguments[_key];
+    }
+
+    var taskFn = decorators.pop();
+    var tp = this;
+    _emberConcurrencyUtils._ComputedProperty.call(this, function (_propertyName) {
+      return TaskGroup.create({
+        fn: taskFn,
+        context: this,
+        _origin: this,
+        _taskGroupPath: tp._taskGroupPath,
+        _scheduler: (0, _emberConcurrencyPropertyModifiersMixin.resolveScheduler)(tp, this, TaskGroup),
+        _propertyName: _propertyName
+      });
+    });
+  }
+
+  TaskGroupProperty.prototype = Object.create(_emberConcurrencyUtils._ComputedProperty.prototype);
+  (0, _emberConcurrencyUtils.objectAssign)(TaskGroupProperty.prototype, _emberConcurrencyPropertyModifiersMixin.propertyModifiers, {
+    constructor: TaskGroupProperty
+  });
+});
+define('ember-concurrency/-task-instance', ['exports', 'ember-concurrency/utils'], function (exports, _emberConcurrencyUtils) {
+  'use strict';
+
+  exports.getRunningInstance = getRunningInstance;
+  exports.didCancel = didCancel;
+  exports.go = go;
+  exports.wrap = wrap;
+  function _toConsumableArray(arr) {
+    if (Array.isArray(arr)) {
+      for (var i = 0, arr2 = Array(arr.length); i < arr.length; i++) {
+        arr2[i] = arr[i];
+      }return arr2;
+    } else {
+      return Array.from(arr);
+    }
+  }
+
+  var TASK_CANCELATION_NAME = 'TaskCancelation';
+
+  var COMPLETION_PENDING = 0;
+  var COMPLETION_SUCCESS = 1;
+  var COMPLETION_ERROR = 2;
+  var COMPLETION_CANCEL = 3;
+
+  var GENERATOR_STATE_BEFORE_CREATE = "BEFORE_CREATE";
+  var GENERATOR_STATE_HAS_MORE_VALUES = "HAS_MORE_VALUES";
+  var GENERATOR_STATE_DONE = "DONE";
+  var GENERATOR_STATE_ERRORED = "ERRORED";
+
+  var PERFORM_TYPE_DEFAULT = "PERFORM_TYPE_DEFAULT";
+  exports.PERFORM_TYPE_DEFAULT = PERFORM_TYPE_DEFAULT;
+  var PERFORM_TYPE_UNLINKED = "PERFORM_TYPE_UNLINKED";
+  exports.PERFORM_TYPE_UNLINKED = PERFORM_TYPE_UNLINKED;
+  var PERFORM_TYPE_LINKED = "PERFORM_TYPE_LINKED";
+
+  exports.PERFORM_TYPE_LINKED = PERFORM_TYPE_LINKED;
+  var TASK_INSTANCE_STACK = [];
+
+  function getRunningInstance() {
+    return TASK_INSTANCE_STACK[TASK_INSTANCE_STACK.length - 1];
+  }
+
+  function handleYieldedUnknownThenable(thenable, taskInstance, resumeIndex) {
+    thenable.then(function (value) {
+      taskInstance.proceed(resumeIndex, _emberConcurrencyUtils.YIELDABLE_CONTINUE, value);
+    }, function (error) {
+      taskInstance.proceed(resumeIndex, _emberConcurrencyUtils.YIELDABLE_THROW, error);
+    });
+  }
+
+  /**
+   * Returns true if the object passed to it is a TaskCancelation error.
+   * If you call `someTask.perform().catch(...)` or otherwise treat
+   * a {@linkcode TaskInstance} like a promise, you may need to
+   * handle the cancelation of a TaskInstance differently from
+   * other kinds of errors it might throw, and you can use this
+   * convenience function to distinguish cancelation from errors.
+   *
+   * ```js
+   * click() {
+   *   this.get('myTask').perform().catch(e => {
+   *     if (!didCancel(e)) { throw e; }
+   *   });
+   * }
+   * ```
+   *
+   * @param {Object} error the caught error, which might be a TaskCancelation
+   * @returns {Boolean}
+   */
+
+  function didCancel(e) {
+    return e && e.name === TASK_CANCELATION_NAME;
+  }
+
+  function forwardToInternalPromise(method) {
+    return function () {
+      var _get;
+
+      this._hasSubscribed = true;
+      return (_get = this.get('_promise'))[method].apply(_get, arguments);
+    };
+  }
+
+  function spliceSlice(str, index, count, add) {
+    return str.slice(0, index) + (add || "") + str.slice(index + count);
+  }
+
+  /**
+    A `TaskInstance` represent a single execution of a
+    {@linkcode Task}. Every call to {@linkcode Task#perform} returns
+    a `TaskInstance`.
+  
+    `TaskInstance`s are cancelable, either explicitly
+    via {@linkcode TaskInstance#cancel} or {@linkcode Task#cancelAll},
+    or automatically due to the host object being destroyed, or
+    because concurrency policy enforced by a
+    {@linkcode TaskProperty Task Modifier} canceled the task instance.
+  
+    <style>
+      .ignore-this--this-is-here-to-hide-constructor,
+      #TaskInstance { display: none }
+    </style>
+  
+    @class TaskInstance
+  */
+  var taskInstanceAttrs = {
+    iterator: null,
+    _disposer: null,
+    _completionState: COMPLETION_PENDING,
+    task: null,
+    args: [],
+    _hasSubscribed: false,
+    _runLoop: true,
+    _debug: false,
+    _hasEnabledEvents: false,
+    cancelReason: null,
+    _performType: PERFORM_TYPE_DEFAULT,
+    _expectsLinkedYield: false,
+
+    /**
+     * If this TaskInstance runs to completion by returning a property
+     * other than a rejecting promise, this property will be set
+     * with that value.
+     *
+     * @memberof TaskInstance
+     * @instance
+     * @readOnly
+     */
+    value: null,
+
+    /**
+     * If this TaskInstance is canceled or throws an error (or yields
+     * a promise that rejects), this property will be set with that error.
+     * Otherwise, it is null.
+     *
+     * @memberof TaskInstance
+     * @instance
+     * @readOnly
+     */
+    error: null,
+
+    /**
+     * True if the task instance is fulfilled.
+     *
+     * @memberof TaskInstance
+     * @instance
+     * @readOnly
+     */
+    isSuccessful: false,
+
+    /**
+     * True if the task instance resolves to a rejection.
+     *
+     * @memberof TaskInstance
+     * @instance
+     * @readOnly
+     */
+    isError: false,
+
+    /**
+     * True if the task instance was canceled before it could run to completion.
+     *
+     * @memberof TaskInstance
+     * @instance
+     * @readOnly
+     */
+    isCanceled: Ember.computed.and('isCanceling', 'isFinished'),
+    isCanceling: false,
+
+    /**
+     * True if the task instance has started, else false.
+     *
+     * @memberof TaskInstance
+     * @instance
+     * @readOnly
+     */
+    hasStarted: false,
+
+    /**
+     * True if the task has run to completion.
+     *
+     * @memberof TaskInstance
+     * @instance
+     * @readOnly
+     */
+    isFinished: false,
+
+    /**
+     * True if the task is still running.
+     *
+     * @memberof TaskInstance
+     * @instance
+     * @readOnly
+     */
+    isRunning: Ember.computed.not('isFinished'),
+
+    /**
+     * Describes the state that the task instance is in. Can be used for debugging,
+     * or potentially driving some UI state. Possible values are:
+     *
+     * - `"dropped"`: task instance was canceled before it started
+     * - `"canceled"`: task instance was canceled before it could finish
+     * - `"finished"`: task instance ran to completion (even if an exception was thrown)
+     * - `"running"`: task instance is currently running (returns true even if
+     *     is paused on a yielded promise)
+     * - `"waiting"`: task instance hasn't begun running yet (usually
+     *     because the task is using the {@linkcode TaskProperty#enqueue .enqueue()}
+     *     task modifier)
+     *
+     * The animated timeline examples on the [Task Concurrency](/#/docs/task-concurrency)
+     * docs page make use of this property.
+     *
+     * @memberof TaskInstance
+     * @instance
+     * @readOnly
+     */
+    state: Ember.computed('isDropped', 'isCanceling', 'hasStarted', 'isFinished', function () {
+      if (Ember.get(this, 'isDropped')) {
+        return 'dropped';
+      } else if (Ember.get(this, 'isCanceling')) {
+        return 'canceled';
+      } else if (Ember.get(this, 'isFinished')) {
+        return 'finished';
+      } else if (Ember.get(this, 'hasStarted')) {
+        return 'running';
+      } else {
+        return 'waiting';
+      }
+    }),
+
+    /**
+     * True if the TaskInstance was canceled before it could
+     * ever start running. For example, calling
+     * {@linkcode Task#perform .perform()} twice on a
+     * task with the {@linkcode TaskProperty#drop .drop()} modifier applied
+     * will result in the second task instance being dropped.
+     *
+     * @memberof TaskInstance
+     * @instance
+     * @readOnly
+     */
+    isDropped: Ember.computed('isCanceling', 'hasStarted', function () {
+      return Ember.get(this, 'isCanceling') && !Ember.get(this, 'hasStarted');
+    }),
+
+    /**
+     * Event emitted when a new {@linkcode TaskInstance} starts executing.
+     *
+     * `on` from `@ember/object/evented` may be used to create a binding on the host object to the event.
+     *
+     * ```js
+     * export default Ember.Component.extend({
+     *   doSomething: task(function * () {
+     *     // ... does something
+     *   }),
+     *
+     *   onDoSomethingStarted: on('doSomething:started', function (taskInstance) {
+     *     // ...
+     *   })
+     * });
+     * ```
+     *
+     * @event TaskInstance#TASK_NAME:started
+     * @param {TaskInstance} taskInstance - Task instance that was started
+     */
+
+    /**
+     * Event emitted when a {@linkcode TaskInstance} succeeds.
+     *
+     * `on` from `@ember/object/evented` may be used to create a binding on the host object to the event.
+     *
+     * ```js
+     * export default Ember.Component.extend({
+     *   doSomething: task(function * () {
+     *     // ... does something
+     *   }),
+     *
+     *   onDoSomethingSucceeded: on('doSomething:succeeded', function (taskInstance) {
+     *     // ...
+     *   })
+     * });
+     * ```
+     *
+     * @event TaskInstance#TASK_NAME:succeeded
+     * @param {TaskInstance} taskInstance - Task instance that was succeeded
+     */
+
+    /**
+     * Event emitted when a {@linkcode TaskInstance} throws an an error that is
+     * not handled within the task itself.
+     *
+     * `on` from `@ember/object/evented` may be used to create a binding on the host object to the event.
+     *
+     * ```js
+     * export default Ember.Component.extend({
+     *   doSomething: task(function * () {
+     *     // ... does something
+     *   }),
+     *
+     *   onDoSomethingErrored: on('doSomething:errored', function (taskInstance, error) {
+     *     // ...
+     *   })
+     * });
+     * ```
+     *
+     * @event TaskInstance#TASK_NAME:errored
+     * @param {TaskInstance} taskInstance - Task instance that was started
+     * @param {Error} error - Error that was thrown by the task instance
+     */
+
+    /**
+     * Event emitted when a {@linkcode TaskInstance} is canceled.
+     *
+     * `on` from `@ember/object/evented` may be used to create a binding on the host object to the event.
+     *
+     * ```js
+     * export default Ember.Component.extend({
+     *   doSomething: task(function * () {
+     *     // ... does something
+     *   }),
+     *
+     *   onDoSomethingCanceled: on('doSomething:canceled', function (taskInstance, cancelationReason) {
+     *     // ...
+     *   })
+     * });
+     * ```
+     *
+     * @event TaskInstance#TASK_NAME:canceled
+     * @param {TaskInstance} taskInstance - Task instance that was started
+     * @param {string} cancelationReason - Cancelation reason that was was provided to {@linkcode TaskInstance#cancel}
+     */
+
+    _index: 1,
+
+    _start: function _start() {
+      if (this.hasStarted || this.isCanceling) {
+        return this;
+      }
+      Ember.set(this, 'hasStarted', true);
+      this._scheduleProceed(_emberConcurrencyUtils.YIELDABLE_CONTINUE, undefined);
+      this._triggerEvent('started', this);
+      return this;
+    },
+    toString: function toString() {
+      var taskString = "" + this.task;
+      return spliceSlice(taskString, -1, 0, '.perform()');
+    },
+
+    /**
+     * Cancels the task instance. Has no effect if the task instance has
+     * already been canceled or has already finished running.
+     *
+     * @method cancel
+     * @memberof TaskInstance
+     * @instance
+     */
+    cancel: function cancel() {
+      var cancelReason = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : ".cancel() was explicitly called";
+
+      if (this.isCanceling || Ember.get(this, 'isFinished')) {
+        return;
+      }
+      Ember.set(this, 'isCanceling', true);
+
+      var name = Ember.get(this, 'task._propertyName') || "<unknown>";
+      Ember.set(this, 'cancelReason', 'TaskInstance \'' + name + '\' was canceled because ' + cancelReason + '. For more information, see: http://ember-concurrency.com/docs/task-cancelation-help');
+
+      if (this.hasStarted) {
+        this._proceedSoon(_emberConcurrencyUtils.YIELDABLE_CANCEL, null);
+      } else {
+        this._finalize(null, COMPLETION_CANCEL);
+      }
+    },
+
+    _defer: null,
+    _promise: Ember.computed(function () {
+      this._defer = Ember.RSVP.defer();
+      this._maybeResolveDefer();
+      return this._defer.promise;
+    }),
+
+    _maybeResolveDefer: function _maybeResolveDefer() {
+      if (!this._defer || !this._completionState) {
+        return;
+      }
+
+      if (this._completionState === COMPLETION_SUCCESS) {
+        this._defer.resolve(this.value);
+      } else {
+        this._defer.reject(this.error);
+      }
+    },
+
+    /**
+     * Returns a promise that resolves with the value returned
+     * from the task's (generator) function, or rejects with
+     * either the exception thrown from the task function, or
+     * an error with a `.name` property with value `"TaskCancelation"`.
+     *
+     * @method then
+     * @memberof TaskInstance
+     * @instance
+     * @return {Promise}
+     */
+    then: forwardToInternalPromise('then'),
+
+    /**
+     * @method catch
+     * @memberof TaskInstance
+     * @instance
+     * @return {Promise}
+     */
+    'catch': forwardToInternalPromise('catch'),
+
+    /**
+     * @method finally
+     * @memberof TaskInstance
+     * @instance
+     * @return {Promise}
+     */
+    'finally': forwardToInternalPromise('finally'),
+
+    _finalize: function _finalize(_value, _completionState) {
+      var completionState = _completionState;
+      var value = _value;
+      this._index++;
+
+      if (this.isCanceling) {
+        completionState = COMPLETION_CANCEL;
+        value = new Error(this.cancelReason);
+
+        if (this._debug || Ember.ENV.DEBUG_TASKS) {
+          Ember.Logger.log(this.cancelReason);
+        }
+
+        value.name = TASK_CANCELATION_NAME;
+        value.taskInstance = this;
+      }
+
+      Ember.set(this, '_completionState', completionState);
+      Ember.set(this, '_result', value);
+
+      if (completionState === COMPLETION_SUCCESS) {
+        Ember.set(this, 'isSuccessful', true);
+        Ember.set(this, 'value', value);
+      } else if (completionState === COMPLETION_ERROR) {
+        Ember.set(this, 'isError', true);
+        Ember.set(this, 'error', value);
+      } else if (completionState === COMPLETION_CANCEL) {
+        Ember.set(this, 'error', value);
+      }
+
+      Ember.set(this, 'isFinished', true);
+
+      this._dispose();
+      this._runFinalizeCallbacks();
+      this._dispatchFinalizeEvents();
+    },
+
+    _finalizeCallbacks: null,
+    _onFinalize: function _onFinalize(callback) {
+      if (!this._finalizeCallbacks) {
+        this._finalizeCallbacks = [];
+      }
+      this._finalizeCallbacks.push(callback);
+
+      if (this._completionState) {
+        this._runFinalizeCallbacks();
+      }
+    },
+    _runFinalizeCallbacks: function _runFinalizeCallbacks() {
+      this._maybeResolveDefer();
+      if (this._finalizeCallbacks) {
+        for (var i = 0, l = this._finalizeCallbacks.length; i < l; ++i) {
+          this._finalizeCallbacks[i]();
+        }
+        this._finalizeCallbacks = null;
+      }
+
+      this._maybeThrowUnhandledTaskErrorLater();
+    },
+    _maybeThrowUnhandledTaskErrorLater: function _maybeThrowUnhandledTaskErrorLater() {
+      var _this = this;
+
+      // this backports the Ember 2.0+ RSVP _onError 'after' microtask behavior to Ember < 2.0
+      if (!this._hasSubscribed && this._completionState === COMPLETION_ERROR) {
+        Ember.run.schedule(Ember.run.backburner.queueNames[Ember.run.backburner.queueNames.length - 1], function () {
+          if (!_this._hasSubscribed && !didCancel(_this.error)) {
+            Ember.RSVP.reject(_this.error);
+          }
+        });
+      }
+    },
+    _dispatchFinalizeEvents: function _dispatchFinalizeEvents() {
+      switch (this._completionState) {
+        case COMPLETION_SUCCESS:
+          this._triggerEvent('succeeded', this);
+          break;
+        case COMPLETION_ERROR:
+          this._triggerEvent('errored', this, Ember.get(this, 'error'));
+          break;
+        case COMPLETION_CANCEL:
+          this._triggerEvent('canceled', this, Ember.get(this, 'cancelReason'));
+          break;
+      }
+    },
+
+    /**
+     * Runs any disposers attached to the task's most recent `yield`.
+     * For instance, when a task yields a TaskInstance, it registers that
+     * child TaskInstance's disposer, so that if the parent task is canceled,
+     * _dispose() will run that disposer and cancel the child TaskInstance.
+     *
+     * @private
+     */
+    _dispose: function _dispose() {
+      if (this._disposer) {
+        var disposer = this._disposer;
+        this._disposer = null;
+
+        // TODO: test erroring disposer
+        disposer();
+      }
+    },
+    _isGeneratorDone: function _isGeneratorDone() {
+      var state = this._generatorState;
+      return state === GENERATOR_STATE_DONE || state === GENERATOR_STATE_ERRORED;
+    },
+
+    /**
+     * Calls .next()/.throw()/.return() on the task's generator function iterator,
+     * essentially taking a single step of execution on the task function.
+     *
+     * @private
+     */
+    _resumeGenerator: function _resumeGenerator(nextValue, iteratorMethod) {
+      true && !!this._isGeneratorDone() && Ember.assert("The task generator function has already run to completion. This is probably an ember-concurrency bug.", !this._isGeneratorDone());
+
+      try {
+        TASK_INSTANCE_STACK.push(this);
+
+        var iterator = this._getIterator();
+        var result = iterator[iteratorMethod](nextValue);
+
+        this._generatorValue = result.value;
+        if (result.done) {
+          this._generatorState = GENERATOR_STATE_DONE;
+        } else {
+          this._generatorState = GENERATOR_STATE_HAS_MORE_VALUES;
+        }
+      } catch (e) {
+        this._generatorValue = e;
+        this._generatorState = GENERATOR_STATE_ERRORED;
+      } finally {
+        if (this._expectsLinkedYield) {
+          if (!this._generatorValue || this._generatorValue._performType !== PERFORM_TYPE_LINKED) {
+            Ember.Logger.warn("You performed a .linked() task without immediately yielding/returning it. This is currently unsupported (but might be supported in future version of ember-concurrency).");
+          }
+          this._expectsLinkedYield = false;
+        }
+
+        TASK_INSTANCE_STACK.pop();
+      }
+    },
+    _getIterator: function _getIterator() {
+      if (!this.iterator) {
+        this.iterator = this._makeIterator();
+      }
+      return this.iterator;
+    },
+
+    /**
+     * Returns a generator function iterator (the object with
+     * .next()/.throw()/.return() methods) using the task function
+     * supplied to `task(...)`. It uses `apply` so that the `this`
+     * context is the host object the task lives on, and passes
+     * the args passed to `perform(...args)` through to the generator
+     * function.
+     *
+     * `_makeIterator` is overridden in EncapsulatedTask to produce
+     * an iterator based on the `*perform()` function on the
+     * EncapsulatedTask definition.
+     *
+     * @private
+     */
+    _makeIterator: function _makeIterator() {
+      return this.fn.apply(this.context, this.args);
+    },
+
+    /**
+     * The TaskInstance internally tracks an index/sequence number
+     * (the `_index` property) which gets incremented every time the
+     * task generator function iterator takes a step. When a task
+     * function is paused at a `yield`, there are two events that
+     * cause the TaskInstance to take a step: 1) the yielded value
+     * "resolves", thus resuming the TaskInstance's execution, or
+     * 2) the TaskInstance is canceled. We need some mechanism to prevent
+     * stale yielded value resolutions from resuming the TaskFunction
+     * after the TaskInstance has already moved on (either because
+     * the TaskInstance has since been canceled or because an
+     * implementation of the Yieldable API tried to resume the
+     * TaskInstance more than once). The `_index` serves as
+     * that simple mechanism: anyone resuming a TaskInstance
+     * needs to pass in the `index` they were provided that acts
+     * as a ticket to resume the TaskInstance that expires once
+     * the TaskInstance has moved on.
+     *
+     * @private
+     */
+    _advanceIndex: function _advanceIndex(index) {
+      if (this._index === index) {
+        return ++this._index;
+      }
+    },
+    _proceedSoon: function _proceedSoon(yieldResumeType, value) {
+      var _this2 = this;
+
+      this._advanceIndex(this._index);
+      if (this._runLoop) {
+        Ember.run.join(function () {
+          Ember.run.schedule('actions', _this2, _this2._proceed, yieldResumeType, value);
+        });
+      } else {
+        setTimeout(function () {
+          return _this2._proceed(yieldResumeType, value);
+        }, 1);
+      }
+    },
+    proceed: function proceed(index, yieldResumeType, value) {
+      if (this._completionState) {
+        return;
+      }
+      if (!this._advanceIndex(index)) {
+        return;
+      }
+      this._proceedSoon(yieldResumeType, value);
+    },
+    _scheduleProceed: function _scheduleProceed(yieldResumeType, value) {
+      var _this3 = this;
+
+      if (this._completionState) {
+        return;
+      }
+
+      if (this._runLoop && !Ember.run.currentRunLoop) {
+        Ember.run(this, this._proceed, yieldResumeType, value);
+        return;
+      } else if (!this._runLoop && Ember.run.currentRunLoop) {
+        setTimeout(function () {
+          return _this3._proceed(yieldResumeType, value);
+        }, 1);
+        return;
+      } else {
+        this._proceed(yieldResumeType, value);
+      }
+    },
+    _proceed: function _proceed(yieldResumeType, value) {
+      if (this._completionState) {
+        return;
+      }
+
+      if (this._generatorState === GENERATOR_STATE_DONE) {
+        this._handleResolvedReturnedValue(yieldResumeType, value);
+      } else {
+        this._handleResolvedContinueValue(yieldResumeType, value);
+      }
+    },
+    _handleResolvedReturnedValue: function _handleResolvedReturnedValue(yieldResumeType, value) {
+      // decide what to do in the case of `return maybeYieldable`;
+      // value is the resolved value of the yieldable. We just
+      // need to decide how to finalize.
+      true && !(this._completionState === COMPLETION_PENDING) && Ember.assert("expected completion state to be pending", this._completionState === COMPLETION_PENDING);
+      true && !(this._generatorState === GENERATOR_STATE_DONE) && Ember.assert("expected generator to be done", this._generatorState === GENERATOR_STATE_DONE);
+
+      switch (yieldResumeType) {
+        case _emberConcurrencyUtils.YIELDABLE_CONTINUE:
+        case _emberConcurrencyUtils.YIELDABLE_RETURN:
+          this._finalize(value, COMPLETION_SUCCESS);
+          break;
+        case _emberConcurrencyUtils.YIELDABLE_THROW:
+          this._finalize(value, COMPLETION_ERROR);
+          break;
+        case _emberConcurrencyUtils.YIELDABLE_CANCEL:
+          Ember.set(this, 'isCanceling', true);
+          this._finalize(null, COMPLETION_CANCEL);
+          break;
+      }
+    },
+
+    _generatorState: GENERATOR_STATE_BEFORE_CREATE,
+    _generatorValue: null,
+    _handleResolvedContinueValue: function _handleResolvedContinueValue(_yieldResumeType, resumeValue) {
+      var iteratorMethod = _yieldResumeType;
+      if (iteratorMethod === _emberConcurrencyUtils.YIELDABLE_CANCEL) {
+        Ember.set(this, 'isCanceling', true);
+        iteratorMethod = _emberConcurrencyUtils.YIELDABLE_RETURN;
+      }
+
+      this._dispose();
+
+      var beforeIndex = this._index;
+      this._resumeGenerator(resumeValue, iteratorMethod);
+
+      if (!this._advanceIndex(beforeIndex)) {
+        return;
+      }
+
+      if (this._generatorState === GENERATOR_STATE_ERRORED) {
+        this._finalize(this._generatorValue, COMPLETION_ERROR);
+        return;
+      }
+
+      this._handleYieldedValue();
+    },
+    _handleYieldedValue: function _handleYieldedValue() {
+      var yieldedValue = this._generatorValue;
+      if (!yieldedValue) {
+        this._proceedWithSimpleValue(yieldedValue);
+        return;
+      }
+
+      if (yieldedValue instanceof _emberConcurrencyUtils.RawValue) {
+        this._proceedWithSimpleValue(yieldedValue.value);
+        return;
+      }
+
+      this._addDisposer(yieldedValue.__ec_cancel__);
+
+      if (yieldedValue[_emberConcurrencyUtils.yieldableSymbol]) {
+        this._invokeYieldable(yieldedValue);
+      } else if (typeof yieldedValue.then === 'function') {
+        handleYieldedUnknownThenable(yieldedValue, this, this._index);
+      } else {
+        this._proceedWithSimpleValue(yieldedValue);
+      }
+    },
+    _proceedWithSimpleValue: function _proceedWithSimpleValue(yieldedValue) {
+      this.proceed(this._index, _emberConcurrencyUtils.YIELDABLE_CONTINUE, yieldedValue);
+    },
+    _addDisposer: function _addDisposer(maybeDisposer) {
+      if (typeof maybeDisposer === 'function') {
+        var priorDisposer = this._disposer;
+        if (priorDisposer) {
+          this._disposer = function () {
+            priorDisposer();
+            maybeDisposer();
+          };
+        } else {
+          this._disposer = maybeDisposer;
+        }
+      }
+    },
+    _invokeYieldable: function _invokeYieldable(yieldedValue) {
+      try {
+        var maybeDisposer = yieldedValue[_emberConcurrencyUtils.yieldableSymbol](this, this._index);
+        this._addDisposer(maybeDisposer);
+      } catch (e) {
+        // TODO: handle erroneous yieldable implementation
+      }
+    },
+    _triggerEvent: function _triggerEvent(eventType) {
+      if (!this._hasEnabledEvents) {
+        return;
+      }
+
+      var host = Ember.get(this, 'task.context');
+      var eventNamespace = Ember.get(this, 'task._propertyName');
+
+      if (host && host.trigger && eventNamespace) {
+        for (var _len = arguments.length, args = Array(_len > 1 ? _len - 1 : 0), _key = 1; _key < _len; _key++) {
+          args[_key - 1] = arguments[_key];
+        }
+
+        host.trigger.apply(host, [eventNamespace + ':' + eventType].concat(_toConsumableArray(args)));
+      }
+    }
+  };
+
+  taskInstanceAttrs[_emberConcurrencyUtils.yieldableSymbol] = function handleYieldedTaskInstance(parentTaskInstance, resumeIndex) {
+    var yieldedTaskInstance = this;
+    yieldedTaskInstance._hasSubscribed = true;
+
+    yieldedTaskInstance._onFinalize(function () {
+      var state = yieldedTaskInstance._completionState;
+      if (state === COMPLETION_SUCCESS) {
+        parentTaskInstance.proceed(resumeIndex, _emberConcurrencyUtils.YIELDABLE_CONTINUE, yieldedTaskInstance.value);
+      } else if (state === COMPLETION_ERROR) {
+        parentTaskInstance.proceed(resumeIndex, _emberConcurrencyUtils.YIELDABLE_THROW, yieldedTaskInstance.error);
+      } else if (state === COMPLETION_CANCEL) {
+        parentTaskInstance.proceed(resumeIndex, _emberConcurrencyUtils.YIELDABLE_CANCEL, null);
+      }
+    });
+
+    return function disposeYieldedTaskInstance() {
+      if (yieldedTaskInstance._performType !== PERFORM_TYPE_UNLINKED) {
+        if (yieldedTaskInstance._performType === PERFORM_TYPE_DEFAULT) {
+          var parentObj = Ember.get(parentTaskInstance, 'task.context');
+          var childObj = Ember.get(yieldedTaskInstance, 'task.context');
+          if (parentObj && childObj && parentObj !== childObj && parentObj.isDestroying && Ember.get(yieldedTaskInstance, 'isRunning')) {
+            var parentName = '`' + parentTaskInstance.task._propertyName + '`';
+            var childName = '`' + yieldedTaskInstance.task._propertyName + '`';
+            Ember.Logger.warn('ember-concurrency detected a potentially hazardous "self-cancel loop" between parent task ' + parentName + ' and child task ' + childName + '. If you want child task ' + childName + ' to be canceled when parent task ' + parentName + ' is canceled, please change `.perform()` to `.linked().perform()`. If you want child task ' + childName + ' to keep running after parent task ' + parentName + ' is canceled, change it to `.unlinked().perform()`');
+          }
+        }
+        yieldedTaskInstance.cancel();
+      }
+    };
+  };
+
+  var TaskInstance = Ember.Object.extend(taskInstanceAttrs);
+
+  function go(args, fn) {
+    var attrs = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
+
+    return TaskInstance.create(Object.assign({ args: args, fn: fn, context: this }, attrs))._start();
+  }
+
+  function wrap(fn) {
+    var attrs = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
+
+    return function wrappedRunnerFunction() {
+      for (var _len2 = arguments.length, args = Array(_len2), _key2 = 0; _key2 < _len2; _key2++) {
+        args[_key2] = arguments[_key2];
+      }
+
+      return go.call(this, args, fn, attrs);
+    };
+  }
+
+  exports['default'] = TaskInstance;
+});
+define("ember-concurrency/-task-property", ["exports", "ember-concurrency/-task-instance", "ember-concurrency/-task-state-mixin", "ember-concurrency/-task-group", "ember-concurrency/-property-modifiers-mixin", "ember-concurrency/utils", "ember-concurrency/-encapsulated-task"], function (exports, _emberConcurrencyTaskInstance, _emberConcurrencyTaskStateMixin, _emberConcurrencyTaskGroup, _emberConcurrencyPropertyModifiersMixin, _emberConcurrencyUtils, _emberConcurrencyEncapsulatedTask) {
+  "use strict";
+
+  exports.TaskProperty = TaskProperty;
+  var _typeof = typeof Symbol === "function" && typeof Symbol.iterator === "symbol" ? function (obj) {
+    return typeof obj;
+  } : function (obj) {
+    return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj;
+  };
+
+  function _defineProperty(obj, key, value) {
+    if (key in obj) {
+      Object.defineProperty(obj, key, { value: value, enumerable: true, configurable: true, writable: true });
+    } else {
+      obj[key] = value;
+    }return obj;
+  }
+
+  function _toConsumableArray(arr) {
+    if (Array.isArray(arr)) {
+      for (var i = 0, arr2 = Array(arr.length); i < arr.length; i++) {
+        arr2[i] = arr[i];
+      }return arr2;
+    } else {
+      return Array.from(arr);
+    }
+  }
+
+  var PerformProxy = Ember.Object.extend({
+    _task: null,
+    _performType: null,
+    _linkedObject: null,
+
+    perform: function perform() {
+      for (var _len = arguments.length, args = Array(_len), _key = 0; _key < _len; _key++) {
+        args[_key] = arguments[_key];
+      }
+
+      return this._task._performShared(args, this._performType, this._linkedObject);
+    }
+  });
+
+  /**
+    The `Task` object lives on a host Ember object (e.g.
+    a Component, Route, or Controller). You call the
+    {@linkcode Task#perform .perform()} method on this object
+    to create run individual {@linkcode TaskInstance}s,
+    and at any point, you can call the {@linkcode Task#cancelAll .cancelAll()}
+    method on this object to cancel all running or enqueued
+    {@linkcode TaskInstance}s.
+  
+  
+    <style>
+      .ignore-this--this-is-here-to-hide-constructor,
+      #Task{ display: none }
+    </style>
+  
+    @class Task
+  */
+  var Task = Ember.Object.extend(_emberConcurrencyTaskStateMixin["default"], _defineProperty({
+    /**
+     * `true` if any current task instances are running.
+     *
+     * @memberof Task
+     * @member {boolean} isRunning
+     * @instance
+     * @readOnly
+     */
+
+    /**
+     * `true` if any future task instances are queued.
+     *
+     * @memberof Task
+     * @member {boolean} isQueued
+     * @instance
+     * @readOnly
+     */
+
+    /**
+     * `true` if the task is not in the running or queued state.
+     *
+     * @memberof Task
+     * @member {boolean} isIdle
+     * @instance
+     * @readOnly
+     */
+
+    /**
+     * The current state of the task: `"running"`, `"queued"` or `"idle"`.
+     *
+     * @memberof Task
+     * @member {string} state
+     * @instance
+     * @readOnly
+     */
+
+    /**
+     * The most recently started task instance.
+     *
+     * @memberof Task
+     * @member {TaskInstance} last
+     * @instance
+     * @readOnly
+     */
+
+    /**
+     * The most recent task instance that is currently running.
+     *
+     * @memberof Task
+     * @member {TaskInstance} lastRunning
+     * @instance
+     * @readOnly
+     */
+
+    /**
+     * The most recently performed task instance.
+     *
+     * @memberof Task
+     * @member {TaskInstance} lastPerformed
+     * @instance
+     * @readOnly
+     */
+
+    /**
+     * The most recent task instance that succeeded.
+     *
+     * @memberof Task
+     * @member {TaskInstance} lastSuccessful
+     * @instance
+     * @readOnly
+     */
+
+    /**
+     * The most recently completed task instance.
+     *
+     * @memberof Task
+     * @member {TaskInstance} lastComplete
+     * @instance
+     * @readOnly
+     */
+
+    /**
+     * The most recent task instance that errored.
+     *
+     * @memberof Task
+     * @member {TaskInstance} lastErrored
+     * @instance
+     * @readOnly
+     */
+
+    /**
+     * The most recently canceled task instance.
+     *
+     * @memberof Task
+     * @member {TaskInstance} lastCanceled
+     * @instance
+     * @readOnly
+     */
+
+    /**
+     * The most recent task instance that is incomplete.
+     *
+     * @memberof Task
+     * @member {TaskInstance} lastIncomplete
+     * @instance
+     * @readOnly
+     */
+
+    /**
+     * The number of times this task has been performed.
+     *
+     * @memberof Task
+     * @member {number} performCount
+     * @instance
+     * @readOnly
+     */
+
+    fn: null,
+    context: null,
+    _observes: null,
+    _curryArgs: null,
+    _linkedObjects: null,
+
+    init: function init() {
+      this._super.apply(this, arguments);
+
+      if (_typeof(this.fn) === 'object') {
+        var owner = Ember.getOwner(this.context);
+        var ownerInjection = owner ? owner.ownerInjection() : {};
+        this._taskInstanceFactory = _emberConcurrencyEncapsulatedTask["default"].extend(ownerInjection, this.fn);
+      }
+
+      (0, _emberConcurrencyUtils._cleanupOnDestroy)(this.context, this, 'cancelAll', 'the object it lives on was destroyed or unrendered');
+    },
+    _curry: function _curry() {
+      var task = this._clone();
+
+      for (var _len2 = arguments.length, args = Array(_len2), _key2 = 0; _key2 < _len2; _key2++) {
+        args[_key2] = arguments[_key2];
+      }
+
+      task._curryArgs = [].concat(_toConsumableArray(this._curryArgs || []), _toConsumableArray(args));
+      return task;
+    },
+    linked: function linked() {
+      var taskInstance = (0, _emberConcurrencyTaskInstance.getRunningInstance)();
+      if (!taskInstance) {
+        throw new Error('You can only call .linked() from within a task.');
+      }
+
+      return PerformProxy.create({
+        _task: this,
+        _performType: _emberConcurrencyTaskInstance.PERFORM_TYPE_LINKED,
+        _linkedObject: taskInstance
+      });
+    },
+    unlinked: function unlinked() {
+      return PerformProxy.create({
+        _task: this,
+        _performType: _emberConcurrencyTaskInstance.PERFORM_TYPE_UNLINKED
+      });
+    },
+    _clone: function _clone() {
+      return Task.create({
+        fn: this.fn,
+        context: this.context,
+        _origin: this._origin,
+        _taskGroupPath: this._taskGroupPath,
+        _scheduler: this._scheduler,
+        _propertyName: this._propertyName
+      });
+    },
+
+    /**
+     * This property is true if this task is NOT running, i.e. the number
+     * of currently running TaskInstances is zero.
+     *
+     * This property is useful for driving the state/style of buttons
+     * and loading UI, among other things.
+     *
+     * @memberof Task
+     * @instance
+     * @readOnly
+     */
+
+    /**
+     * This property is true if this task is running, i.e. the number
+     * of currently running TaskInstances is greater than zero.
+     *
+     * This property is useful for driving the state/style of buttons
+     * and loading UI, among other things.
+     *
+     * @memberof Task
+     * @instance
+     * @readOnly
+     */
+
+    /**
+     * EXPERIMENTAL
+     *
+     * This value describes what would happen to the TaskInstance returned
+     * from .perform() if .perform() were called right now.  Returns one of
+     * the following values:
+     *
+     * - `succeed`: new TaskInstance will start running immediately
+     * - `drop`: new TaskInstance will be dropped
+     * - `enqueue`: new TaskInstance will be enqueued for later execution
+     *
+     * @memberof Task
+     * @instance
+     * @private
+     * @readOnly
+     */
+
+    /**
+     * EXPERIMENTAL
+     *
+     * Returns true if calling .perform() right now would immediately start running
+     * the returned TaskInstance.
+     *
+     * @memberof Task
+     * @instance
+     * @private
+     * @readOnly
+     */
+
+    /**
+     * EXPERIMENTAL
+     *
+     * Returns true if calling .perform() right now would immediately cancel (drop)
+     * the returned TaskInstance.
+     *
+     * @memberof Task
+     * @instance
+     * @private
+     * @readOnly
+     */
+
+    /**
+     * EXPERIMENTAL
+     *
+     * Returns true if calling .perform() right now would enqueue the TaskInstance
+     * rather than execute immediately.
+     *
+     * @memberof Task
+     * @instance
+     * @private
+     * @readOnly
+     */
+
+    /**
+     * EXPERIMENTAL
+     *
+     * Returns true if calling .perform() right now would cause a previous task to be canceled
+     *
+     * @memberof Task
+     * @instance
+     * @private
+     * @readOnly
+     */
+
+    /**
+     * The current number of active running task instances. This
+     * number will never exceed maxConcurrency.
+     *
+     * @memberof Task
+     * @instance
+     * @readOnly
+     */
+
+    /**
+     * Cancels all running or queued `TaskInstance`s for this Task.
+     * If you're trying to cancel a specific TaskInstance (rather
+     * than all of the instances running under this task) call
+     * `.cancel()` on the specific TaskInstance.
+     *
+     * @method cancelAll
+     * @memberof Task
+     * @instance
+     */
+
+    toString: function toString() {
+      return '<Task:' + this._propertyName + '>';
+    },
+
+    _taskInstanceFactory: _emberConcurrencyTaskInstance["default"],
+
+    /**
+     * Creates a new {@linkcode TaskInstance} and attempts to run it right away.
+     * If running this task instance would increase the task's concurrency
+     * to a number greater than the task's maxConcurrency, this task
+     * instance might be immediately canceled (dropped), or enqueued
+     * to run at later time, after the currently running task(s) have finished.
+     *
+     * @method perform
+     * @memberof Task
+     * @param {*} arg* - args to pass to the task function
+     * @instance
+     *
+     * @fires TaskInstance#TASK_NAME:started
+     * @fires TaskInstance#TASK_NAME:succeeded
+     * @fires TaskInstance#TASK_NAME:errored
+     * @fires TaskInstance#TASK_NAME:canceled
+     *
+     */
+    perform: function perform() {
+      for (var _len3 = arguments.length, args = Array(_len3), _key3 = 0; _key3 < _len3; _key3++) {
+        args[_key3] = arguments[_key3];
+      }
+
+      return this._performShared(args, _emberConcurrencyTaskInstance.PERFORM_TYPE_DEFAULT, null);
+    },
+    _performShared: function _performShared(args, performType, linkedObject) {
+      var fullArgs = this._curryArgs ? [].concat(_toConsumableArray(this._curryArgs), _toConsumableArray(args)) : args;
+      var taskInstance = this._taskInstanceFactory.create({
+        fn: this.fn,
+        args: fullArgs,
+        context: this.context,
+        owner: this.context,
+        task: this,
+        _debug: this._debug,
+        _hasEnabledEvents: this._hasEnabledEvents,
+        _origin: this,
+        _performType: performType
+      });
+
+      if (performType === _emberConcurrencyTaskInstance.PERFORM_TYPE_LINKED) {
+        linkedObject._expectsLinkedYield = true;
+      }
+
+      if (this.context.isDestroying) {
+        // TODO: express this in terms of lifetimes; a task linked to
+        // a dead lifetime should immediately cancel.
+        taskInstance.cancel();
+      }
+
+      this._scheduler.schedule(taskInstance);
+      return taskInstance;
+    }
+  }, _emberConcurrencyUtils.INVOKE, function () {
+    return this.perform.apply(this, arguments);
+  }));
+
+  exports.Task = Task;
+  /**
+    A {@link TaskProperty} is the Computed Property-like object returned
+    from the {@linkcode task} function. You can call Task Modifier methods
+    on this object to configure the behavior of the {@link Task}.
+  
+    See [Managing Task Concurrency](/#/docs/task-concurrency) for an
+    overview of all the different task modifiers you can use and how
+    they impact automatic cancelation / enqueueing of task instances.
+  
+    <style>
+      .ignore-this--this-is-here-to-hide-constructor,
+      #TaskProperty { display: none }
+    </style>
+  
+    @class TaskProperty
+  */
+
+  function TaskProperty(taskFn) {
+    var tp = this;
+    _emberConcurrencyUtils._ComputedProperty.call(this, function (_propertyName) {
+      taskFn.displayName = _propertyName + ' (task)';
+      return Task.create({
+        fn: tp.taskFn,
+        context: this,
+        _origin: this,
+        _taskGroupPath: tp._taskGroupPath,
+        _scheduler: (0, _emberConcurrencyPropertyModifiersMixin.resolveScheduler)(tp, this, _emberConcurrencyTaskGroup.TaskGroup),
+        _propertyName: _propertyName,
+        _debug: tp._debug,
+        _hasEnabledEvents: tp._hasEnabledEvents
+      });
+    });
+
+    this.taskFn = taskFn;
+    this.eventNames = null;
+    this.cancelEventNames = null;
+    this._observes = null;
+  }
+
+  TaskProperty.prototype = Object.create(_emberConcurrencyUtils._ComputedProperty.prototype);
+  (0, _emberConcurrencyUtils.objectAssign)(TaskProperty.prototype, _emberConcurrencyPropertyModifiersMixin.propertyModifiers, {
+    constructor: TaskProperty,
+
+    setup: function setup(proto, taskName) {
+      if (this._maxConcurrency !== Infinity && !this._hasSetBufferPolicy) {
+        Ember.Logger.warn('The use of maxConcurrency() without a specified task modifier is deprecated and won\'t be supported in future versions of ember-concurrency. Please specify a task modifier instead, e.g. `' + taskName + ': task(...).enqueue().maxConcurrency(' + this._maxConcurrency + ')`');
+      }
+
+      registerOnPrototype(Ember.addListener, proto, this.eventNames, taskName, 'perform', false);
+      registerOnPrototype(Ember.addListener, proto, this.cancelEventNames, taskName, 'cancelAll', false);
+      registerOnPrototype(Ember.addObserver, proto, this._observes, taskName, 'perform', true);
+    },
+
+    /**
+     * Calling `task(...).on(eventName)` configures the task to be
+     * automatically performed when the specified events fire. In
+     * this way, it behaves like
+     * [Ember.on](http://emberjs.com/api/classes/Ember.html#method_on).
+     *
+     * You can use `task(...).on('init')` to perform the task
+     * when the host object is initialized.
+     *
+     * ```js
+     * export default Ember.Component.extend({
+     *   pollForUpdates: task(function * () {
+     *     // ... this runs when the Component is first created
+     *     // because we specified .on('init')
+     *   }).on('init'),
+     *
+     *   handleFoo: task(function * (a, b, c) {
+     *     // this gets performed automatically if the 'foo'
+     *     // event fires on this Component,
+     *     // e.g., if someone called component.trigger('foo')
+     *   }).on('foo'),
+     * });
+     * ```
+     *
+     * [See the Writing Tasks Docs for more info](/#/docs/writing-tasks)
+     *
+     * @method on
+     * @memberof TaskProperty
+     * @param {String} eventNames*
+     * @instance
+     */
+    on: function on() {
+      this.eventNames = this.eventNames || [];
+      this.eventNames.push.apply(this.eventNames, arguments);
+      return this;
+    },
+
+    /**
+     * This behaves like the {@linkcode TaskProperty#on task(...).on() modifier},
+     * but instead will cause the task to be canceled if any of the
+     * specified events fire on the parent object.
+     *
+     * [See the Live Example](/#/docs/examples/route-tasks/1)
+     *
+     * @method cancelOn
+     * @memberof TaskProperty
+     * @param {String} eventNames*
+     * @instance
+     */
+    cancelOn: function cancelOn() {
+      this.cancelEventNames = this.cancelEventNames || [];
+      this.cancelEventNames.push.apply(this.cancelEventNames, arguments);
+      return this;
+    },
+    observes: function observes() {
+      for (var _len4 = arguments.length, properties = Array(_len4), _key4 = 0; _key4 < _len4; _key4++) {
+        properties[_key4] = arguments[_key4];
+      }
+
+      this._observes = properties;
+      return this;
+    },
+
+    /**
+     * Configures the task to cancel old currently task instances
+     * to make room for a new one to perform. Sets default
+     * maxConcurrency to 1.
+     *
+     * [See the Live Example](/#/docs/examples/route-tasks/1)
+     *
+     * @method restartable
+     * @memberof TaskProperty
+     * @instance
+     */
+
+    /**
+     * Configures the task to run task instances one-at-a-time in
+     * the order they were `.perform()`ed. Sets default
+     * maxConcurrency to 1.
+     *
+     * @method enqueue
+     * @memberof TaskProperty
+     * @instance
+     */
+
+    /**
+     * Configures the task to immediately cancel (i.e. drop) any
+     * task instances performed when the task is already running
+     * at maxConcurrency. Sets default maxConcurrency to 1.
+     *
+     * @method drop
+     * @memberof TaskProperty
+     * @instance
+     */
+
+    /**
+     * Configures the task to drop all but the most recently
+     * performed {@linkcode TaskInstance }.
+     *
+     * @method keepLatest
+     * @memberof TaskProperty
+     * @instance
+     */
+
+    /**
+     * Sets the maximum number of task instances that are allowed
+     * to run at the same time. By default, with no task modifiers
+     * applied, this number is Infinity (there is no limit
+     * to the number of tasks that can run at the same time).
+     * {@linkcode TaskProperty#restartable .restartable()},
+     * {@linkcode TaskProperty#enqueue .enqueue()}, and
+     * {@linkcode TaskProperty#drop .drop()} set the default
+     * maxConcurrency to 1, but you can override this value
+     * to set the maximum number of concurrently running tasks
+     * to a number greater than 1.
+     *
+     * [See the AJAX Throttling example](/#/docs/examples/ajax-throttling)
+     *
+     * The example below uses a task with `maxConcurrency(3)` to limit
+     * the number of concurrent AJAX requests (for anyone using this task)
+     * to 3.
+     *
+     * ```js
+     * doSomeAjax: task(function * (url) {
+     *   return Ember.$.getJSON(url).promise();
+     * }).maxConcurrency(3),
+     *
+     * elsewhere() {
+     *   this.get('doSomeAjax').perform("http://www.example.com/json");
+     * },
+     * ```
+     *
+     * @method maxConcurrency
+     * @memberof TaskProperty
+     * @param {Number} n The maximum number of concurrently running tasks
+     * @instance
+     */
+
+    /**
+     * Adds this task to a TaskGroup so that concurrency constraints
+     * can be shared between multiple tasks.
+     *
+     * [See the Task Group docs for more information](/#/docs/task-groups)
+     *
+     * @method group
+     * @memberof TaskProperty
+     * @param {String} groupPath A path to the TaskGroup property
+     * @instance
+     */
+
+    /**
+     * Logs lifecycle events to aid in debugging unexpected Task behavior.
+     * Presently only logs cancelation events and the reason for the cancelation,
+     * e.g. "TaskInstance 'doStuff' was canceled because the object it lives on was destroyed or unrendered"
+     *
+     * @method debug
+     * @memberof TaskProperty
+     * @instance
+     */
+
+    perform: function perform() {
+      throw new Error("It looks like you tried to perform a task via `this.nameOfTask.perform()`, which isn't supported. Use `this.get('nameOfTask').perform()` instead.");
+    }
+  });
+
+  function registerOnPrototype(addListenerOrObserver, proto, names, taskName, taskMethod, once) {
+    if (names) {
+      for (var i = 0; i < names.length; ++i) {
+        var name = names[i];
+        addListenerOrObserver(proto, name, null, makeTaskCallback(taskName, taskMethod, once));
+      }
+    }
+  }
+
+  function makeTaskCallback(taskName, method, once) {
+    return function () {
+      var task = this.get(taskName);
+
+      if (once) {
+        Ember.run.scheduleOnce.apply(undefined, ['actions', task, method].concat(Array.prototype.slice.call(arguments)));
+      } else {
+        task[method].apply(task, arguments);
+      }
+    };
+  }
+});
+define('ember-concurrency/-task-state-mixin', ['exports'], function (exports) {
+  'use strict';
+
+  var alias = Ember.computed.alias;
+
+  // this is a mixin of properties/methods shared between Tasks and TaskGroups
+
+  exports['default'] = Ember.Mixin.create({
+    isRunning: Ember.computed.gt('numRunning', 0),
+    isQueued: Ember.computed.gt('numQueued', 0),
+    isIdle: Ember.computed('isRunning', 'isQueued', function () {
+      return !this.get('isRunning') && !this.get('isQueued');
+    }),
+
+    state: Ember.computed('isRunning', 'isQueued', function () {
+      if (this.get('isRunning')) {
+        return 'running';
+      } else if (this.get('isQueued')) {
+        return 'queued';
+      } else {
+        return 'idle';
+      }
+    }),
+
+    _propertyName: null,
+    _origin: null,
+    name: alias('_propertyName'),
+
+    concurrency: alias('numRunning'),
+    last: alias('_scheduler.lastStarted'),
+    lastRunning: alias('_scheduler.lastRunning'),
+    lastPerformed: alias('_scheduler.lastPerformed'),
+    lastSuccessful: alias('_scheduler.lastSuccessful'),
+    lastComplete: alias('_scheduler.lastComplete'),
+    lastErrored: alias('_scheduler.lastErrored'),
+    lastCanceled: alias('_scheduler.lastCanceled'),
+    lastIncomplete: alias('_scheduler.lastIncomplete'),
+    performCount: alias('_scheduler.performCount'),
+
+    numRunning: 0,
+    numQueued: 0,
+    _seenIndex: 0,
+
+    cancelAll: function cancelAll() {
+      var reason = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : ".cancelAll() was explicitly called on the Task";
+
+      this._scheduler.cancelAll(reason);
+    },
+
+    group: Ember.computed(function () {
+      return this._taskGroupPath && this.context.get(this._taskGroupPath);
+    }),
+
+    _scheduler: null
+
+  });
+});
+define("ember-concurrency/-wait-for", ["exports", "ember-concurrency/utils"], function (exports, _emberConcurrencyUtils) {
+  "use strict";
+
+  exports.waitForQueue = waitForQueue;
+  exports.waitForEvent = waitForEvent;
+  exports.waitForProperty = waitForProperty;
+  var _createClass = (function () {
+    function defineProperties(target, props) {
+      for (var i = 0; i < props.length; i++) {
+        var descriptor = props[i];descriptor.enumerable = descriptor.enumerable || false;descriptor.configurable = true;if ("value" in descriptor) descriptor.writable = true;Object.defineProperty(target, descriptor.key, descriptor);
+      }
+    }return function (Constructor, protoProps, staticProps) {
+      if (protoProps) defineProperties(Constructor.prototype, protoProps);if (staticProps) defineProperties(Constructor, staticProps);return Constructor;
+    };
+  })();
+
+  function _possibleConstructorReturn(self, call) {
+    if (!self) {
+      throw new ReferenceError("this hasn't been initialised - super() hasn't been called");
+    }return call && (typeof call === "object" || typeof call === "function") ? call : self;
+  }
+
+  function _inherits(subClass, superClass) {
+    if (typeof superClass !== "function" && superClass !== null) {
+      throw new TypeError("Super expression must either be null or a function, not " + typeof superClass);
+    }subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } });if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass;
+  }
+
+  function _classCallCheck(instance, Constructor) {
+    if (!(instance instanceof Constructor)) {
+      throw new TypeError("Cannot call a class as a function");
+    }
+  }
+
+  var WaitFor = (function () {
+    function WaitFor() {
+      _classCallCheck(this, WaitFor);
+    }
+
+    _createClass(WaitFor, [{
+      key: 'then',
+      value: function then() {
+        var _yieldableToPromise;
+
+        return (_yieldableToPromise = (0, _emberConcurrencyUtils.yieldableToPromise)(this)).then.apply(_yieldableToPromise, arguments);
+      }
+    }]);
+
+    return WaitFor;
+  })();
+
+  var WaitForQueueYieldable = (function (_WaitFor) {
+    _inherits(WaitForQueueYieldable, _WaitFor);
+
+    function WaitForQueueYieldable(queueName) {
+      _classCallCheck(this, WaitForQueueYieldable);
+
+      var _this = _possibleConstructorReturn(this, (WaitForQueueYieldable.__proto__ || Object.getPrototypeOf(WaitForQueueYieldable)).call(this));
+
+      _this.queueName = queueName;
+      return _this;
+    }
+
+    _createClass(WaitForQueueYieldable, [{
+      key: _emberConcurrencyUtils.yieldableSymbol,
+      value: function value(taskInstance, resumeIndex) {
+        Ember.run.schedule(this.queueName, function () {
+          taskInstance.proceed(resumeIndex, _emberConcurrencyUtils.YIELDABLE_CONTINUE, null);
+        });
+      }
+    }]);
+
+    return WaitForQueueYieldable;
+  })(WaitFor);
+
+  var WaitForEventYieldable = (function (_WaitFor2) {
+    _inherits(WaitForEventYieldable, _WaitFor2);
+
+    function WaitForEventYieldable(object, eventName) {
+      _classCallCheck(this, WaitForEventYieldable);
+
+      var _this2 = _possibleConstructorReturn(this, (WaitForEventYieldable.__proto__ || Object.getPrototypeOf(WaitForEventYieldable)).call(this));
+
+      _this2.object = object;
+      _this2.eventName = eventName;
+      return _this2;
+    }
+
+    _createClass(WaitForEventYieldable, [{
+      key: _emberConcurrencyUtils.yieldableSymbol,
+      value: function value(taskInstance, resumeIndex) {
+        var _this3 = this;
+
+        var unbind = function unbind() {};
+        var fn = function fn(event) {
+          unbind();
+          taskInstance.proceed(resumeIndex, _emberConcurrencyUtils.YIELDABLE_CONTINUE, event);
+        };
+
+        if (typeof this.object.addEventListener === 'function') {
+          // assume that we're dealing with a DOM `EventTarget`.
+          this.object.addEventListener(this.eventName, fn);
+
+          // unfortunately this is required, because IE 11 does not support the
+          // `once` option: https://caniuse.com/#feat=once-event-listener
+          unbind = function unbind() {
+            _this3.object.removeEventListener(_this3.eventName, fn);
+          };
+
+          return unbind;
+        } else {
+          // assume that we're dealing with either `Ember.Evented` or a compatible
+          // interface, like jQuery.
+          this.object.one(this.eventName, fn);
+
+          return function () {
+            _this3.object.off(_this3.eventName, fn);
+          };
+        }
+      }
+    }]);
+
+    return WaitForEventYieldable;
+  })(WaitFor);
+
+  var WaitForPropertyYieldable = (function (_WaitFor3) {
+    _inherits(WaitForPropertyYieldable, _WaitFor3);
+
+    function WaitForPropertyYieldable(object, key) {
+      var predicateCallback = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : Boolean;
+
+      _classCallCheck(this, WaitForPropertyYieldable);
+
+      var _this4 = _possibleConstructorReturn(this, (WaitForPropertyYieldable.__proto__ || Object.getPrototypeOf(WaitForPropertyYieldable)).call(this));
+
+      _this4.object = object;
+      _this4.key = key;
+
+      if (typeof predicateCallback === 'function') {
+        _this4.predicateCallback = predicateCallback;
+      } else {
+        _this4.predicateCallback = function (v) {
+          return v === predicateCallback;
+        };
+      }
+      return _this4;
+    }
+
+    _createClass(WaitForPropertyYieldable, [{
+      key: _emberConcurrencyUtils.yieldableSymbol,
+      value: function value(taskInstance, resumeIndex) {
+        var _this5 = this;
+
+        var observerFn = function observerFn() {
+          var value = Ember.get(_this5.object, _this5.key);
+          var predicateValue = _this5.predicateCallback(value);
+          if (predicateValue) {
+            taskInstance.proceed(resumeIndex, _emberConcurrencyUtils.YIELDABLE_CONTINUE, value);
+            return true;
+          }
+        };
+
+        if (!observerFn()) {
+          this.object.addObserver(this.key, null, observerFn);
+          return function () {
+            _this5.object.removeObserver(_this5.key, null, observerFn);
+          };
+        }
+      }
+    }]);
+
+    return WaitForPropertyYieldable;
+  })(WaitFor);
+
+  /**
+   * Use `waitForQueue` to pause the task until a certain run loop queue is reached.
+   *
+   * ```js
+   * import { task, waitForQueue } from 'ember-concurrency';
+   * export default Component.extend({
+   *   myTask: task(function * () {
+   *     yield waitForQueue('afterRender');
+   *     console.log("now we're in the afterRender queue");
+   *   })
+   * });
+   * ```
+   *
+   * @param {string} queueName the name of the Ember run loop queue
+   */
+
+  function waitForQueue(queueName) {
+    return new WaitForQueueYieldable(queueName);
+  }
+
+  /**
+   * Use `waitForEvent` to pause the task until an event is fired. The event
+   * can either be a jQuery event or an Ember.Evented event (or any event system
+   * where the object supports `.on()` `.one()` and `.off()`).
+   *
+   * ```js
+   * import { task, waitForEvent } from 'ember-concurrency';
+   * export default Component.extend({
+   *   myTask: task(function * () {
+   *     console.log("Please click anywhere..");
+   *     let clickEvent = yield waitForEvent($('body'), 'click');
+   *     console.log("Got event", clickEvent);
+   *
+   *     let emberEvent = yield waitForEvent(this, 'foo');
+   *     console.log("Got foo event", emberEvent);
+   *
+   *     // somewhere else: component.trigger('foo', { value: 123 });
+   *   })
+   * });
+   * ```
+   *
+   * @param {object} object the Ember Object or jQuery selector (with ,on(), .one(), and .off())
+   *                 that the event fires from
+   * @param {function} eventName the name of the event to wait for
+   */
+
+  function waitForEvent(object, eventName) {
+    true && !(0, _emberConcurrencyUtils.isEventedObject)(object) && Ember.assert(object + ' must include Ember.Evented (or support `.one()` and `.off()`) or DOM EventTarget (or support `addEventListener` and  `removeEventListener`) to be able to use `waitForEvent`', (0, _emberConcurrencyUtils.isEventedObject)(object));
+
+    return new WaitForEventYieldable(object, eventName);
+  }
+
+  /**
+   * Use `waitForProperty` to pause the task until a property on an object
+   * changes to some expected value. This can be used for a variety of use
+   * cases, including synchronizing with another task by waiting for it
+   * to become idle, or change state in some other way. If you omit the
+   * callback, `waitForProperty` will resume execution when the observed
+   * property becomes truthy. If you provide a callback, it'll be called
+   * immediately with the observed property's current value, and multiple
+   * times thereafter whenever the property changes, until you return
+   * a truthy value from the callback, or the current task is canceled.
+   * You can also pass in a non-Function value in place of the callback,
+   * in which case the task will continue executing when the property's
+   * value becomes the value that you passed in.
+   *
+   * ```js
+   * import { task, waitForProperty } from 'ember-concurrency';
+   * export default Component.extend({
+   *   foo: 0,
+   *
+   *   myTask: task(function * () {
+   *     console.log("Waiting for `foo` to become 5");
+   *
+   *     yield waitForProperty(this, 'foo', v => v === 5);
+   *     // alternatively: yield waitForProperty(this, 'foo', 5);
+   *
+   *     // somewhere else: this.set('foo', 5)
+   *
+   *     console.log("`foo` is 5!");
+   *
+   *     // wait for another task to be idle before running:
+   *     yield waitForProperty(this, 'otherTask.isIdle');
+   *     console.log("otherTask is idle!");
+   *   })
+   * });
+   * ```
+   *
+   * @param {object} object an object (most likely an Ember Object)
+   * @param {string} key the property name that is observed for changes
+   * @param {function} callbackOrValue a Function that should return a truthy value
+   *                                   when the task should continue executing, or
+   *                                   a non-Function value that the watched property
+   *                                   needs to equal before the task will continue running
+   */
+
+  function waitForProperty(object, key, predicateCallback) {
+    return new WaitForPropertyYieldable(object, key, predicateCallback);
+  }
+});
+define('ember-concurrency/helpers/cancel-all', ['exports', 'ember-concurrency/-helpers'], function (exports, _emberConcurrencyHelpers) {
+  'use strict';
+
+  exports.cancelHelper = cancelHelper;
+
+  var CANCEL_REASON = "the 'cancel-all' template helper was invoked";
+
+  function cancelHelper(args) {
+    var cancelable = args[0];
+    if (!cancelable || typeof cancelable.cancelAll !== 'function') {
+      true && !false && Ember.assert('The first argument passed to the `cancel-all` helper should be a Task or TaskGroup (without quotes); you passed ' + cancelable, false);
+    }
+
+    return (0, _emberConcurrencyHelpers.taskHelperClosure)('cancel-all', 'cancelAll', [cancelable, CANCEL_REASON]);
+  }
+
+  exports['default'] = Ember.Helper.helper(cancelHelper);
+});
+define('ember-concurrency/helpers/perform', ['exports', 'ember-concurrency/-helpers'], function (exports, _emberConcurrencyHelpers) {
+  'use strict';
+
+  exports.performHelper = performHelper;
+
+  function performHelper(args, hash) {
+    return (0, _emberConcurrencyHelpers.taskHelperClosure)('perform', 'perform', args, hash);
+  }
+
+  exports['default'] = Ember.Helper.helper(performHelper);
+});
+define("ember-concurrency/helpers/task", ["exports"], function (exports) {
+    "use strict";
+
+    function _toConsumableArray(arr) {
+        if (Array.isArray(arr)) {
+            for (var i = 0, arr2 = Array(arr.length); i < arr.length; i++) {
+                arr2[i] = arr[i];
+            }return arr2;
+        } else {
+            return Array.from(arr);
+        }
+    }
+
+    function _toArray(arr) {
+        return Array.isArray(arr) ? arr : Array.from(arr);
+    }
+
+    function taskHelper(_ref) {
+        var _ref2 = _toArray(_ref),
+            task = _ref2[0],
+            args = _ref2.slice(1);
+
+        return task._curry.apply(task, _toConsumableArray(args));
+    }
+
+    exports["default"] = Ember.Helper.helper(taskHelper);
+});
+define('ember-concurrency/index', ['exports', 'ember-concurrency/utils', 'ember-concurrency/-task-property', 'ember-concurrency/-task-instance', 'ember-concurrency/-task-group', 'ember-concurrency/-cancelable-promise-helpers', 'ember-concurrency/-wait-for'], function (exports, _emberConcurrencyUtils, _emberConcurrencyTaskProperty, _emberConcurrencyTaskInstance, _emberConcurrencyTaskGroup, _emberConcurrencyCancelablePromiseHelpers, _emberConcurrencyWaitFor) {
+  'use strict';
+
+  exports.task = task;
+  exports.taskGroup = taskGroup;
+
+  /**
+   * A Task is a cancelable, restartable, asynchronous operation that
+   * is driven by a generator function. Tasks are automatically canceled
+   * when the object they live on is destroyed (e.g. a Component
+   * is unrendered).
+   *
+   * To define a task, use the `task(...)` function, and pass in
+   * a generator function, which will be invoked when the task
+   * is performed. The reason generator functions are used is
+   * that they (like the proposed ES7 async-await syntax) can
+   * be used to elegantly express asynchronous, cancelable
+   * operations.
+   *
+   * You can also define an
+   * <a href="/#/docs/encapsulated-task">Encapsulated Task</a>
+   * by passing in an object that defined a `perform` generator
+   * function property.
+   *
+   * The following Component defines a task called `myTask` that,
+   * when performed, prints a message to the console, sleeps for 1 second,
+   * prints a final message to the console, and then completes.
+   *
+   * ```js
+   * import { task, timeout } from 'ember-concurrency';
+   * export default Component.extend({
+   *   myTask: task(function * () {
+   *     console.log("Pausing for a second...");
+   *     yield timeout(1000);
+   *     console.log("Done!");
+   *   })
+   * });
+   * ```
+   *
+   * ```hbs
+   * <button {{action myTask.perform}}>Perform Task</button>
+   * ```
+   *
+   * By default, tasks have no concurrency constraints
+   * (multiple instances of a task can be running at the same time)
+   * but much of a power of tasks lies in proper usage of Task Modifiers
+   * that you can apply to a task.
+   *
+   * @param {function} generatorFunction the generator function backing the task.
+   * @returns {TaskProperty}
+   */
+
+  function task() {
+    for (var _len = arguments.length, args = Array(_len), _key = 0; _key < _len; _key++) {
+      args[_key] = arguments[_key];
+    }
+
+    return new (Function.prototype.bind.apply(_emberConcurrencyTaskProperty.TaskProperty, [null].concat(args)))();
+  }
+
+  /**
+   * "Task Groups" provide a means for applying
+   * task modifiers to groups of tasks. Once a {@linkcode Task} is declared
+   * as part of a group task, modifiers like `drop()` or `restartable()`
+   * will no longer affect the individual `Task`. Instead those
+   * modifiers can be applied to the entire group.
+   *
+   * ```js
+   * import { task, taskGroup } from 'ember-concurrency';
+   *
+   * export default Controller.extend({
+   *   chores: taskGroup().drop(),
+   *
+   *   mowLawn:       task(taskFn).group('chores'),
+   *   doDishes:      task(taskFn).group('chores'),
+   *   changeDiapers: task(taskFn).group('chores')
+   * });
+   * ```
+   *
+   * @returns {TaskGroup}
+  */
+
+  function taskGroup() {
+    for (var _len2 = arguments.length, args = Array(_len2), _key2 = 0; _key2 < _len2; _key2++) {
+      args[_key2] = arguments[_key2];
+    }
+
+    return new (Function.prototype.bind.apply(_emberConcurrencyTaskGroup.TaskGroupProperty, [null].concat(args)))();
+  }
+
+  exports.all = _emberConcurrencyCancelablePromiseHelpers.all;
+  exports.allSettled = _emberConcurrencyCancelablePromiseHelpers.allSettled;
+  exports.didCancel = _emberConcurrencyTaskInstance.didCancel;
+  exports.hash = _emberConcurrencyCancelablePromiseHelpers.hash;
+  exports.race = _emberConcurrencyCancelablePromiseHelpers.race;
+  exports.timeout = _emberConcurrencyUtils.timeout;
+  exports.waitForQueue = _emberConcurrencyWaitFor.waitForQueue;
+  exports.waitForEvent = _emberConcurrencyWaitFor.waitForEvent;
+  exports.waitForProperty = _emberConcurrencyWaitFor.waitForProperty;
+});
+define('ember-concurrency/initializers/ember-concurrency', ['exports', 'ember-concurrency'], function (exports, _emberConcurrency) {
+  // This initializer exists only to make sure that the following
+  // imports happen before the app boots.
+  'use strict';
+
+  exports['default'] = {
+    name: 'ember-concurrency',
+    initialize: function initialize() {}
+  };
+});
+define('ember-concurrency/utils', ['exports'], function (exports) {
+  'use strict';
+
+  exports.isEventedObject = isEventedObject;
+  exports.Arguments = Arguments;
+  exports._cleanupOnDestroy = _cleanupOnDestroy;
+  exports.timeout = timeout;
+  exports.RawValue = RawValue;
+  exports.raw = raw;
+  exports.rawTimeout = rawTimeout;
+  exports.yieldableToPromise = yieldableToPromise;
+  function _defineProperty(obj, key, value) {
+    if (key in obj) {
+      Object.defineProperty(obj, key, { value: value, enumerable: true, configurable: true, writable: true });
+    } else {
+      obj[key] = value;
+    }return obj;
+  }
+
+  function isEventedObject(c) {
+    return c && (typeof c.one === 'function' && typeof c.off === 'function' || typeof c.addEventListener === 'function' && typeof c.removeEventListener === 'function');
+  }
+
+  function Arguments(args, defer) {
+    this.args = args;
+    this.defer = defer;
+  }
+
+  Arguments.prototype.resolve = function (value) {
+    if (this.defer) {
+      this.defer.resolve(value);
+    }
+  };
+
+  var objectAssign = Object.assign || function objectAssign(target) {
+    'use strict';
+
+    if (target == null) {
+      throw new TypeError('Cannot convert undefined or null to object');
+    }
+
+    target = Object(target);
+    for (var index = 1; index < arguments.length; index++) {
+      var source = arguments[index];
+      if (source != null) {
+        for (var key in source) {
+          if (Object.prototype.hasOwnProperty.call(source, key)) {
+            target[key] = source[key];
+          }
+        }
+      }
+    }
+    return target;
+  };
+
+  exports.objectAssign = objectAssign;
+
+  function _cleanupOnDestroy(owner, object, cleanupMethodName) {
+    for (var _len = arguments.length, args = Array(_len > 3 ? _len - 3 : 0), _key = 3; _key < _len; _key++) {
+      args[_key - 3] = arguments[_key];
+    }
+
+    // TODO: find a non-mutate-y, non-hacky way of doing this.
+
+    if (!owner.willDestroy) {
+      // we're running in non Ember object (possibly in a test mock)
+      return;
+    }
+
+    if (!owner.willDestroy.__ember_processes_destroyers__) {
+      var oldWillDestroy = owner.willDestroy;
+      var disposers = [];
+
+      owner.willDestroy = function () {
+        for (var i = 0, l = disposers.length; i < l; i++) {
+          disposers[i]();
+        }
+        oldWillDestroy.apply(owner, arguments);
+      };
+      owner.willDestroy.__ember_processes_destroyers__ = disposers;
+    }
+
+    owner.willDestroy.__ember_processes_destroyers__.push(function () {
+      object[cleanupMethodName].apply(object, args);
+    });
+  }
+
+  var INVOKE = "__invoke_symbol__";
+
+  exports.INVOKE = INVOKE;
+  var locations = ['ember-glimmer/helpers/action', 'ember-routing-htmlbars/keywords/closure-action', 'ember-routing/keywords/closure-action'];
+
+  for (var i = 0; i < locations.length; i++) {
+    if (locations[i] in Ember.__loader.registry) {
+      exports.INVOKE = INVOKE = Ember.__loader.require(locations[i])['INVOKE'];
+      break;
+    }
+  }
+
+  // TODO: Symbol polyfill?
+  var yieldableSymbol = "__ec_yieldable__";
+  exports.yieldableSymbol = yieldableSymbol;
+  var YIELDABLE_CONTINUE = "next";
+  exports.YIELDABLE_CONTINUE = YIELDABLE_CONTINUE;
+  var YIELDABLE_THROW = "throw";
+  exports.YIELDABLE_THROW = YIELDABLE_THROW;
+  var YIELDABLE_RETURN = "return";
+  exports.YIELDABLE_RETURN = YIELDABLE_RETURN;
+  var YIELDABLE_CANCEL = "cancel";
+
+  exports.YIELDABLE_CANCEL = YIELDABLE_CANCEL;
+  var _ComputedProperty = Ember.ComputedProperty;
+
+  exports._ComputedProperty = _ComputedProperty;
+  /**
+   *
+   * Yielding `timeout(ms)` will pause a task for the duration
+   * of time passed in, in milliseconds.
+   *
+   * The task below, when performed, will print a message to the
+   * console every second.
+   *
+   * ```js
+   * export default Component.extend({
+   *   myTask: task(function * () {
+   *     while (true) {
+   *       console.log("Hello!");
+   *       yield timeout(1000);
+   *     }
+   *   })
+   * });
+   * ```
+   *
+   * @param {number} ms - the amount of time to sleep before resuming
+   *   the task, in milliseconds
+   */
+
+  function timeout(ms) {
+    var timerId = void 0;
+    var promise = new Ember.RSVP.Promise(function (r) {
+      timerId = Ember.run.later(r, ms);
+    });
+    promise.__ec_cancel__ = function () {
+      Ember.run.cancel(timerId);
+    };
+    return promise;
+  }
+
+  function RawValue(value) {
+    this.value = value;
+  }
+
+  function raw(value) {
+    return new RawValue(value);
+  }
+
+  function rawTimeout(ms) {
+    return _defineProperty({}, yieldableSymbol, function (taskInstance, resumeIndex) {
+      var _this = this;
+
+      var timerId = setTimeout(function () {
+        taskInstance.proceed(resumeIndex, YIELDABLE_CONTINUE, _this._result);
+      }, ms);
+      return function () {
+        window.clearInterval(timerId);
+      };
+    });
+  }
+
+  function yieldableToPromise(yieldable) {
+    var def = Ember.RSVP.defer();
+
+    def.promise.__ec_cancel__ = yieldable[yieldableSymbol]({
+      proceed: function proceed(_index, resumeType, value) {
+        if (resumeType == YIELDABLE_CONTINUE || resumeType == YIELDABLE_RETURN) {
+          def.resolve(value);
+        } else {
+          def.reject(value);
+        }
+      }
+    }, 0);
+
+    return def.promise;
+  }
 });
 define('ember-data/-debug/index', ['exports'], function (exports) {
   'use strict';
@@ -79496,6 +102971,16 @@ define("ember-data/version", ["exports"], function (exports) {
 
   exports["default"] = "2.18.2";
 });
+define('ember-get-config/index', ['exports', 'kalebr-frontend/config/environment'], function (exports, _kalebrFrontendConfigEnvironment) {
+  'use strict';
+
+  Object.defineProperty(exports, 'default', {
+    enumerable: true,
+    get: function get() {
+      return _kalebrFrontendConfigEnvironment['default'];
+    }
+  });
+});
 define("ember-getowner-polyfill/index", ["exports", "ember"], function (exports, _ember) {
   "use strict";
 
@@ -80062,6 +103547,1082 @@ define('ember-load-initializers/index', ['exports', 'ember'], function (exports,
       }
     });
   };
+});
+define("ember-popper/components/ember-popper-base", ["exports", "@ember-decorators/argument/-debug/validated-component", "ember-popper/templates/components/ember-popper", "@ember-decorators/argument/types", "@ember-decorators/object", "@ember-decorators/argument", "ember-raf-scheduler", "@ember-decorators/component", "@ember-decorators/argument/type"], function (exports, _emberDecoratorsArgumentDebugValidatedComponent, _emberPopperTemplatesComponentsEmberPopper, _emberDecoratorsArgumentTypes, _emberDecoratorsObject, _emberDecoratorsArgument, _emberRafScheduler, _emberDecoratorsComponent, _emberDecoratorsArgumentType) {
+  "use strict";
+
+  var _createClass = (function () {
+    function defineProperties(target, props) {
+      for (var i = 0; i < props.length; i++) {
+        var descriptor = props[i];descriptor.enumerable = descriptor.enumerable || false;descriptor.configurable = true;if ("value" in descriptor) descriptor.writable = true;Object.defineProperty(target, descriptor.key, descriptor);
+      }
+    }return function (Constructor, protoProps, staticProps) {
+      if (protoProps) defineProperties(Constructor.prototype, protoProps);if (staticProps) defineProperties(Constructor, staticProps);return Constructor;
+    };
+  })();
+
+  var _get = function get(_x, _x2, _x3) {
+    var _again = true;
+
+    _function: while (_again) {
+      var object = _x,
+          property = _x2,
+          receiver = _x3;
+      _again = false;
+      if (object === null) object = Function.prototype;var desc = Object.getOwnPropertyDescriptor(object, property);if (desc === undefined) {
+        var parent = Object.getPrototypeOf(object);if (parent === null) {
+          return undefined;
+        } else {
+          _x = parent;
+          _x2 = property;
+          _x3 = receiver;
+          _again = true;
+          desc = parent = undefined;
+          continue _function;
+        }
+      } else if ("value" in desc) {
+        return desc.value;
+      } else {
+        var getter = desc.get;if (getter === undefined) {
+          return undefined;
+        }return getter.call(receiver);
+      }
+    }
+  };
+
+  var _dec, _dec2, _dec3, _dec4, _dec5, _dec6, _dec7, _dec8, _dec9, _dec10, _dec11, _dec12, _dec13, _dec14, _dec15, _class, _desc, _value, _class2, _descriptor, _descriptor2, _descriptor3, _descriptor4, _descriptor5, _descriptor6, _descriptor7, _descriptor8;
+
+  function _initDefineProp(target, property, descriptor, context) {
+    if (!descriptor) return;
+    Object.defineProperty(target, property, {
+      enumerable: descriptor.enumerable,
+      configurable: descriptor.configurable,
+      writable: descriptor.writable,
+      value: descriptor.initializer ? descriptor.initializer.call(context) : void 0
+    });
+  }
+
+  function _classCallCheck(instance, Constructor) {
+    if (!(instance instanceof Constructor)) {
+      throw new TypeError("Cannot call a class as a function");
+    }
+  }
+
+  function _possibleConstructorReturn(self, call) {
+    if (!self) {
+      throw new ReferenceError("this hasn't been initialised - super() hasn't been called");
+    }return call && (typeof call === "object" || typeof call === "function") ? call : self;
+  }
+
+  function _inherits(subClass, superClass) {
+    if (typeof superClass !== "function" && superClass !== null) {
+      throw new TypeError("Super expression must either be null or a function, not " + typeof superClass);
+    }subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } });if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass;
+  }
+
+  function _applyDecoratedDescriptor(target, property, decorators, descriptor, context) {
+    var desc = {};
+    Object['ke' + 'ys'](descriptor).forEach(function (key) {
+      desc[key] = descriptor[key];
+    });
+    desc.enumerable = !!desc.enumerable;
+    desc.configurable = !!desc.configurable;
+
+    if ('value' in desc || desc.initializer) {
+      desc.writable = true;
+    }
+
+    desc = decorators.slice().reverse().reduce(function (desc, decorator) {
+      return decorator(target, property, desc) || desc;
+    }, desc);
+
+    if (context && desc.initializer !== void 0) {
+      desc.value = desc.initializer ? desc.initializer.call(context) : void 0;
+      desc.initializer = undefined;
+    }
+
+    if (desc.initializer === void 0) {
+      Object['define' + 'Property'](target, property, desc);
+      desc = null;
+    }
+
+    return desc;
+  }
+
+  function _initializerWarningHelper(descriptor, context) {
+    throw new Error('Decorating class property failed. Please ensure that transform-class-properties is enabled.');
+  }
+
+  var Selector = (0, _emberDecoratorsArgumentType.unionOf)('string', _emberDecoratorsArgumentTypes.Element);
+
+  var EmberPopperBase = (_dec = (0, _emberDecoratorsComponent.tagName)(''), _dec2 = (0, _emberDecoratorsArgument.argument)({ defaultIfUndefined: true }), _dec3 = (0, _emberDecoratorsArgumentType.type)('boolean'), _dec4 = (0, _emberDecoratorsArgumentType.type)((0, _emberDecoratorsArgumentType.optional)('object')), _dec5 = (0, _emberDecoratorsArgumentType.type)((0, _emberDecoratorsArgumentType.optional)(Function)), _dec6 = (0, _emberDecoratorsArgumentType.type)((0, _emberDecoratorsArgumentType.optional)(Function)), _dec7 = (0, _emberDecoratorsArgument.argument)({ defaultIfUndefined: true }), _dec8 = (0, _emberDecoratorsArgumentType.type)('string'), _dec9 = (0, _emberDecoratorsArgument.argument)({ defaultIfUndefined: true }), _dec10 = (0, _emberDecoratorsArgumentType.type)(Selector), _dec11 = (0, _emberDecoratorsArgumentType.type)((0, _emberDecoratorsArgumentType.optional)(_emberDecoratorsArgumentTypes.Action)), _dec12 = (0, _emberDecoratorsArgument.argument)({ defaultIfUndefined: true }), _dec13 = (0, _emberDecoratorsArgumentType.type)('boolean'), _dec14 = (0, _emberDecoratorsObject.computed)('_renderInPlace', 'popperContainer'), _dec15 = (0, _emberDecoratorsObject.computed)('renderInPlace'), _dec(_class = (_class2 = (function (_Component) {
+    _inherits(EmberPopperBase, _Component);
+
+    function EmberPopperBase() {
+      var _ref;
+
+      var _temp, _this, _ret;
+
+      _classCallCheck(this, EmberPopperBase);
+
+      for (var _len = arguments.length, args = Array(_len), _key = 0; _key < _len; _key++) {
+        args[_key] = arguments[_key];
+      }
+
+      return _ret = (_temp = (_this = _possibleConstructorReturn(this, (_ref = EmberPopperBase.__proto__ || Object.getPrototypeOf(EmberPopperBase)).call.apply(_ref, [this].concat(args))), _this), _this.layout = _emberPopperTemplatesComponentsEmberPopper["default"], _initDefineProp(_this, 'eventsEnabled', _descriptor, _this), _initDefineProp(_this, 'modifiers', _descriptor2, _this), _initDefineProp(_this, 'onCreate', _descriptor3, _this), _initDefineProp(_this, 'onUpdate', _descriptor4, _this), _initDefineProp(_this, 'placement', _descriptor5, _this), _initDefineProp(_this, 'popperContainer', _descriptor6, _this), _initDefineProp(_this, 'registerAPI', _descriptor7, _this), _initDefineProp(_this, 'renderInPlace', _descriptor8, _this), _this._didRenderInPlace = false, _this._eventsEnabled = null, _this._initialParentNode = null, _this._modifiers = null, _this._onCreate = null, _this._onUpdate = null, _this._placement = null, _this._popper = null, _this._popperTarget = null, _this._publicAPI = null, _this._updateRAF = null, _temp), _possibleConstructorReturn(_this, _ret);
+    }
+
+    // ================== PUBLIC CONFIG OPTIONS ==================
+
+    /**
+     * Whether event listeners, resize and scroll, for repositioning the popper are initially enabled.
+     */
+
+    /**
+     * Modifiers that will be merged into the Popper instance's options hash.
+     * https://popper.js.org/popper-documentation.html#Popper.DEFAULTS
+     */
+
+    /**
+     * onCreate callback merged (if present) into the Popper instance's options hash.
+     * https://popper.js.org/popper-documentation.html#Popper.Defaults.onCreate
+     */
+
+    /**
+     * onUpdate callback merged (if present) into the Popper instance's options hash.
+     * https://popper.js.org/popper-documentation.html#Popper.Defaults.onUpdate
+     */
+
+    /**
+     * Placement of the popper. One of ['top', 'right', 'bottom', 'left'].
+     */
+
+    /**
+     * The popper element needs to be moved higher in the DOM tree to avoid z-index issues.
+     * See the block-comment in the template for more details. `.ember-application` is applied
+     * to the root element of the ember app by default, so we move it up to there.
+     */
+
+    /**
+     * An optional function to be called when a new target is located.
+     * The target is passed in as an argument to the function.
+     */
+
+    /**
+     * If `true`, the popper element will not be moved to popperContainer. WARNING: This can cause
+     * z-index issues where your popper will be overlapped by DOM elements that aren't nested as
+     * deeply in the DOM tree.
+     */
+
+    // ================== PRIVATE PROPERTIES ==================
+
+    /**
+     * Tracks current/previous state of `_renderInPlace`.
+     */
+
+    /**
+     * Tracks current/previous value of `eventsEnabled` option
+     */
+
+    /**
+     * Parent of the element on didInsertElement, before it may have been moved
+     */
+
+    /**
+     * Tracks current/previous value of `modifiers` option
+     */
+
+    /**
+     * Tracks current/previous value of `onCreate` callback
+     */
+
+    /**
+     * Tracks current/previous value of `onUpdate` callback
+     */
+
+    /**
+     * Tracks current/previous value of `placement` option
+     */
+
+    /**
+     * Set in didInsertElement() once the Popper is initialized.
+     * Passed to consumers via a named yield.
+     */
+
+    /**
+     * Tracks current/previous value of popper target
+     */
+
+    /**
+     * Public API of the popper sent to external components in `registerAPI`
+     */
+
+    /**
+     * ID for the requestAnimationFrame used for updates, used to cancel
+     * the RAF on component destruction
+     */
+
+    _createClass(EmberPopperBase, [{
+      key: 'didRender',
+
+      // ================== LIFECYCLE HOOKS ==================
+
+      value: function didRender() {
+        this._updatePopper();
+      }
+    }, {
+      key: 'willDestroyElement',
+      value: function willDestroyElement() {
+        _get(EmberPopperBase.prototype.__proto__ || Object.getPrototypeOf(EmberPopperBase.prototype), 'willDestroyElement', this).apply(this, arguments);
+
+        this._popper.destroy();
+        _emberRafScheduler.scheduler.forget(this._updateRAF);
+      }
+
+      /**
+       * ================== ACTIONS ==================
+       */
+
+    }, {
+      key: 'update',
+      value: function update() {
+        this._popper.update();
+      }
+    }, {
+      key: 'scheduleUpdate',
+      value: function scheduleUpdate() {
+        var _this2 = this;
+
+        if (this._updateRAF !== null) {
+          return;
+        }
+
+        this._updateRAF = _emberRafScheduler.scheduler.schedule('affect', function () {
+          _this2._updateRAF = null;
+          _this2._popper.update();
+        });
+      }
+    }, {
+      key: 'enableEventListeners',
+      value: function enableEventListeners() {
+        this._popper.enableEventListeners();
+      }
+    }, {
+      key: 'disableEventListeners',
+      value: function disableEventListeners() {
+        this._popper.disableEventListeners();
+      }
+
+      // ================== PRIVATE IMPLEMENTATION DETAILS ==================
+
+    }, {
+      key: '_updatePopper',
+      value: function _updatePopper() {
+        if (this.isDestroying || this.isDestroyed) {
+          return;
+        }
+
+        var eventsEnabled = this.get('eventsEnabled');
+        var modifiers = this.get('modifiers');
+        var onCreate = this.get('onCreate');
+        var onUpdate = this.get('onUpdate');
+        var placement = this.get('placement');
+        var popperTarget = this._getPopperTarget();
+        var renderInPlace = this.get('_renderInPlace');
+
+        // Compare against previous values to see if anything has changed
+        var didChange = renderInPlace !== this._didRenderInPlace || popperTarget !== this._popperTarget || eventsEnabled !== this._eventsEnabled || modifiers !== this._modifiers || placement !== this._placement || onCreate !== this._onCreate || onUpdate !== this._onUpdate;
+
+        if (didChange === true) {
+          if (this._popper !== null) {
+            this._popper.destroy();
+          }
+
+          var popperElement = this._getPopperElement();
+
+          // Store current values to check against on updates
+          this._didRenderInPlace = renderInPlace;
+          this._eventsEnabled = eventsEnabled;
+          this._modifiers = modifiers;
+          this._onCreate = onCreate;
+          this._onUpdate = onUpdate;
+          this._placement = placement;
+          this._popperTarget = popperTarget;
+
+          var options = {
+            eventsEnabled: eventsEnabled,
+            modifiers: modifiers,
+            placement: placement
+          };
+
+          if (onCreate) {
+            true && !(typeof onCreate === 'function') && Ember.assert('onCreate of ember-popper must be a function', typeof onCreate === 'function');
+
+            options.onCreate = onCreate;
+          }
+
+          if (onUpdate) {
+            true && !(typeof onUpdate === 'function') && Ember.assert('onUpdate of ember-popper must be a function', typeof onUpdate === 'function');
+
+            options.onUpdate = onUpdate;
+          }
+
+          this._popper = new Popper(popperTarget, popperElement, options);
+
+          // Execute the registerAPI hook last to ensure the Popper is initialized on the target
+          if (this.get('registerAPI') !== null) {
+            /* eslint-disable ember/closure-actions */
+            this.sendAction('registerAPI', this._getPublicAPI());
+          }
+        }
+      }
+
+      /**
+       * Used to get the popper element
+       */
+
+    }, {
+      key: '_getPopperElement',
+      value: function _getPopperElement() {
+        return self.document.getElementById(this.id);
+      }
+    }, {
+      key: '_getPopperTarget',
+      value: function _getPopperTarget() {
+        return this.get('popperTarget');
+      }
+    }, {
+      key: '_getPublicAPI',
+      value: function _getPublicAPI() {
+        if (this._publicAPI === null) {
+          // bootstrap the public API with fields that are guaranteed to be static,
+          // such as imperative actions
+          this._publicAPI = {
+            disableEventListeners: this.disableEventListeners.bind(this),
+            enableEventListeners: this.enableEventListeners.bind(this),
+            scheduleUpdate: this.scheduleUpdate.bind(this),
+            update: this.update.bind(this)
+          };
+        }
+
+        this._publicAPI.popperElement = this._getPopperElement();
+        this._publicAPI.popperTarget = this._popperTarget;
+
+        return this._publicAPI;
+      }
+    }, {
+      key: '_popperContainer',
+      get: function get() {
+        var renderInPlace = this.get('_renderInPlace');
+        var maybeContainer = this.get('popperContainer');
+
+        var popperContainer = void 0;
+
+        if (renderInPlace) {
+          popperContainer = this._initialParentNode;
+        } else if (maybeContainer instanceof _emberDecoratorsArgumentTypes.Element) {
+          popperContainer = maybeContainer;
+        } else if (typeof maybeContainer === 'string') {
+          var selector = maybeContainer;
+          var possibleContainers = self.document.querySelectorAll(selector);
+
+          true && !(possibleContainers.length === 1) && Ember.assert('ember-popper with popperContainer selector "' + selector + '" found ' + (possibleContainers.length + ' possible containers when there should be exactly 1'), possibleContainers.length === 1);
+
+          popperContainer = possibleContainers[0];
+        }
+
+        return popperContainer;
+      }
+    }, {
+      key: '_renderInPlace',
+      get: function get() {
+        // self.document is undefined in Fastboot, so we have to render in
+        // place for the popper to show up at all.
+        return self.document ? !!this.get('renderInPlace') : true;
+      }
+    }]);
+
+    return EmberPopperBase;
+  })(_emberDecoratorsArgumentDebugValidatedComponent["default"]), (_descriptor = _applyDecoratedDescriptor(_class2.prototype, 'eventsEnabled', [_dec2, _dec3], {
+    enumerable: true,
+    initializer: function initializer() {
+      return true;
+    }
+  }), _descriptor2 = _applyDecoratedDescriptor(_class2.prototype, 'modifiers', [_emberDecoratorsArgument.argument, _dec4], {
+    enumerable: true,
+    initializer: function initializer() {
+      return null;
+    }
+  }), _descriptor3 = _applyDecoratedDescriptor(_class2.prototype, 'onCreate', [_emberDecoratorsArgument.argument, _dec5], {
+    enumerable: true,
+    initializer: function initializer() {
+      return null;
+    }
+  }), _descriptor4 = _applyDecoratedDescriptor(_class2.prototype, 'onUpdate', [_emberDecoratorsArgument.argument, _dec6], {
+    enumerable: true,
+    initializer: function initializer() {
+      return null;
+    }
+  }), _descriptor5 = _applyDecoratedDescriptor(_class2.prototype, 'placement', [_dec7, _dec8], {
+    enumerable: true,
+    initializer: function initializer() {
+      return 'bottom';
+    }
+  }), _descriptor6 = _applyDecoratedDescriptor(_class2.prototype, 'popperContainer', [_dec9, _dec10], {
+    enumerable: true,
+    initializer: function initializer() {
+      return '.ember-application';
+    }
+  }), _descriptor7 = _applyDecoratedDescriptor(_class2.prototype, 'registerAPI', [_emberDecoratorsArgument.argument, _dec11], {
+    enumerable: true,
+    initializer: function initializer() {
+      return null;
+    }
+  }), _descriptor8 = _applyDecoratedDescriptor(_class2.prototype, 'renderInPlace', [_dec12, _dec13], {
+    enumerable: true,
+    initializer: function initializer() {
+      return false;
+    }
+  }), _applyDecoratedDescriptor(_class2.prototype, 'update', [_emberDecoratorsObject.action], Object.getOwnPropertyDescriptor(_class2.prototype, 'update'), _class2.prototype), _applyDecoratedDescriptor(_class2.prototype, 'scheduleUpdate', [_emberDecoratorsObject.action], Object.getOwnPropertyDescriptor(_class2.prototype, 'scheduleUpdate'), _class2.prototype), _applyDecoratedDescriptor(_class2.prototype, 'enableEventListeners', [_emberDecoratorsObject.action], Object.getOwnPropertyDescriptor(_class2.prototype, 'enableEventListeners'), _class2.prototype), _applyDecoratedDescriptor(_class2.prototype, 'disableEventListeners', [_emberDecoratorsObject.action], Object.getOwnPropertyDescriptor(_class2.prototype, 'disableEventListeners'), _class2.prototype), _applyDecoratedDescriptor(_class2.prototype, '_popperContainer', [_dec14], Object.getOwnPropertyDescriptor(_class2.prototype, '_popperContainer'), _class2.prototype), _applyDecoratedDescriptor(_class2.prototype, '_renderInPlace', [_dec15], Object.getOwnPropertyDescriptor(_class2.prototype, '_renderInPlace'), _class2.prototype)), _class2)) || _class);
+  exports["default"] = EmberPopperBase;
+});
+define("ember-popper/components/ember-popper-targeting-parent", ["exports", "ember-popper/components/ember-popper-base", "@ember-decorators/argument", "@ember-decorators/object", "@ember-decorators/component", "@ember-decorators/argument/type"], function (exports, _emberPopperComponentsEmberPopperBase, _emberDecoratorsArgument, _emberDecoratorsObject, _emberDecoratorsComponent, _emberDecoratorsArgumentType) {
+  "use strict";
+
+  var _createClass = (function () {
+    function defineProperties(target, props) {
+      for (var i = 0; i < props.length; i++) {
+        var descriptor = props[i];descriptor.enumerable = descriptor.enumerable || false;descriptor.configurable = true;if ("value" in descriptor) descriptor.writable = true;Object.defineProperty(target, descriptor.key, descriptor);
+      }
+    }return function (Constructor, protoProps, staticProps) {
+      if (protoProps) defineProperties(Constructor.prototype, protoProps);if (staticProps) defineProperties(Constructor, staticProps);return Constructor;
+    };
+  })();
+
+  var _get = function get(_x, _x2, _x3) {
+    var _again = true;
+
+    _function: while (_again) {
+      var object = _x,
+          property = _x2,
+          receiver = _x3;
+      _again = false;
+      if (object === null) object = Function.prototype;var desc = Object.getOwnPropertyDescriptor(object, property);if (desc === undefined) {
+        var parent = Object.getPrototypeOf(object);if (parent === null) {
+          return undefined;
+        } else {
+          _x = parent;
+          _x2 = property;
+          _x3 = receiver;
+          _again = true;
+          desc = parent = undefined;
+          continue _function;
+        }
+      } else if ("value" in desc) {
+        return desc.value;
+      } else {
+        var getter = desc.get;if (getter === undefined) {
+          return undefined;
+        }return getter.call(receiver);
+      }
+    }
+  };
+
+  var _dec, _dec2, _dec3, _class, _desc, _value, _class2, _descriptor;
+
+  function _initDefineProp(target, property, descriptor, context) {
+    if (!descriptor) return;
+    Object.defineProperty(target, property, {
+      enumerable: descriptor.enumerable,
+      configurable: descriptor.configurable,
+      writable: descriptor.writable,
+      value: descriptor.initializer ? descriptor.initializer.call(context) : void 0
+    });
+  }
+
+  function _classCallCheck(instance, Constructor) {
+    if (!(instance instanceof Constructor)) {
+      throw new TypeError("Cannot call a class as a function");
+    }
+  }
+
+  function _possibleConstructorReturn(self, call) {
+    if (!self) {
+      throw new ReferenceError("this hasn't been initialised - super() hasn't been called");
+    }return call && (typeof call === "object" || typeof call === "function") ? call : self;
+  }
+
+  function _inherits(subClass, superClass) {
+    if (typeof superClass !== "function" && superClass !== null) {
+      throw new TypeError("Super expression must either be null or a function, not " + typeof superClass);
+    }subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } });if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass;
+  }
+
+  function _applyDecoratedDescriptor(target, property, decorators, descriptor, context) {
+    var desc = {};
+    Object['ke' + 'ys'](descriptor).forEach(function (key) {
+      desc[key] = descriptor[key];
+    });
+    desc.enumerable = !!desc.enumerable;
+    desc.configurable = !!desc.configurable;
+
+    if ('value' in desc || desc.initializer) {
+      desc.writable = true;
+    }
+
+    desc = decorators.slice().reverse().reduce(function (desc, decorator) {
+      return decorator(target, property, desc) || desc;
+    }, desc);
+
+    if (context && desc.initializer !== void 0) {
+      desc.value = desc.initializer ? desc.initializer.call(context) : void 0;
+      desc.initializer = undefined;
+    }
+
+    if (desc.initializer === void 0) {
+      Object['define' + 'Property'](target, property, desc);
+      desc = null;
+    }
+
+    return desc;
+  }
+
+  function _initializerWarningHelper(descriptor, context) {
+    throw new Error('Decorating class property failed. Please ensure that transform-class-properties is enabled.');
+  }
+
+  var EmberPopperTargetingParent = (_dec = (0, _emberDecoratorsComponent.tagName)('div'), _dec2 = (0, _emberDecoratorsArgumentType.type)(undefined), _dec3 = (0, _emberDecoratorsObject.computed)(), _dec(_class = (_class2 = (function (_EmberPopperBase) {
+    _inherits(EmberPopperTargetingParent, _EmberPopperBase);
+
+    function EmberPopperTargetingParent() {
+      var _ref;
+
+      var _temp, _this, _ret;
+
+      _classCallCheck(this, EmberPopperTargetingParent);
+
+      for (var _len = arguments.length, args = Array(_len), _key = 0; _key < _len; _key++) {
+        args[_key] = arguments[_key];
+      }
+
+      return _ret = (_temp = (_this = _possibleConstructorReturn(this, (_ref = EmberPopperTargetingParent.__proto__ || Object.getPrototypeOf(EmberPopperTargetingParent)).call.apply(_ref, [this].concat(args))), _this), _initDefineProp(_this, 'popperTarget', _descriptor, _this), _temp), _possibleConstructorReturn(_this, _ret);
+    }
+
+    _createClass(EmberPopperTargetingParent, [{
+      key: 'didInsertElement',
+
+      // ================== LIFECYCLE HOOKS ==================
+
+      value: function didInsertElement() {
+        this._initialParentNode = this.element.parentNode;
+
+        if (!true) {
+          Ember.addObserver(this, 'eventsEnabled', this, this._updatePopper);
+          Ember.addObserver(this, 'modifiers', this, this._updatePopper);
+          Ember.addObserver(this, 'onCreate', this, this._updatePopper);
+          Ember.addObserver(this, 'onUpdate', this, this._updatePopper);
+          Ember.addObserver(this, 'placement', this, this._updatePopper);
+          Ember.addObserver(this, 'popperContainer', this, this._updatePopper);
+          Ember.addObserver(this, 'popperTarget', this, this._updatePopper);
+          Ember.addObserver(this, 'registerAPI', this, this._updatePopper);
+          Ember.addObserver(this, 'renderInPlace', this, this._updatePopper);
+
+          _get(EmberPopperTargetingParent.prototype.__proto__ || Object.getPrototypeOf(EmberPopperTargetingParent.prototype), 'didRender', this).apply(this, arguments);
+        }
+      }
+    }, {
+      key: 'willDestroyElement',
+      value: function willDestroyElement() {
+        _get(EmberPopperTargetingParent.prototype.__proto__ || Object.getPrototypeOf(EmberPopperTargetingParent.prototype), 'willDestroyElement', this).apply(this, arguments);
+
+        if (!true) {
+          Ember.removeObserver(this, 'eventsEnabled', this, this._updatePopper);
+          Ember.removeObserver(this, 'modifiers', this, this._updatePopper);
+          Ember.removeObserver(this, 'onCreate', this, this._updatePopper);
+          Ember.removeObserver(this, 'onUpdate', this, this._updatePopper);
+          Ember.removeObserver(this, 'placement', this, this._updatePopper);
+          Ember.removeObserver(this, 'popperContainer', this, this._updatePopper);
+          Ember.removeObserver(this, 'popperTarget', this, this._updatePopper);
+          Ember.removeObserver(this, 'registerAPI', this, this._updatePopper);
+          Ember.removeObserver(this, 'renderInPlace', this, this._updatePopper);
+        }
+
+        var element = this._getPopperElement();
+
+        if (element.parentNode !== this._initialParentNode) {
+          element.parentNode.removeChild(element);
+        }
+      }
+
+      // ================== PRIVATE IMPLEMENTATION DETAILS ==================
+
+    }, {
+      key: '_updatePopper',
+      value: function _updatePopper() {
+        var element = this._getPopperElement();
+        var popperContainer = this.get('_popperContainer');
+        var renderInPlace = this.get('_renderInPlace');
+
+        // If renderInPlace is false, move the element to the popperContainer to avoid z-index issues.
+        // See renderInPlace for more details.
+        if (renderInPlace === false && element.parentNode !== popperContainer) {
+          popperContainer.appendChild(element);
+        }
+
+        _get(EmberPopperTargetingParent.prototype.__proto__ || Object.getPrototypeOf(EmberPopperTargetingParent.prototype), '_updatePopper', this).call(this);
+      }
+    }, {
+      key: '_getPopperElement',
+      value: function _getPopperElement() {
+        return this.element;
+      }
+    }, {
+      key: '_getPopperTarget',
+      value: function _getPopperTarget() {
+        return this._initialParentNode;
+      }
+    }, {
+      key: '_popperHash',
+      get: function get() {
+        return {
+          disableEventListeners: this.disableEventListeners.bind(this),
+          enableEventListeners: this.enableEventListeners.bind(this),
+          scheduleUpdate: this.scheduleUpdate.bind(this),
+          update: this.update.bind(this)
+        };
+      }
+    }]);
+
+    return EmberPopperTargetingParent;
+  })(_emberPopperComponentsEmberPopperBase["default"]), (_descriptor = _applyDecoratedDescriptor(_class2.prototype, 'popperTarget', [_emberDecoratorsArgument.argument, _dec2], {
+    enumerable: true,
+    initializer: function initializer() {
+      return undefined;
+    }
+  }), _applyDecoratedDescriptor(_class2.prototype, '_popperHash', [_dec3], Object.getOwnPropertyDescriptor(_class2.prototype, '_popperHash'), _class2.prototype)), _class2)) || _class);
+  exports["default"] = EmberPopperTargetingParent;
+});
+define("ember-popper/components/ember-popper", ["exports", "ember-popper/components/ember-popper-base", "@ember-decorators/argument", "@ember-decorators/object", "@ember-decorators/component", "@ember-decorators/argument/type"], function (exports, _emberPopperComponentsEmberPopperBase, _emberDecoratorsArgument, _emberDecoratorsObject, _emberDecoratorsComponent, _emberDecoratorsArgumentType) {
+  "use strict";
+
+  var _createClass = (function () {
+    function defineProperties(target, props) {
+      for (var i = 0; i < props.length; i++) {
+        var descriptor = props[i];descriptor.enumerable = descriptor.enumerable || false;descriptor.configurable = true;if ("value" in descriptor) descriptor.writable = true;Object.defineProperty(target, descriptor.key, descriptor);
+      }
+    }return function (Constructor, protoProps, staticProps) {
+      if (protoProps) defineProperties(Constructor.prototype, protoProps);if (staticProps) defineProperties(Constructor, staticProps);return Constructor;
+    };
+  })();
+
+  var _get = function get(_x, _x2, _x3) {
+    var _again = true;
+
+    _function: while (_again) {
+      var object = _x,
+          property = _x2,
+          receiver = _x3;
+      _again = false;
+      if (object === null) object = Function.prototype;var desc = Object.getOwnPropertyDescriptor(object, property);if (desc === undefined) {
+        var parent = Object.getPrototypeOf(object);if (parent === null) {
+          return undefined;
+        } else {
+          _x = parent;
+          _x2 = property;
+          _x3 = receiver;
+          _again = true;
+          desc = parent = undefined;
+          continue _function;
+        }
+      } else if ("value" in desc) {
+        return desc.value;
+      } else {
+        var getter = desc.get;if (getter === undefined) {
+          return undefined;
+        }return getter.call(receiver);
+      }
+    }
+  };
+
+  var _dec, _dec2, _dec3, _class, _desc, _value, _class2, _descriptor;
+
+  function _initDefineProp(target, property, descriptor, context) {
+    if (!descriptor) return;
+    Object.defineProperty(target, property, {
+      enumerable: descriptor.enumerable,
+      configurable: descriptor.configurable,
+      writable: descriptor.writable,
+      value: descriptor.initializer ? descriptor.initializer.call(context) : void 0
+    });
+  }
+
+  function _classCallCheck(instance, Constructor) {
+    if (!(instance instanceof Constructor)) {
+      throw new TypeError("Cannot call a class as a function");
+    }
+  }
+
+  function _possibleConstructorReturn(self, call) {
+    if (!self) {
+      throw new ReferenceError("this hasn't been initialised - super() hasn't been called");
+    }return call && (typeof call === "object" || typeof call === "function") ? call : self;
+  }
+
+  function _inherits(subClass, superClass) {
+    if (typeof superClass !== "function" && superClass !== null) {
+      throw new TypeError("Super expression must either be null or a function, not " + typeof superClass);
+    }subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } });if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass;
+  }
+
+  function _applyDecoratedDescriptor(target, property, decorators, descriptor, context) {
+    var desc = {};
+    Object['ke' + 'ys'](descriptor).forEach(function (key) {
+      desc[key] = descriptor[key];
+    });
+    desc.enumerable = !!desc.enumerable;
+    desc.configurable = !!desc.configurable;
+
+    if ('value' in desc || desc.initializer) {
+      desc.writable = true;
+    }
+
+    desc = decorators.slice().reverse().reduce(function (desc, decorator) {
+      return decorator(target, property, desc) || desc;
+    }, desc);
+
+    if (context && desc.initializer !== void 0) {
+      desc.value = desc.initializer ? desc.initializer.call(context) : void 0;
+      desc.initializer = undefined;
+    }
+
+    if (desc.initializer === void 0) {
+      Object['define' + 'Property'](target, property, desc);
+      desc = null;
+    }
+
+    return desc;
+  }
+
+  function _initializerWarningHelper(descriptor, context) {
+    throw new Error('Decorating class property failed. Please ensure that transform-class-properties is enabled.');
+  }
+
+  var EmberPopper = (_dec = (0, _emberDecoratorsComponent.tagName)('div'), _dec2 = (0, _emberDecoratorsArgumentType.type)(Element), _dec3 = (0, _emberDecoratorsObject.computed)(), _dec(_class = (_class2 = (function (_EmberPopperBase) {
+    _inherits(EmberPopper, _EmberPopperBase);
+
+    function EmberPopper() {
+      var _ref;
+
+      var _temp, _this, _ret;
+
+      _classCallCheck(this, EmberPopper);
+
+      for (var _len = arguments.length, args = Array(_len), _key = 0; _key < _len; _key++) {
+        args[_key] = arguments[_key];
+      }
+
+      return _ret = (_temp = (_this = _possibleConstructorReturn(this, (_ref = EmberPopper.__proto__ || Object.getPrototypeOf(EmberPopper)).call.apply(_ref, [this].concat(args))), _this), _initDefineProp(_this, 'popperTarget', _descriptor, _this), _temp), _possibleConstructorReturn(_this, _ret);
+    }
+
+    _createClass(EmberPopper, [{
+      key: 'didInsertElement',
+
+      // ================== LIFECYCLE HOOKS ==================
+
+      value: function didInsertElement() {
+        this._initialParentNode = this.element.parentNode;
+
+        if (!true) {
+          Ember.addObserver(this, 'eventsEnabled', this, this._updatePopper);
+          Ember.addObserver(this, 'modifiers', this, this._updatePopper);
+          Ember.addObserver(this, 'onCreate', this, this._updatePopper);
+          Ember.addObserver(this, 'onUpdate', this, this._updatePopper);
+          Ember.addObserver(this, 'placement', this, this._updatePopper);
+          Ember.addObserver(this, 'popperContainer', this, this._updatePopper);
+          Ember.addObserver(this, 'popperTarget', this, this._updatePopper);
+          Ember.addObserver(this, 'registerAPI', this, this._updatePopper);
+          Ember.addObserver(this, 'renderInPlace', this, this._updatePopper);
+
+          _get(EmberPopper.prototype.__proto__ || Object.getPrototypeOf(EmberPopper.prototype), 'didRender', this).apply(this, arguments);
+        }
+      }
+    }, {
+      key: 'willDestroyElement',
+      value: function willDestroyElement() {
+        _get(EmberPopper.prototype.__proto__ || Object.getPrototypeOf(EmberPopper.prototype), 'willDestroyElement', this).apply(this, arguments);
+
+        if (!true) {
+          Ember.removeObserver(this, 'eventsEnabled', this, this._updatePopper);
+          Ember.removeObserver(this, 'modifiers', this, this._updatePopper);
+          Ember.removeObserver(this, 'onCreate', this, this._updatePopper);
+          Ember.removeObserver(this, 'onUpdate', this, this._updatePopper);
+          Ember.removeObserver(this, 'placement', this, this._updatePopper);
+          Ember.removeObserver(this, 'popperContainer', this, this._updatePopper);
+          Ember.removeObserver(this, 'popperTarget', this, this._updatePopper);
+          Ember.removeObserver(this, 'registerAPI', this, this._updatePopper);
+          Ember.removeObserver(this, 'renderInPlace', this, this._updatePopper);
+        }
+
+        var element = this._getPopperElement();
+
+        if (element.parentNode !== this._initialParentNode) {
+          element.parentNode.removeChild(element);
+        }
+      }
+
+      // ================== PRIVATE IMPLEMENTATION DETAILS ==================
+
+    }, {
+      key: '_updatePopper',
+      value: function _updatePopper() {
+        var element = this._getPopperElement();
+        var popperContainer = this.get('_popperContainer');
+        var renderInPlace = this.get('_renderInPlace');
+
+        // If renderInPlace is false, move the element to the popperContainer to avoid z-index issues.
+        // See renderInPlace for more details.
+        if (renderInPlace === false && element.parentNode !== popperContainer) {
+          popperContainer.appendChild(element);
+        }
+
+        _get(EmberPopper.prototype.__proto__ || Object.getPrototypeOf(EmberPopper.prototype), '_updatePopper', this).call(this);
+      }
+    }, {
+      key: '_getPopperElement',
+      value: function _getPopperElement() {
+        return this.element;
+      }
+    }, {
+      key: '_popperHash',
+      get: function get() {
+        return {
+          disableEventListeners: this.disableEventListeners.bind(this),
+          enableEventListeners: this.enableEventListeners.bind(this),
+          scheduleUpdate: this.scheduleUpdate.bind(this),
+          update: this.update.bind(this)
+        };
+      }
+    }]);
+
+    return EmberPopper;
+  })(_emberPopperComponentsEmberPopperBase["default"]), (_descriptor = _applyDecoratedDescriptor(_class2.prototype, 'popperTarget', [_emberDecoratorsArgument.argument, _dec2], {
+    enumerable: true,
+    initializer: function initializer() {
+      return null;
+    }
+  }), _applyDecoratedDescriptor(_class2.prototype, '_popperHash', [_dec3], Object.getOwnPropertyDescriptor(_class2.prototype, '_popperHash'), _class2.prototype)), _class2)) || _class);
+  exports["default"] = EmberPopper;
+});
+define("ember-popper/templates/components/ember-popper", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 7,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-popper/templates/components/ember-popper.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createTextNode("\n");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(1);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        return morphs;
+      },
+      statements: [["inline", "yield", [["subexpr", "hash", [], ["disableEventListeners", ["subexpr", "action", ["disableEventListeners"], [], ["loc", [null, [2, 24], [2, 56]]], 0, 0], "enableEventListeners", ["subexpr", "action", ["enableEventListeners"], [], ["loc", [null, [3, 23], [3, 54]]], 0, 0], "scheduleUpdate", ["subexpr", "action", ["scheduleUpdate"], [], ["loc", [null, [4, 17], [4, 42]]], 0, 0], "update", ["subexpr", "action", ["update"], [], ["loc", [null, [5, 9], [5, 26]]], 0, 0]], ["loc", [null, [1, 8], [6, 1]]], 0, 0]], [], ["loc", [null, [1, 0], [6, 3]]], 0, 0]],
+      locals: [],
+      templates: []
+    };
+  })());
+});
+define("ember-raf-scheduler/index", ["exports"], function (exports) {
+  "use strict";
+
+  var _createClass = (function () {
+    function defineProperties(target, props) {
+      for (var i = 0; i < props.length; i++) {
+        var descriptor = props[i];descriptor.enumerable = descriptor.enumerable || false;descriptor.configurable = true;if ("value" in descriptor) descriptor.writable = true;Object.defineProperty(target, descriptor.key, descriptor);
+      }
+    }return function (Constructor, protoProps, staticProps) {
+      if (protoProps) defineProperties(Constructor.prototype, protoProps);if (staticProps) defineProperties(Constructor, staticProps);return Constructor;
+    };
+  })();
+
+  function _classCallCheck(instance, Constructor) {
+    if (!(instance instanceof Constructor)) {
+      throw new TypeError("Cannot call a class as a function");
+    }
+  }
+
+  var Token = (function () {
+    function Token(parent) {
+      _classCallCheck(this, Token);
+
+      this._parent = parent;
+      this._cancelled = false;
+
+      if (true) {
+        Object.seal(this);
+      }
+    }
+
+    _createClass(Token, [{
+      key: 'cancel',
+      value: function cancel() {
+        this._cancelled = true;
+      }
+    }, {
+      key: 'cancelled',
+      get: function get() {
+        return this._cancelled || (this._cancelled = this._parent ? this._parent.cancelled : false);
+      }
+    }]);
+
+    return Token;
+  })();
+
+  exports.Token = Token;
+  function job(cb, token) {
+    return function execJob() {
+      if (token.cancelled === false) {
+        cb();
+      }
+    };
+  }
+
+  var Scheduler = (function () {
+    function Scheduler() {
+      _classCallCheck(this, Scheduler);
+
+      this.sync = [];
+      this.layout = [];
+      this.measure = [];
+      this.affect = [];
+      this.jobs = 0;
+      this._nextFlush = null;
+      this.ticks = 0;
+
+      if (true) {
+        Object.seal(this);
+      }
+    }
+
+    _createClass(Scheduler, [{
+      key: 'schedule',
+      value: function schedule(queueName, cb, parent) {
+        true && !(queueName in this) && Ember.assert('Attempted to schedule to unknown queue: ' + queueName, queueName in this);
+
+        this.jobs++;
+        var token = new Token(parent);
+
+        this[queueName].push(job(cb, token));
+        this._flush();
+
+        return token;
+      }
+    }, {
+      key: 'forget',
+      value: function forget(token) {
+        // TODO add explicit test
+        if (token) {
+          token.cancel();
+        }
+      }
+    }, {
+      key: '_flush',
+      value: function _flush() {
+        var _this = this;
+
+        if (this._nextFlush !== null) {
+          return;
+        }
+
+        this._nextFlush = requestAnimationFrame(function () {
+          _this.flush();
+        });
+      }
+    }, {
+      key: 'flush',
+      value: function flush() {
+        var i = void 0,
+            q = void 0;
+        this.jobs = 0;
+
+        if (this.sync.length > 0) {
+          Ember.run.begin();
+          q = this.sync;
+          this.sync = [];
+
+          for (i = 0; i < q.length; i++) {
+            q[i]();
+          }
+          Ember.run.end();
+        }
+
+        if (this.layout.length > 0) {
+          q = this.layout;
+          this.layout = [];
+
+          for (i = 0; i < q.length; i++) {
+            q[i]();
+          }
+        }
+
+        if (this.measure.length > 0) {
+          q = this.measure;
+          this.measure = [];
+
+          for (i = 0; i < q.length; i++) {
+            q[i]();
+          }
+        }
+
+        if (this.affect.length > 0) {
+          q = this.affect;
+          this.affect = [];
+
+          for (i = 0; i < q.length; i++) {
+            q[i]();
+          }
+        }
+
+        this._nextFlush = null;
+        if (this.jobs > 0) {
+          this._flush();
+        }
+      }
+    }]);
+
+    return Scheduler;
+  })();
+
+  exports.Scheduler = Scheduler;
+  var scheduler = new Scheduler();
+
+  exports.scheduler = scheduler;
+  exports["default"] = scheduler;
 });
 define('ember-resolver/container-debug-adapter', ['exports', 'ember', 'ember-resolver/utils/module-registry'], function (exports, _ember, _emberResolverUtilsModuleRegistry) {
   'use strict';
@@ -81527,6 +106088,250 @@ define('ember-validations/validators/local/presence', ['exports', 'ember', 'embe
       }
     }
   });
+});
+define('ember-wormhole/components/ember-wormhole', ['exports', 'ember-wormhole/templates/components/ember-wormhole', 'ember-wormhole/utils/dom'], function (exports, _emberWormholeTemplatesComponentsEmberWormhole, _emberWormholeUtilsDom) {
+  'use strict';
+
+  exports['default'] = Ember.Component.extend({
+    layout: _emberWormholeTemplatesComponentsEmberWormhole['default'],
+
+    /*
+     * Attrs
+     */
+    to: Ember.computed.alias('destinationElementId'),
+    destinationElementId: null,
+    destinationElement: Ember.computed('destinationElementId', 'renderInPlace', function () {
+      var renderInPlace = this.get('renderInPlace');
+      if (renderInPlace) {
+        return this._element;
+      }
+      var id = this.get('destinationElementId');
+      if (!id) {
+        return null;
+      }
+      return (0, _emberWormholeUtilsDom.findElementById)(this._dom, id);
+    }),
+    renderInPlace: false,
+
+    /*
+     * Lifecycle
+     */
+    init: function init() {
+      var _this = this;
+
+      this._super.apply(this, arguments);
+
+      this._dom = (0, _emberWormholeUtilsDom.getDOM)(this);
+
+      // Create text nodes used for the head, tail
+      this._wormholeHeadNode = this._dom.createTextNode('');
+      this._wormholeTailNode = this._dom.createTextNode('');
+
+      /*
+       * didInsertElement does not fire in Fastboot, so we schedule this in
+       * init to be run after render. Importantly, we want to run
+       * appendToDestination after the child nodes have rendered.
+       */
+      Ember.run.schedule('afterRender', function () {
+        if (_this.isDestroyed) {
+          return;
+        }
+        _this._element = _this._wormholeHeadNode.parentNode;
+        if (!_this._element) {
+          throw new Error('The head node of a wormhole must be attached to the DOM');
+        }
+        _this._appendToDestination();
+      });
+    },
+
+    willDestroyElement: function willDestroyElement() {
+      var _this2 = this;
+
+      // not called in fastboot
+      this._super.apply(this, arguments);
+      var _wormholeHeadNode = this._wormholeHeadNode,
+          _wormholeTailNode = this._wormholeTailNode;
+
+      Ember.run.schedule('render', function () {
+        _this2._removeRange(_wormholeHeadNode, _wormholeTailNode);
+      });
+    },
+
+    _destinationDidChange: Ember.observer('destinationElement', function () {
+      var destinationElement = this._getDestinationElement();
+      if (destinationElement !== this._wormholeHeadNode.parentNode) {
+        Ember.run.schedule('render', this, '_appendToDestination');
+      }
+    }),
+
+    _appendToDestination: function _appendToDestination() {
+      var destinationElement = this._getDestinationElement();
+      if (!destinationElement) {
+        var destinationElementId = this.get('destinationElementId');
+        if (destinationElementId) {
+          throw new Error('ember-wormhole failed to render into \'#' + destinationElementId + '\' because the element is not in the DOM');
+        }
+        throw new Error('ember-wormhole failed to render content because the destinationElementId was set to an undefined or falsy value.');
+      }
+
+      var startingActiveElement = (0, _emberWormholeUtilsDom.getActiveElement)();
+      this._appendRange(destinationElement, this._wormholeHeadNode, this._wormholeTailNode);
+      var resultingActiveElement = (0, _emberWormholeUtilsDom.getActiveElement)();
+      if (startingActiveElement && resultingActiveElement !== startingActiveElement) {
+        startingActiveElement.focus();
+      }
+    },
+    _appendRange: function _appendRange(destinationElement, firstNode, lastNode) {
+      while (firstNode) {
+        destinationElement.insertBefore(firstNode, null);
+        firstNode = firstNode !== lastNode ? lastNode.parentNode.firstChild : null;
+      }
+    },
+    _removeRange: function _removeRange(firstNode, lastNode) {
+      var node = lastNode;
+      do {
+        var next = node.previousSibling;
+        if (node.parentNode) {
+          node.parentNode.removeChild(node);
+          if (node === firstNode) {
+            break;
+          }
+        }
+        node = next;
+      } while (node);
+    },
+    _getDestinationElement: function _getDestinationElement() {
+      var renderInPlace = this.get('renderInPlace');
+      if (renderInPlace) {
+        return this._element;
+      }
+      return this.get('destinationElement');
+    }
+  });
+});
+define("ember-wormhole/templates/components/ember-wormhole", ["exports"], function (exports) {
+  "use strict";
+
+  exports["default"] = Ember.HTMLBars.template((function () {
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 4,
+            "column": 0
+          }
+        },
+        "moduleName": "modules/ember-wormhole/templates/components/ember-wormhole.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        var el1 = dom.createComment("");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var morphs = new Array(3);
+        morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+        morphs[1] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+        morphs[2] = dom.createMorphAt(fragment, 2, 2, contextualElement);
+        dom.insertBoundary(fragment, 0);
+        dom.insertBoundary(fragment, null);
+        return morphs;
+      },
+      statements: [["inline", "unbound", [["get", "_wormholeHeadNode", ["loc", [null, [1, 10], [1, 27]]], 0, 0, 0, 0]], [], ["loc", [null, [1, 0], [1, 31]]], 0, 0], ["content", "yield", ["loc", [null, [2, 0], [2, 11]]], 0, 0, 0, 0], ["inline", "unbound", [["get", "_wormholeTailNode", ["loc", [null, [3, 10], [3, 27]]], 0, 0, 0, 0]], [], ["loc", [null, [3, 0], [3, 31]]], 0, 0]],
+      locals: [],
+      templates: []
+    };
+  })());
+});
+define('ember-wormhole/utils/dom', ['exports'], function (exports) {
+  'use strict';
+
+  exports.getActiveElement = getActiveElement;
+  exports.findElementById = findElementById;
+  exports.getDOM = getDOM;
+
+  function getActiveElement() {
+    if (typeof document === 'undefined') {
+      return null;
+    } else {
+      return document.activeElement;
+    }
+  }
+
+  /*
+   * Implement some helpers methods for interacting with the DOM,
+   * be it Fastboot's SimpleDOM or the browser's version.
+   */
+
+  function childNodesOfElement(element) {
+    var children = [];
+    var child = element.firstChild;
+    while (child) {
+      children.push(child);
+      child = child.nextSibling;
+    }
+    return children;
+  }
+
+  function findElementById(doc, id) {
+    if (doc.getElementById) {
+      return doc.getElementById(id);
+    }
+
+    var nodes = childNodesOfElement(doc);
+    var node = void 0;
+
+    while (nodes.length) {
+      node = nodes.shift();
+
+      if (node.getAttribute && node.getAttribute('id') === id) {
+        return node;
+      }
+
+      nodes = childNodesOfElement(node).concat(nodes);
+    }
+  }
+
+  // Private Ember API usage. Get the dom implementation used by the current
+  // renderer, be it native browser DOM or Fastboot SimpleDOM
+
+  function getDOM(context) {
+    var renderer = context.renderer;
+
+    if (!renderer._dom) {
+      // pre glimmer2
+      var container = Ember.getOwner ? Ember.getOwner(context) : context.container;
+      var documentService = container.lookup('service:-document');
+
+      if (documentService) {
+        return documentService;
+      }
+
+      renderer = container.lookup('renderer:-dom');
+    }
+
+    if (renderer._dom && renderer._dom.document) {
+      // pre Ember 2.6
+      return renderer._dom.document;
+    } else {
+      throw new Error('ember-wormhole could not get DOM');
+    }
+  }
 });
 ;/* jshint ignore:start */
 
