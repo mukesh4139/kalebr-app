@@ -5,15 +5,17 @@ userReview = Ember.Route.extend(
     self = @
     @get('store').findAll('question').then (response) ->
       self.set 'questions', response
-      self.get('store').findRecord('user', params.id)
+      self.get('store').findRecord('user', params.id).then (reviewee) ->
+        self.set 'reviewee', reviewee
+        if self.get('session.currentUser.scopedReview.id')
+          self.get('session.currentUser.scopedReview')
+        else
+          self.get('store').createRecord('review', {
+            reviewer: self.get('session.currentUser'),
+            performanceReview: self.get('reviewee.selfPerformanceReview')
+          })
 
   setupController: (controller, model) ->
-#    @get('questions').forEach (question) ->
-#      question.set('options', question.get('options').map (option) ->
-#        Em.ObjectProxy.create
-#          content: option
-#          selected: false
-#      )
     controller.set 'questions', @get 'questions'
     controller.set 'model', model
 

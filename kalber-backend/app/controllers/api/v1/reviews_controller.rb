@@ -43,6 +43,8 @@ class Api::V1::ReviewsController < ApplicationController
   end
 
   def review_params
-    params.require(:review).permit(:feedback)
+    params[:review][:questions_options_attributes] = params[:review][:questions_options]
+    params.require(:review).permit(:feedback, :performance_review_id, :reviewer_id,
+                                   :questions_options_attributes => [:review_id, :question_id, :option_id])
   end
 end

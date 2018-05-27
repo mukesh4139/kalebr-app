@@ -3,7 +3,7 @@
 
 ApplicationSerializer = ActiveModelSerializer.extend(DS.EmbeddedRecordsMixin,
   attrs:
-    options: {embedded: 'always'}, reviewers: { serialize: 'ids', deserialize: 'ids'}
+    options: {embedded: 'always'}, reviewers: { serialize: 'ids', deserialize: 'ids'}, questionsOptions: {embedded: 'always'},
 )
 
 `export default ApplicationSerializer`

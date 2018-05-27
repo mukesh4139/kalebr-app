@@ -1,3 +1,5 @@
-import Ember from 'ember'
+`import Ember from 'ember'`
 
-export default Ember.Route.extend()
+home = Ember.Route.extend()
+
+`export default home`

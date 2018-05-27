@@ -1,4 +1,5 @@
 `import Ember from 'ember'`
+`import constants from "kalebr-frontend/utils/constants"`
 
 userReview = Ember.Controller.extend
   actions:
@@ -7,5 +8,22 @@ userReview = Ember.Controller.extend
         opt.set 'selected', false
       option.set 'selected', true
       false
+
+    submitReview: ->
+      self = @
+      @get('questions').forEach (question) ->
+        selectedOption = undefined
+        question.get('options').forEach (option) ->
+          if option.get('selected')
+            selectedOption = option
+
+        if selectedOption
+          questionsAnswer = self.get('store').createRecord('questions-option', {
+            option: selectedOption,
+            question: question,
+          })
+          self.get('model').get('questionsOptions').pushObject(questionsAnswer)
+
+      @get('model').save()
 
 `export default userReview`

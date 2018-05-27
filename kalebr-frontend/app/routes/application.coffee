@@ -20,11 +20,11 @@ applicationRoute = Ember.Route.extend(
           self.get('session').set 'currentUser', currUser
           console.log(data.user.email, 'logged in')
         else
-          console.log(msg.responseJSON.errors[0])
+          console.log(data.errors[0])
           self.replaceWith('login')
 
       error: (msg)  ->
-        console.log(msg.responseJSON.errors[0])
+        console.log(data.errors[0])
         self.replaceWith('login')
     )
 

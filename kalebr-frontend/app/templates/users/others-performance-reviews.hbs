@@ -4,7 +4,13 @@
           <div class="single-user-row flex">
               <div class="width10pc">{{performanceReview.id}}</div>
               <div class="width30pc">{{performanceReview.reviewee.fullname}}</div>
-              {{#link-to 'users/review' session.currentUser}}<div class="width20pc">Go to Review</div>{{/link-to}}
+              <div class="width20pc">
+                {{#unless performanceReview.reviewee.scopedReview}}
+                  {{#link-to 'users/review' performanceReview.reviewee}}Go to Review{{/link-to}}
+                {{else}}
+                  Reviewed
+                {{/unless}}
+              </div>
           </div>
       {{/each}}
     </div>

@@ -1,6 +1,6 @@
 class Api::V1::UsersController < ApplicationController
   before_action :set_user, only: [:show, :update, :destroy]
-  before_action :authenticate_request!, only: [:create, :update, :destroy]
+  before_action :authenticate_request!, only: [:show, :create, :update, :destroy]
 
   def index
     @users = User.all
