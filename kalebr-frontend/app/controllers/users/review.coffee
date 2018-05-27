@@ -1,6 +1,7 @@
 `import Ember from 'ember'`
 
 userReview = Ember.Controller.extend
+  # Review will only be submitted if all the questions have been attempted by reviewee
   checkIfAllQuestionsAttempted: ->
     self = @
     allAttempted = true
@@ -35,8 +36,9 @@ userReview = Ember.Controller.extend
             })
             self.get('model').get('questionsOptions').pushObject(questionsAnswer)
 
-        @get('model').save()
-        @get('reviewee').reload()
-        @transitionToRoute('users/othersPerformanceReviews', @get('session.currentUser.id'))
+        @get('model').save().then((response)->
+          self.get('reviewee').reload()
+          self.transitionToRoute('users/othersPerformanceReviews', self.get('session.currentUser.id'))
+        )
 
 `export default userReview`

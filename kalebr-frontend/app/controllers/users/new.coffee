@@ -3,6 +3,9 @@
 userNew = Ember.Controller.extend
   invalidPasswordMsg: 'Password should be of Min. 6 Chars'
 
+  # Password is invalid for a user if password length is less than 6
+  # While Editing user, admin may leave password as blank if wish not to update
+
   checkPasswordValidity: ->
     validity = false
     if @get('model.id')

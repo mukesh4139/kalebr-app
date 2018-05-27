@@ -1,6 +1,6 @@
 class Api::V1::PerformanceReviewsController < ApplicationController
-  before_action :set_performance_review, only: [:show, :update, :destroy]
-  before_action :authenticate_request!, only: [:create, :update, :destroy]
+  before_action :set_performance_review, only: [:show, :update]
+  before_action :authenticate_request!, only: [:create, :update]
 
   def index
     @performance_reviews = PerformanceReview.all.order(:id)
@@ -25,14 +25,6 @@ class Api::V1::PerformanceReviewsController < ApplicationController
       render json: @performance_review
     else
       render json: {message: "Performance Review could not be updated due to #{@performance_review.errors.full_messages}"}, status: 422
-    end
-  end
-
-  def destroy
-    if @performance_review.destroy
-      render json: {message: "Performance Review deleted successfully"}, status: :ok
-    else
-      render json: {message: "Performance Review could not be deleted"}, status: 422
     end
   end
 

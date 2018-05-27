@@ -1,6 +1,6 @@
 class Api::V1::ReviewsController < ApplicationController
-  before_action :set_review, only: [:show, :update, :destroy, :comment]
-  before_action :authenticate_request!, only: [:create, :update, :destroy, :comment]
+  before_action :set_review, only: [:show, :comment]
+  before_action :authenticate_request!, only: [:create, :comment]
 
   def index
     @reviews = Review.all.order(:id)
@@ -17,22 +17,6 @@ class Api::V1::ReviewsController < ApplicationController
       render json: @review
     else
       render json: {message: "Review could not be save due to #{@review.errors.full_messages}"}, status: 422
-    end
-  end
-
-  def update
-    if @review.update(review_params)
-      render json: @review
-    else
-      render json: {message: "Review could not be updated due to #{@review.errors.full_messages}"}, status: 422
-    end
-  end
-
-  def destroy
-    if @review.destroy
-      render json: {message: "Review deleted successfully"}, status: :ok
-    else
-      render json: {message: "Review could not be deleted"}, status: 422
     end
   end
 

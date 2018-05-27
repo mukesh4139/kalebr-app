@@ -1,5 +1,6 @@
 html {
   height: 100%;
+  min-width: 375px;
   font-family: "Helvetica Neue Light", "HelveticaNeue-Light", "Helvetica Neue", Calibri, Helvetica, Arial, sans-serif;
 }
 
@@ -14,10 +15,15 @@ body {
   padding: 5rem 0;
 }
 
-@media all and (max-width: 800px) {
+@media all and (max-width: 650px) {
   .application-container {
     margin:0;
+    padding: 15rem 0;
   }
+  .navigation {
+    height: 15rem;
+  }
+
 }
 
 .input-wrapper {

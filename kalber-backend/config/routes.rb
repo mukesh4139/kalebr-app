@@ -10,13 +10,13 @@ Rails.application.routes.draw do
           get 'reviews'
         end
       end
-      resources :questions
+      resources :questions, except: [:new, :edit, :destroy]
       resources :reviews do
         member do
           post 'comment'
         end
       end
-      resources :performance_reviews
+      resources :performance_reviews, except: [:new, :edit, :destroy]
     end
   end
 

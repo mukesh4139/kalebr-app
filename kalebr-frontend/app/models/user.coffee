@@ -10,7 +10,7 @@ userModel = DS.Model.extend(EmberValidations, {
   selfPerformanceReview: DS.belongsTo('performance-review', {inverse: 'reviewee'})
   othersPerformanceReviews: DS.hasMany('performance-review', {inverse: null})
   scopedReview: DS.belongsTo('review', {inverse: null})
-  reviews: DS.hasMany('review')
+  reviews: DS.hasMany('review', {inverse: null})
 
   fullname: (->
     @get('firstname') + ' ' + @get('lastname')
