@@ -7,6 +7,8 @@ questions = Ember.Controller.extend
       false
 
     deleteRecord: (record) ->
-      record.get('content').destroyRecord()
+      question = record.get('content')
+      question.destroyRecord()
+      @get('model').removeObject(record)
 
 `export default questions`

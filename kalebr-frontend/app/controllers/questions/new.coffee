@@ -22,7 +22,17 @@ questionNew = Ember.Controller.extend
       if @get('model.isValid') and @get('optionsValid')
         @markBlankOptionsToBeDeleted()
         @set 'showErrors', false
-        @get('model').save().then (response) ->
+        @get('model').save().then () ->
+          # clearing non persistent options
+          index = 0
+          length = self.get('model.options.length')
+          for i in [0..(length-1)]
+            option = self.get('model.options').objectAt(index)
+            if !Em.isEmpty(option) and Em.isEmpty(option.get("id"))
+              self.get('model.options').objectAt(index).destroyRecord()
+            else
+              index = index + 1
+
           self.transitionToRoute('questions')
       else
         @set 'showErrors', true

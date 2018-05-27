@@ -2,7 +2,8 @@
 
 questionsRoute = Ember.Route.extend(
   model: ->
-    @get('store').findAll('question')
+    @get('store').query('question', {all: true}).then (questions) ->
+      questions
 
   setupController: (controller, model) ->
     model = model.map (question) ->

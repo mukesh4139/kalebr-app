@@ -35,8 +35,9 @@ login = Ember.Controller.extend
               window.localStorage.setItem('auth_token', data.auth_token)
               normalizedData = self.store.normalize('user', data.user)
               currUser = self.store.push(normalizedData)
-              self.get('session').set 'currentUser', currUser
-              self.transitionToRoute('home')
+              currUser.reload().then (user)->
+                self.get('session').set 'currentUser', user
+                self.transitionToRoute('home')
 
           error: (msg)->
             alert msg.responseJSON.errors[0]
