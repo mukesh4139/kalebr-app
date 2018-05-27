@@ -38,7 +38,6 @@ This is a rails-ember application primarily built for reviewing each other at an
 https://kaleber-app.herokuapp.com
 
 ## Assumptions and Limitations
-
-Only Objective Questions are supported for now.
-One question can have maximum 4 options.
-All Questions must be attempted to complete review.
+    Only Objective Questions are supported for now.
+    One question can have maximum 4 options.
+    All Questions must be attempted to complete review.
