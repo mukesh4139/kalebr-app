@@ -10,7 +10,7 @@
       {{#each model as |user|}}
           <div class="flex">
               <div class="width10pc">{{user.id}}</div>
-              <div class="width30pc">{{user.firstname}} {{user.lastname}}</div>
+              <div class="width20pc">{{user.firstname}} {{user.lastname}}</div>
               <div class="width30pc">{{user.email}}</div>
               {{#bs-dropdown as |dd|}}
                 {{#dd.button}}Actions <span class="caret"></span>{{/dd.button}}

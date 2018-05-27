@@ -15,5 +15,8 @@ class Review < ApplicationRecord
   belongs_to :reviewer, class_name: 'User'
   has_many :questions_options, dependent: :destroy
 
+  validates_presence_of :performance_review
+  validates_presence_of :reviewer
+
   accepts_nested_attributes_for :questions_options, reject_if: proc {|attribute| !attribute.present?}
 end

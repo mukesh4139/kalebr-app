@@ -26,7 +26,7 @@ class User < ApplicationRecord
   devise :database_authenticatable, :registerable,
          :recoverable, :rememberable, :trackable, :validatable
 
-  validates_presence_of :firstname, message: 'firstname is required'
+  validates_presence_of :firstname
 
   has_one :self_performance_review, class_name: 'PerformanceReview', foreign_key: :reviewee_id, dependent: :destroy
   has_many :reviews, through: :self_performance_review, dependent: :destroy

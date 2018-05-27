@@ -45,6 +45,11 @@ group :development, :test do
   gem 'capybara', '~> 2.13'
   gem 'selenium-webdriver'
   gem 'annotate'
+  gem 'rspec-rails'
+  gem 'shoulda-matchers', '~> 3.0', require: false
+  gem 'database_cleaner', '~> 1.5'
+  gem 'faker'
+  gem 'rails-controller-testing'
 end
 
 group :development do
