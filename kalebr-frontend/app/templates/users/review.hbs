@@ -1,6 +1,13 @@
 <div class="review questions pad1rem">
     <div class="questions-list users-list">
       {{#each questions as |question|}}
+        {{#if showErrors}}
+          {{#unless question.attempted}}
+            <div class="errors">
+              * Not Attempted
+            </div>
+          {{/unless}}
+        {{/if}}
           <div class="flex padtb1rem">
               <div class="width5pc">{{question.id}}.</div>
               <div class="width65pc">{{question.statement}}</div>

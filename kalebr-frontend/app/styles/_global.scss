@@ -10,6 +10,8 @@ body {
 .application-container {
   margin:0 20% ;
   background: #fafafa;
+  min-height: 100vh;
+  padding: 5rem 0;
 }
 
 @media all and (max-width: 800px) {
@@ -84,10 +86,6 @@ body {
   width: 30pc;
 }
 
-.width50pc {
-  width: 50pc;
-}
-
 .width65pc {
   width: 65pc;
 }
@@ -101,6 +99,7 @@ body {
   border-radius: 5px;
   background: deepskyblue;
   color: white;
+  text-align: center;
 }
 
 .flex {
@@ -131,7 +130,7 @@ a {
 
 .thick-border {
   height: 8px;
-  margin: 0 -1rem;
+  margin: 1rem -1rem;
   background: white;
 }
 

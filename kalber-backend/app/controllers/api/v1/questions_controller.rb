@@ -3,12 +3,8 @@ class Api::V1::QuestionsController < ApplicationController
   before_action :authenticate_request!, only: [:create, :update, :destroy]
 
   def index
-    if params[:all]
-      @questions = Question.all
-    else
-      @question = Question.where(id: params[:ids])
-    end
-    render json: @questions.order(:id)
+    @questions = Question.all.order(:id)
+    render json: @questions
   end
 
   def show

@@ -1,11 +1,12 @@
 `import Ember from 'ember'`
 `import constants from "kalebr-frontend/utils/constants"`
 
-userReview = Ember.Controller.extend
+userReviewComment = Ember.Controller.extend
   comment: ''
 
   actions:
     submitComment: ->
+      self = @
       url = constants.HOST + constants.NAMESPACE + '/reviews/' + @get('model.id') + '/comment'
       $.ajax(
         type: 'POST'
@@ -14,7 +15,8 @@ userReview = Ember.Controller.extend
         headers:
           Authorization: "Bearer " + window.localStorage.getItem('auth_token')
         success: (response) ->
-          console.log('commented')
+          self.get('model').set 'feedback', self.get('comment')
       )
 
-`export default userReview`
+
+`export default userReviewComment`

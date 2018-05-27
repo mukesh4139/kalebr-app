@@ -20,5 +20,9 @@ userReviewComment = Ember.Route.extend(
     controller.set 'questions', @get 'questions'
     controller.set 'model', model
 
+  exit: ->
+    @get('questions').forEach (question) ->
+      question.get('options').forEach (option) ->
+        option.set 'selected', false
 )
 `export default userReviewComment`

@@ -1,17 +1,18 @@
 <div class="others-performance-reviews users pad1rem">
     <div class="users-list">
       {{#each model as |performanceReview|}}
-          <div class="single-user-row flex">
+          <div class="flex">
               <div class="width10pc">{{performanceReview.id}}</div>
               <div class="width30pc">{{performanceReview.reviewee.fullname}}</div>
               <div class="width20pc">
                 {{#unless performanceReview.reviewee.scopedReview}}
-                  {{#link-to 'users/review' performanceReview.reviewee}}Go to Review{{/link-to}}
+                  {{#link-to 'users/review' performanceReview.reviewee.id}}Go to Review{{/link-to}}
                 {{else}}
                   Reviewed
                 {{/unless}}
               </div>
           </div>
+        <div class="thick-border"></div>
       {{/each}}
     </div>
 </div>

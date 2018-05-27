@@ -7,8 +7,8 @@
                   <li>{{#link-to 'users'}} Users {{/link-to}}</li>
                   <li>{{#link-to 'questions'}} Questions {{/link-to}}</li>
               {{/if}}
-              <li>{{#link-to 'users/reviews' session.currentUser}} Self Perf. Reviews {{/link-to}}</li>
-              <li>{{#link-to 'users/othersPerformanceReviews' session.currentUser}} Others Perf. Reviews {{/link-to}}</li>
+              <li>{{#link-to 'users/reviews' session.currentUser.id}} Self Perf. Reviews {{/link-to}}</li>
+              <li>{{#link-to 'users/othersPerformanceReviews' session.currentUser.id}} Others Perf. Reviews {{/link-to}}</li>
               <li {{action 'logout'}}>Sign Out</li>
             {{else}}
                 <li>Sign In</li>

@@ -19,7 +19,7 @@ userNew = Ember.Controller.extend
       if @get('model.isValid') and @checkPasswordValidity()
         @set 'showErrors', false
         @get('model').save().then (response) ->
-          self.transitionToRoute('questions')
+          self.transitionToRoute('users')
       else
         @set 'showErrors', true
       false

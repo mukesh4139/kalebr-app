@@ -1,7 +1,7 @@
 `import Ember from 'ember'`
 
 userReviews = Ember.Route.extend(
-  model: (params) ->
+  model: (params)->
     self = @
     @get('store').findRecord('user', params.id).then (reviewee) ->
       self.set 'reviewee', reviewee

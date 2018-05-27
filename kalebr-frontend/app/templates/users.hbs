@@ -8,7 +8,7 @@
     </div>
     <div class="users-list">
       {{#each model as |user|}}
-          <div class="single-user-row flex">
+          <div class="flex">
               <div class="width10pc">{{user.id}}</div>
               <div class="width30pc">{{user.firstname}} {{user.lastname}}</div>
               <div class="width30pc">{{user.email}}</div>
@@ -27,6 +27,7 @@
                 {{/dd.menu}}
               {{/bs-dropdown}}
           </div>
+          <div class="thick-border"></div>
       {{/each}}
     </div>
 </div>

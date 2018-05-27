@@ -16,8 +16,19 @@ userReview = Ember.Route.extend(
           })
 
   setupController: (controller, model) ->
-    controller.set 'questions', @get 'questions'
+    controller.set 'questions', @get('questions').map (question) ->
+      Em.ObjectProxy.create
+        content: question
+        attempted: false
+
+    controller.set 'reviewee', @get('reviewee')
     controller.set 'model', model
+    controller.set 'showErrors', false
+
+  exit: ->
+    @get('questions').forEach (question) ->
+      question.get('options').forEach (option) ->
+        option.set 'selected', false
 
 )
 `export default userReview`

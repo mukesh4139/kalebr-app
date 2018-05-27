@@ -9,12 +9,12 @@
   <div class="questions-list users-list">
     {{#each model as |question|}}
         <div class="flex padtb1rem">
-            <div class="width5pc">{{question.id}}</div>
+            <div class="width5pc">{{question.id}}.</div>
           <div class="width65pc">{{question.statement}}</div>
           <div class="width10pc">
             {{#link-to 'questions/edit' question.id}} Edit{{/link-to}}
           </div>
-          <div class="width10pc" {{action 'deleteRecord' question}}>Del</div>
+          <div class="width10pc"> <span{{action 'deleteRecord' question}}>Delete</span></div>
           <div class="width20pc" {{action 'toggleOptions' question}}>
               Options {{#if question.showOptions}}&#9650; {{else}}&#9660; {{/if}}
           </div>

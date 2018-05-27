@@ -15,7 +15,7 @@ userPerformanceReview = Ember.Controller.extend
           self.get('model').get('reviewers').pushObject(user.content)
 
         @get('model').save().then (response) ->
-          self.transitionToRoute('users/reviews', self.get('model.reviewee'))
+          self.transitionToRoute('users/reviews', self.get('model.reviewee.id'))
       else
         alert 'Please Select at least one reviewers'
       false
