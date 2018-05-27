@@ -1,0 +1,41 @@
+<div class="review questions pad1rem">
+    <div class="questions-list users-list">
+      {{#each questions as |question|}}
+          <div class="flex padtb1rem">
+              <div class="width5pc">{{question.id}}.</div>
+              <div class="width65pc">{{question.statement}}</div>
+          </div>
+          <div class="flex padtb1rem">
+            {{#each question.options as |option|}}
+                <div class="single-option">
+                    <span {{action 'selectOption' question option}}>
+                      {{#if option.selected}}
+                        {{input type="checkbox" checked='checked'}}
+                      {{else}}
+                        {{input type="checkbox"}}
+                      {{/if}}
+                    </span>
+                  {{option.statement}}
+                </div>
+            {{/each}}
+          </div>
+          <div class="thick-border"></div>
+      {{/each}}
+    </div>
+    {{#if model.feedback}}
+      <h3>Your Comment</h3>
+      <div>{{model.feedback}}</div>
+    {{else}}
+        <div class="input-wrapper">
+            <div class="input-label"> Comment </div>
+          {{textarea value=comment rows="6"}}
+        </div>
+        <div class="button width15rem" {{action 'submitComment'}}>
+            Submit Comment
+        </div>
+    {{/if}}
+
+
+
+
+</div>

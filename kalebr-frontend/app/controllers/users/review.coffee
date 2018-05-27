@@ -1,5 +1,4 @@
 `import Ember from 'ember'`
-`import constants from "kalebr-frontend/utils/constants"`
 
 userReview = Ember.Controller.extend
   actions:

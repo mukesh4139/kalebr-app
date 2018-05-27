@@ -22,5 +22,6 @@ Router.map ->
 
   @route 'home'
 
+  @route 'users/reviewComment', path: 'users/:user_id/reviews/:review_id/comment'
 
 `export default Router`

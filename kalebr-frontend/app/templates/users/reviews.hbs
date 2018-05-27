@@ -14,7 +14,7 @@
               <div class="width10pc">{{review.id}}</div>
               <div class="width30pc">{{review.reviewer.fullname}}</div>
               <div class="width20pc">
-                {{#link-to 'users/review' session.currentUser (query-params view=true)}}View Reviews{{/link-to}}
+                {{#link-to 'users/reviewComment' session.currentUser.id review.id}}View Reviews{{/link-to}}
               </div>
           </div>
           <div class="thick-border"></div>

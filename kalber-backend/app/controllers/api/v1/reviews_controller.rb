@@ -1,6 +1,6 @@
 class Api::V1::ReviewsController < ApplicationController
-  before_action :set_review, only: [:show, :update, :destroy]
-  before_action :authenticate_request!, only: [:create, :update, :destroy]
+  before_action :set_review, only: [:show, :update, :destroy, :comment]
+  before_action :authenticate_request!, only: [:create, :update, :destroy, :comment]
 
   def index
     @reviews = Review.all.order(:id)
@@ -34,6 +34,11 @@ class Api::V1::ReviewsController < ApplicationController
     else
       render json: {message: "Review could not be deleted"}, status: 422
     end
+  end
+
+  def comment
+    @review.update(feedback: params[:comment])
+    render json: @review
   end
 
   private

@@ -11,7 +11,11 @@ Rails.application.routes.draw do
         end
       end
       resources :questions
-      resources :reviews
+      resources :reviews do
+        member do
+          post 'comment'
+        end
+      end
       resources :performance_reviews
     end
   end
