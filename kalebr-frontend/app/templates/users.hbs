@@ -19,7 +19,7 @@
                     {{#menu.link-to 'users/edit' user.id}} Edit{{/menu.link-to}}
                   {{/menu.item}}
                   {{#menu.item}}
-                    <div {{action 'deleteRecord' user}}>Destroy</div>
+                    <div class="destroy-action" {{action 'deleteRecord' user}}>Destroy</div>
                   {{/menu.item}}
                   {{#menu.item}}
                     {{#menu.link-to 'users/reviews' user.id}} Reviews{{/menu.link-to}}

@@ -1,7 +1,7 @@
 <div id="wrapper">
     <div class="app-container">
         <ul class="navigation">
-            <li><a href="#">Home</a></li>
+            <li>{{#link-to 'home'}}Home{{/link-to}}</li>
             {{#if session.currentUser}}
               {{#if session.currentUser.admin}}
                   <li>{{#link-to 'users'}} Users {{/link-to}}</li>

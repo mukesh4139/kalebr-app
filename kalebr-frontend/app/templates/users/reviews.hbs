@@ -1,7 +1,7 @@
 <div class="reviews pad1rem">
     <div class="flex flex-right">
         {{#if session.currentUser.admin}}
-          {{#link-to 'users/performanceReview' model.id}}
+          {{#link-to 'users/performanceReview' reviewee.id}}
               <div class="button">
                   Assign / Change Reviewers
               </div>

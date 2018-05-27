@@ -8,13 +8,7 @@
           <div class="flex padtb1rem">
             {{#each question.options as |option|}}
                 <div class="single-option">
-                    <span {{action 'selectOption' question option}}>
-                      {{#if option.selected}}
-                        {{input type="checkbox" checked='checked'}}
-                      {{else}}
-                        {{input type="checkbox"}}
-                      {{/if}}
-                    </span>
+                  {{input type="checkbox" checked=option.selected disabled=true}}
                   {{option.statement}}
                 </div>
             {{/each}}
@@ -34,8 +28,4 @@
             Submit Comment
         </div>
     {{/if}}
-
-
-
-
 </div>

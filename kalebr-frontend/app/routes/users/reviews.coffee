@@ -2,9 +2,13 @@
 
 userReviews = Ember.Route.extend(
   model: (params) ->
-    @get('session.currentUser.reviews')
+    self = @
+    @get('store').findRecord('user', params.id).then (reviewee) ->
+      self.set 'reviewee', reviewee
+      reviewee.get('reviews')
 
   setupController: (controller, model) ->
+    controller.set 'reviewee', @get('reviewee')
     controller.set 'model', model
 
 )
