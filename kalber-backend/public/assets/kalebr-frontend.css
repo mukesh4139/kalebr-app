@@ -55,7 +55,7 @@ body {
     border-radius: 6px;
     color: #000; }
   .input-wrapper textarea {
-    width: 25rem;
+    width: 35rem;
     padding: 10px;
     border-radius: 5px;
     background-color: #fff;
@@ -130,6 +130,7 @@ a {
 
 .thick-border {
   height: 8px;
+  margin: 0 -1rem;
   background: white; }
 
 .show {
@@ -162,6 +163,15 @@ a {
 
 .single-option {
   flex-basis: 25%; }
+
+.destroy-action {
+  display: block;
+  padding: 3px 20px;
+  clear: both;
+  font-weight: normal;
+  line-height: 1.42857;
+  color: #333333;
+  white-space: nowrap; }
 
 /*!
  * Bootstrap v3.3.7 (http://getbootstrap.com)

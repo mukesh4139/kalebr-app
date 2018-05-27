@@ -757,6 +757,34 @@ define('kalebr-frontend/controllers/users/performance-review', ['exports', 'embe
 
   exports['default'] = userPerformanceReview;
 });
+define('kalebr-frontend/controllers/users/review-comment', ['exports', 'ember', 'kalebr-frontend/utils/constants'], function (exports, _ember, _kalebrFrontendUtilsConstants) {
+  var userReview;
+
+  userReview = _ember['default'].Controller.extend({
+    comment: '',
+    actions: {
+      submitComment: function submitComment() {
+        var url;
+        url = _kalebrFrontendUtilsConstants['default'].HOST + _kalebrFrontendUtilsConstants['default'].NAMESPACE + '/reviews/' + this.get('model.id') + '/comment';
+        return $.ajax({
+          type: 'POST',
+          url: url,
+          data: {
+            comment: this.get('comment')
+          },
+          headers: {
+            Authorization: "Bearer " + window.localStorage.getItem('auth_token')
+          },
+          success: function success(response) {
+            return console.log('commented');
+          }
+        });
+      }
+    }
+  });
+
+  exports['default'] = userReview;
+});
 define('kalebr-frontend/controllers/users/review', ['exports', 'ember'], function (exports, _ember) {
   var userReview;
 
@@ -768,6 +796,27 @@ define('kalebr-frontend/controllers/users/review', ['exports', 'ember'], functio
         });
         option.set('selected', true);
         return false;
+      },
+      submitReview: function submitReview() {
+        var self;
+        self = this;
+        this.get('questions').forEach(function (question) {
+          var questionsAnswer, selectedOption;
+          selectedOption = void 0;
+          question.get('options').forEach(function (option) {
+            if (option.get('selected')) {
+              return selectedOption = option;
+            }
+          });
+          if (selectedOption) {
+            questionsAnswer = self.get('store').createRecord('questions-option', {
+              option: selectedOption,
+              question: question
+            });
+            return self.get('model').get('questionsOptions').pushObject(questionsAnswer);
+          }
+        });
+        return this.get('model').save();
       }
     }
   });
@@ -1130,14 +1179,30 @@ define('kalebr-frontend/models/question', ['exports', 'ember-data', 'ember-valid
 
   exports['default'] = questionModel;
 });
-define("kalebr-frontend/models/review", ["exports", "ember-data"], function (exports, _emberData) {
-  var reviewModel;
+define('kalebr-frontend/models/questions-option', ['exports', 'ember-data'], function (exports, _emberData) {
+  var questionsOption;
 
-  reviewModel = _emberData["default"].Model.extend({
-    feeback: _emberData["default"].attr('string')
+  questionsOption = _emberData['default'].Model.extend({
+    review: _emberData['default'].belongsTo('review'),
+    question: _emberData['default'].belongsTo('question'),
+    option: _emberData['default'].belongsTo('option')
   });
 
-  exports["default"] = reviewModel;
+  exports['default'] = questionsOption;
+});
+define('kalebr-frontend/models/review', ['exports', 'ember-data'], function (exports, _emberData) {
+  var reviewModel;
+
+  reviewModel = _emberData['default'].Model.extend({
+    feedback: _emberData['default'].attr('string'),
+    performanceReview: _emberData['default'].belongsTo('performanceReview'),
+    reviewer: _emberData['default'].belongsTo('user', {
+      inverse: null
+    }),
+    questionsOptions: _emberData['default'].hasMany('questions-option')
+  });
+
+  exports['default'] = reviewModel;
 });
 define('kalebr-frontend/models/user', ['exports', 'ember-data', 'ember-validations'], function (exports, _emberData, _emberValidations) {
   var userModel;
@@ -1154,6 +1219,10 @@ define('kalebr-frontend/models/user', ['exports', 'ember-data', 'ember-validatio
     othersPerformanceReviews: _emberData['default'].hasMany('performance-review', {
       inverse: null
     }),
+    scopedReview: _emberData['default'].belongsTo('review', {
+      inverse: null
+    }),
+    reviews: _emberData['default'].hasMany('review'),
     fullname: (function () {
       return this.get('firstname') + ' ' + this.get('lastname');
     }).property('firstname', 'lastname'),
@@ -1183,10 +1252,10 @@ define('kalebr-frontend/router', ['exports', 'ember', 'kalebr-frontend/config/en
 
   Router.map(function () {
     this.route('users', {
-      path: '/'
+      path: '/users'
     });
     this.route('login', {
-      path: '/login'
+      path: '/'
     });
     this.route('questions');
     this.route('questions/new');
@@ -1209,7 +1278,10 @@ define('kalebr-frontend/router', ['exports', 'ember', 'kalebr-frontend/config/en
     this.route('users/othersPerformanceReviews', {
       path: 'users/:id/othersPerformanceReviews'
     });
-    return this.route('home');
+    this.route('home');
+    return this.route('users/reviewComment', {
+      path: 'users/:user_id/reviews/:review_id/comment'
+    });
   });
 
   exports['default'] = Router;
@@ -1239,12 +1311,12 @@ define('kalebr-frontend/routes/application', ['exports', 'ember', 'kalebr-fronte
             self.get('session').set('currentUser', currUser);
             return console.log(data.user.email, 'logged in');
           } else {
-            console.log(msg.responseJSON.errors[0]);
+            console.log(data.errors[0]);
             return self.replaceWith('login');
           }
         },
         error: function error(msg) {
-          console.log(msg.responseJSON.errors[0]);
+          console.log(data.errors[0]);
           return self.replaceWith('login');
         }
       });
@@ -1262,12 +1334,27 @@ define('kalebr-frontend/routes/application', ['exports', 'ember', 'kalebr-fronte
   exports['default'] = applicationRoute;
 });
 define('kalebr-frontend/routes/home', ['exports', 'ember'], function (exports, _ember) {
-  exports['default'] = _ember['default'].Route.extend();
+  var home;
+
+  home = _ember['default'].Route.extend({
+    beforeModel: function beforeModel() {
+      if (!this.get('session.currentUser')) {
+        return this.transitionTo('login');
+      }
+    }
+  });
+
+  exports['default'] = home;
 });
 define('kalebr-frontend/routes/login', ['exports', 'ember'], function (exports, _ember) {
   var login;
 
   login = _ember['default'].Route.extend({
+    beforeModel: function beforeModel() {
+      if (this.get('session.currentUser')) {
+        return this.transitionTo('home');
+      }
+    },
     setupController: function setupController(controller, model) {
       controller.reset();
       return controller.set('model', model);
@@ -1447,6 +1534,41 @@ define('kalebr-frontend/routes/users/performance-review', ['exports', 'ember'], 
 
   exports['default'] = userPerformanceReviewRoute;
 });
+define('kalebr-frontend/routes/users/review-comment', ['exports', 'ember'], function (exports, _ember) {
+  var userReviewComment;
+
+  userReviewComment = _ember['default'].Route.extend({
+    model: function model(params) {
+      var self;
+      self = this;
+      return this.get('store').findAll('question', {
+        review_id: params.review_id
+      }).then(function (response) {
+        self.set('questions', response);
+        return self.get('store').findRecord('review', params.review_id);
+      });
+    },
+    setupController: function setupController(controller, model) {
+      var self;
+      self = this;
+      this.get('questions').forEach(function (question) {
+        return question.get('options').forEach(function (option) {
+          return model.get('questionsOptions').forEach(function (questionOption) {
+            if (questionOption.get('question.id') === question.id) {
+              if (option.id === questionOption.get('option.id')) {
+                return option.set('selected', true);
+              }
+            }
+          });
+        });
+      });
+      controller.set('questions', this.get('questions'));
+      return controller.set('model', model);
+    }
+  });
+
+  exports['default'] = userReviewComment;
+});
 define('kalebr-frontend/routes/users/review', ['exports', 'ember'], function (exports, _ember) {
   var userReview;
 
@@ -1456,7 +1578,17 @@ define('kalebr-frontend/routes/users/review', ['exports', 'ember'], function (ex
       self = this;
       return this.get('store').findAll('question').then(function (response) {
         self.set('questions', response);
-        return self.get('store').findRecord('user', params.id);
+        return self.get('store').findRecord('user', params.id).then(function (reviewee) {
+          self.set('reviewee', reviewee);
+          if (self.get('session.currentUser.scopedReview.id')) {
+            return self.get('session.currentUser.scopedReview');
+          } else {
+            return self.get('store').createRecord('review', {
+              reviewer: self.get('session.currentUser'),
+              performanceReview: self.get('reviewee.selfPerformanceReview')
+            });
+          }
+        });
       });
     },
     setupController: function setupController(controller, model) {
@@ -1472,9 +1604,15 @@ define('kalebr-frontend/routes/users/reviews', ['exports', 'ember'], function (e
 
   userReviews = _ember['default'].Route.extend({
     model: function model(params) {
-      return this.get('store').findRecord('user', params.id);
+      var self;
+      self = this;
+      return this.get('store').findRecord('user', params.id).then(function (reviewee) {
+        self.set('reviewee', reviewee);
+        return reviewee.get('reviews');
+      });
     },
     setupController: function setupController(controller, model) {
+      controller.set('reviewee', this.get('reviewee'));
       return controller.set('model', model);
     }
   });
@@ -1492,6 +1630,9 @@ define('kalebr-frontend/serializers/application', ['exports', 'ember-data', 'act
       reviewers: {
         serialize: 'ids',
         deserialize: 'ids'
+      },
+      questionsOptions: {
+        embedded: 'always'
       }
     }
   });
@@ -1526,6 +1667,41 @@ define('kalebr-frontend/services/validations', ['exports', 'ember'], function (e
 define("kalebr-frontend/templates/application", ["exports"], function (exports) {
   exports["default"] = Ember.HTMLBars.template((function () {
     var child0 = (function () {
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 4,
+              "column": 16
+            },
+            "end": {
+              "line": 4,
+              "column": 39
+            }
+          },
+          "moduleName": "kalebr-frontend/templates/application.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("Home");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes() {
+          return [];
+        },
+        statements: [],
+        locals: [],
+        templates: []
+      };
+    })();
+    var child1 = (function () {
       var child0 = (function () {
         var child0 = (function () {
           return {
@@ -1658,7 +1834,7 @@ define("kalebr-frontend/templates/application", ["exports"], function (exports) 
               },
               "end": {
                 "line": 10,
-                "column": 92
+                "column": 86
               }
             },
             "moduleName": "kalebr-frontend/templates/application.hbs"
@@ -1669,7 +1845,7 @@ define("kalebr-frontend/templates/application", ["exports"], function (exports) 
           hasRendered: false,
           buildFragment: function buildFragment(dom) {
             var el0 = dom.createDocumentFragment();
-            var el1 = dom.createTextNode(" Self Performance Reviews ");
+            var el1 = dom.createTextNode(" Self Perf. Reviews ");
             dom.appendChild(el0, el1);
             return el0;
           },
@@ -1693,7 +1869,7 @@ define("kalebr-frontend/templates/application", ["exports"], function (exports) 
               },
               "end": {
                 "line": 11,
-                "column": 110
+                "column": 105
               }
             },
             "moduleName": "kalebr-frontend/templates/application.hbs"
@@ -1704,7 +1880,7 @@ define("kalebr-frontend/templates/application", ["exports"], function (exports) 
           hasRendered: false,
           buildFragment: function buildFragment(dom) {
             var el0 = dom.createDocumentFragment();
-            var el1 = dom.createTextNode(" Other Performance Reviews ");
+            var el1 = dom.createTextNode(" Others Perf. Reviews ");
             dom.appendChild(el0, el1);
             return el0;
           },
@@ -1772,12 +1948,12 @@ define("kalebr-frontend/templates/application", ["exports"], function (exports) 
           dom.insertBoundary(fragment, 0);
           return morphs;
         },
-        statements: [["block", "if", [["get", "session.currentUser.admin", ["loc", [null, [6, 20], [6, 45]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [6, 14], [9, 21]]]], ["block", "link-to", ["users/reviews", ["get", "session.currentUser", ["loc", [null, [10, 45], [10, 64]]], 0, 0, 0, 0]], [], 1, null, ["loc", [null, [10, 18], [10, 104]]]], ["block", "link-to", ["users/othersPerformanceReviews", ["get", "session.currentUser", ["loc", [null, [11, 62], [11, 81]]], 0, 0, 0, 0]], [], 2, null, ["loc", [null, [11, 18], [11, 122]]]], ["element", "action", ["logout"], [], ["loc", [null, [12, 18], [12, 37]]], 0, 0]],
+        statements: [["block", "if", [["get", "session.currentUser.admin", ["loc", [null, [6, 20], [6, 45]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [6, 14], [9, 21]]]], ["block", "link-to", ["users/reviews", ["get", "session.currentUser", ["loc", [null, [10, 45], [10, 64]]], 0, 0, 0, 0]], [], 1, null, ["loc", [null, [10, 18], [10, 98]]]], ["block", "link-to", ["users/othersPerformanceReviews", ["get", "session.currentUser", ["loc", [null, [11, 62], [11, 81]]], 0, 0, 0, 0]], [], 2, null, ["loc", [null, [11, 18], [11, 117]]]], ["element", "action", ["logout"], [], ["loc", [null, [12, 18], [12, 37]]], 0, 0]],
         locals: [],
         templates: [child0, child1, child2]
       };
     })();
-    var child1 = (function () {
+    var child2 = (function () {
       return {
         meta: {
           "revision": "Ember@2.8.3",
@@ -1853,10 +2029,7 @@ define("kalebr-frontend/templates/application", ["exports"], function (exports) 
         var el4 = dom.createTextNode("\n            ");
         dom.appendChild(el3, el4);
         var el4 = dom.createElement("li");
-        var el5 = dom.createElement("a");
-        dom.setAttribute(el5, "href", "#");
-        var el6 = dom.createTextNode("Home");
-        dom.appendChild(el5, el6);
+        var el5 = dom.createComment("");
         dom.appendChild(el4, el5);
         dom.appendChild(el3, el4);
         var el4 = dom.createTextNode("\n");
@@ -1889,14 +2062,16 @@ define("kalebr-frontend/templates/application", ["exports"], function (exports) 
       },
       buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
         var element1 = dom.childAt(fragment, [0, 1]);
-        var morphs = new Array(2);
-        morphs[0] = dom.createMorphAt(dom.childAt(element1, [1]), 3, 3);
-        morphs[1] = dom.createMorphAt(dom.childAt(element1, [3]), 1, 1);
+        var element2 = dom.childAt(element1, [1]);
+        var morphs = new Array(3);
+        morphs[0] = dom.createMorphAt(dom.childAt(element2, [1]), 0, 0);
+        morphs[1] = dom.createMorphAt(element2, 3, 3);
+        morphs[2] = dom.createMorphAt(dom.childAt(element1, [3]), 1, 1);
         return morphs;
       },
-      statements: [["block", "if", [["get", "session.currentUser", ["loc", [null, [5, 18], [5, 37]]], 0, 0, 0, 0]], [], 0, 1, ["loc", [null, [5, 12], [15, 19]]]], ["content", "outlet", ["loc", [null, [18, 10], [18, 20]]], 0, 0, 0, 0]],
+      statements: [["block", "link-to", ["home"], [], 0, null, ["loc", [null, [4, 16], [4, 51]]]], ["block", "if", [["get", "session.currentUser", ["loc", [null, [5, 18], [5, 37]]], 0, 0, 0, 0]], [], 1, 2, ["loc", [null, [5, 12], [15, 19]]]], ["content", "outlet", ["loc", [null, [18, 10], [18, 20]]], 0, 0, 0, 0]],
       locals: [],
-      templates: [child0, child1]
+      templates: [child0, child1, child2]
     };
   })());
 });
@@ -3027,6 +3202,7 @@ define("kalebr-frontend/templates/users", ["exports"], function (exports) {
                 var el1 = dom.createTextNode("                    ");
                 dom.appendChild(el0, el1);
                 var el1 = dom.createElement("div");
+                dom.setAttribute(el1, "class", "destroy-action");
                 var el2 = dom.createTextNode("Destroy");
                 dom.appendChild(el1, el2);
                 dom.appendChild(el0, el1);
@@ -3040,7 +3216,7 @@ define("kalebr-frontend/templates/users", ["exports"], function (exports) {
                 morphs[0] = dom.createElementMorph(element0);
                 return morphs;
               },
-              statements: [["element", "action", ["deleteRecord", ["get", "user", ["loc", [null, [22, 49], [22, 53]]], 0, 0, 0, 0]], [], ["loc", [null, [22, 25], [22, 55]]], 0, 0]],
+              statements: [["element", "action", ["deleteRecord", ["get", "user", ["loc", [null, [22, 72], [22, 76]]], 0, 0, 0, 0]], [], ["loc", [null, [22, 48], [22, 78]]], 0, 0]],
               locals: [],
               templates: []
             };
@@ -3810,18 +3986,53 @@ define("kalebr-frontend/templates/users/others-performance-reviews", ["exports"]
   exports["default"] = Ember.HTMLBars.template((function () {
     var child0 = (function () {
       var child0 = (function () {
+        var child0 = (function () {
+          return {
+            meta: {
+              "revision": "Ember@2.8.3",
+              "loc": {
+                "source": null,
+                "start": {
+                  "line": 9,
+                  "column": 18
+                },
+                "end": {
+                  "line": 9,
+                  "column": 84
+                }
+              },
+              "moduleName": "kalebr-frontend/templates/users/others-performance-reviews.hbs"
+            },
+            isEmpty: false,
+            arity: 0,
+            cachedFragment: null,
+            hasRendered: false,
+            buildFragment: function buildFragment(dom) {
+              var el0 = dom.createDocumentFragment();
+              var el1 = dom.createTextNode("Go to Review");
+              dom.appendChild(el0, el1);
+              return el0;
+            },
+            buildRenderNodes: function buildRenderNodes() {
+              return [];
+            },
+            statements: [],
+            locals: [],
+            templates: []
+          };
+        })();
         return {
           meta: {
             "revision": "Ember@2.8.3",
             "loc": {
               "source": null,
               "start": {
-                "line": 7,
-                "column": 14
+                "line": 8,
+                "column": 16
               },
               "end": {
-                "line": 7,
-                "column": 102
+                "line": 10,
+                "column": 16
               }
             },
             "moduleName": "kalebr-frontend/templates/users/others-performance-reviews.hbs"
@@ -3832,10 +4043,48 @@ define("kalebr-frontend/templates/users/others-performance-reviews", ["exports"]
           hasRendered: false,
           buildFragment: function buildFragment(dom) {
             var el0 = dom.createDocumentFragment();
-            var el1 = dom.createElement("div");
-            dom.setAttribute(el1, "class", "width20pc");
-            var el2 = dom.createTextNode("Go to Review");
-            dom.appendChild(el1, el2);
+            var el1 = dom.createTextNode("                  ");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createComment("");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createTextNode("\n");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+            var morphs = new Array(1);
+            morphs[0] = dom.createMorphAt(fragment, 1, 1, contextualElement);
+            return morphs;
+          },
+          statements: [["block", "link-to", ["users/review", ["get", "performanceReview.reviewee", ["loc", [null, [9, 44], [9, 70]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [9, 18], [9, 96]]]]],
+          locals: [],
+          templates: [child0]
+        };
+      })();
+      var child1 = (function () {
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": {
+              "source": null,
+              "start": {
+                "line": 10,
+                "column": 16
+              },
+              "end": {
+                "line": 12,
+                "column": 16
+              }
+            },
+            "moduleName": "kalebr-frontend/templates/users/others-performance-reviews.hbs"
+          },
+          isEmpty: false,
+          arity: 0,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createTextNode("                  Reviewed\n");
             dom.appendChild(el0, el1);
             return el0;
           },
@@ -3857,7 +4106,7 @@ define("kalebr-frontend/templates/users/others-performance-reviews", ["exports"]
               "column": 6
             },
             "end": {
-              "line": 9,
+              "line": 15,
               "column": 6
             }
           },
@@ -3889,7 +4138,14 @@ define("kalebr-frontend/templates/users/others-performance-reviews", ["exports"]
           dom.appendChild(el1, el2);
           var el2 = dom.createTextNode("\n              ");
           dom.appendChild(el1, el2);
-          var el2 = dom.createComment("");
+          var el2 = dom.createElement("div");
+          dom.setAttribute(el2, "class", "width20pc");
+          var el3 = dom.createTextNode("\n");
+          dom.appendChild(el2, el3);
+          var el3 = dom.createComment("");
+          dom.appendChild(el2, el3);
+          var el3 = dom.createTextNode("              ");
+          dom.appendChild(el2, el3);
           dom.appendChild(el1, el2);
           var el2 = dom.createTextNode("\n          ");
           dom.appendChild(el1, el2);
@@ -3903,12 +4159,12 @@ define("kalebr-frontend/templates/users/others-performance-reviews", ["exports"]
           var morphs = new Array(3);
           morphs[0] = dom.createMorphAt(dom.childAt(element0, [1]), 0, 0);
           morphs[1] = dom.createMorphAt(dom.childAt(element0, [3]), 0, 0);
-          morphs[2] = dom.createMorphAt(element0, 5, 5);
+          morphs[2] = dom.createMorphAt(dom.childAt(element0, [5]), 1, 1);
           return morphs;
         },
-        statements: [["content", "performanceReview.id", ["loc", [null, [5, 37], [5, 61]]], 0, 0, 0, 0], ["content", "performanceReview.reviewee.fullname", ["loc", [null, [6, 37], [6, 76]]], 0, 0, 0, 0], ["block", "link-to", ["users/review", ["get", "session.currentUser", ["loc", [null, [7, 40], [7, 59]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [7, 14], [7, 114]]]]],
+        statements: [["content", "performanceReview.id", ["loc", [null, [5, 37], [5, 61]]], 0, 0, 0, 0], ["content", "performanceReview.reviewee.fullname", ["loc", [null, [6, 37], [6, 76]]], 0, 0, 0, 0], ["block", "unless", [["get", "performanceReview.reviewee.scopedReview", ["loc", [null, [8, 26], [8, 65]]], 0, 0, 0, 0]], [], 0, 1, ["loc", [null, [8, 16], [12, 27]]]]],
         locals: ["performanceReview"],
-        templates: [child0]
+        templates: [child0, child1]
       };
     })();
     return {
@@ -3921,7 +4177,7 @@ define("kalebr-frontend/templates/users/others-performance-reviews", ["exports"]
             "column": 0
           },
           "end": {
-            "line": 12,
+            "line": 18,
             "column": 0
           }
         },
@@ -3958,7 +4214,7 @@ define("kalebr-frontend/templates/users/others-performance-reviews", ["exports"]
         morphs[0] = dom.createMorphAt(dom.childAt(fragment, [0, 1]), 1, 1);
         return morphs;
       },
-      statements: [["block", "each", [["get", "model", ["loc", [null, [3, 14], [3, 19]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [3, 6], [9, 15]]]]],
+      statements: [["block", "each", [["get", "model", ["loc", [null, [3, 14], [3, 19]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [3, 6], [15, 15]]]]],
       locals: [],
       templates: [child0]
     };
@@ -4186,6 +4442,311 @@ define("kalebr-frontend/templates/users/performance-review", ["exports"], functi
         return morphs;
       },
       statements: [["content", "model.reviewee.firstname", ["loc", [null, [3, 25], [3, 54]]], 0, 0, 0, 0], ["content", "model.reviewee.lastname", ["loc", [null, [3, 55], [3, 82]]], 0, 0, 0, 0], ["block", "each", [["get", "users", ["loc", [null, [11, 14], [11, 19]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [11, 6], [16, 15]]]], ["element", "action", ["createPerformanceReview"], [], ["loc", [null, [19, 35], [19, 71]]], 0, 0], ["block", "if", [["get", "model.id", ["loc", [null, [20, 12], [20, 20]]], 0, 0, 0, 0]], [], 1, 2, ["loc", [null, [20, 6], [24, 13]]]]],
+      locals: [],
+      templates: [child0, child1, child2]
+    };
+  })());
+});
+define("kalebr-frontend/templates/users/review-comment", ["exports"], function (exports) {
+  exports["default"] = Ember.HTMLBars.template((function () {
+    var child0 = (function () {
+      var child0 = (function () {
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": {
+              "source": null,
+              "start": {
+                "line": 9,
+                "column": 12
+              },
+              "end": {
+                "line": 14,
+                "column": 12
+              }
+            },
+            "moduleName": "kalebr-frontend/templates/users/review-comment.hbs"
+          },
+          isEmpty: false,
+          arity: 1,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createTextNode("                ");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createElement("div");
+            dom.setAttribute(el1, "class", "single-option");
+            var el2 = dom.createTextNode("\n                  ");
+            dom.appendChild(el1, el2);
+            var el2 = dom.createComment("");
+            dom.appendChild(el1, el2);
+            var el2 = dom.createTextNode("\n                  ");
+            dom.appendChild(el1, el2);
+            var el2 = dom.createComment("");
+            dom.appendChild(el1, el2);
+            var el2 = dom.createTextNode("\n                ");
+            dom.appendChild(el1, el2);
+            dom.appendChild(el0, el1);
+            var el1 = dom.createTextNode("\n");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+            var element1 = dom.childAt(fragment, [1]);
+            var morphs = new Array(2);
+            morphs[0] = dom.createMorphAt(element1, 1, 1);
+            morphs[1] = dom.createMorphAt(element1, 3, 3);
+            return morphs;
+          },
+          statements: [["inline", "input", [], ["type", "checkbox", "checked", ["subexpr", "@mut", [["get", "option.selected", ["loc", [null, [11, 50], [11, 65]]], 0, 0, 0, 0]], [], [], 0, 0], "disabled", true], ["loc", [null, [11, 18], [11, 81]]], 0, 0], ["content", "option.statement", ["loc", [null, [12, 18], [12, 38]]], 0, 0, 0, 0]],
+          locals: ["option"],
+          templates: []
+        };
+      })();
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 3,
+              "column": 6
+            },
+            "end": {
+              "line": 17,
+              "column": 6
+            }
+          },
+          "moduleName": "kalebr-frontend/templates/users/review-comment.hbs"
+        },
+        isEmpty: false,
+        arity: 1,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("          ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("div");
+          dom.setAttribute(el1, "class", "flex padtb1rem");
+          var el2 = dom.createTextNode("\n              ");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createElement("div");
+          dom.setAttribute(el2, "class", "width5pc");
+          var el3 = dom.createComment("");
+          dom.appendChild(el2, el3);
+          var el3 = dom.createTextNode(".");
+          dom.appendChild(el2, el3);
+          dom.appendChild(el1, el2);
+          var el2 = dom.createTextNode("\n              ");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createElement("div");
+          dom.setAttribute(el2, "class", "width65pc");
+          var el3 = dom.createComment("");
+          dom.appendChild(el2, el3);
+          dom.appendChild(el1, el2);
+          var el2 = dom.createTextNode("\n          ");
+          dom.appendChild(el1, el2);
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n          ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("div");
+          dom.setAttribute(el1, "class", "flex padtb1rem");
+          var el2 = dom.createTextNode("\n");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createComment("");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createTextNode("          ");
+          dom.appendChild(el1, el2);
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n          ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("div");
+          dom.setAttribute(el1, "class", "thick-border");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var element2 = dom.childAt(fragment, [1]);
+          var morphs = new Array(3);
+          morphs[0] = dom.createMorphAt(dom.childAt(element2, [1]), 0, 0);
+          morphs[1] = dom.createMorphAt(dom.childAt(element2, [3]), 0, 0);
+          morphs[2] = dom.createMorphAt(dom.childAt(fragment, [3]), 1, 1);
+          return morphs;
+        },
+        statements: [["content", "question.id", ["loc", [null, [5, 36], [5, 51]]], 0, 0, 0, 0], ["content", "question.statement", ["loc", [null, [6, 37], [6, 59]]], 0, 0, 0, 0], ["block", "each", [["get", "question.options", ["loc", [null, [9, 20], [9, 36]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [9, 12], [14, 21]]]]],
+        locals: ["question"],
+        templates: [child0]
+      };
+    })();
+    var child1 = (function () {
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 19,
+              "column": 4
+            },
+            "end": {
+              "line": 22,
+              "column": 4
+            }
+          },
+          "moduleName": "kalebr-frontend/templates/users/review-comment.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("      ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("h3");
+          var el2 = dom.createTextNode("Your Comment");
+          dom.appendChild(el1, el2);
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n      ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("div");
+          var el2 = dom.createComment("");
+          dom.appendChild(el1, el2);
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(1);
+          morphs[0] = dom.createMorphAt(dom.childAt(fragment, [3]), 0, 0);
+          return morphs;
+        },
+        statements: [["content", "model.feedback", ["loc", [null, [21, 11], [21, 29]]], 0, 0, 0, 0]],
+        locals: [],
+        templates: []
+      };
+    })();
+    var child2 = (function () {
+      return {
+        meta: {
+          "revision": "Ember@2.8.3",
+          "loc": {
+            "source": null,
+            "start": {
+              "line": 22,
+              "column": 4
+            },
+            "end": {
+              "line": 30,
+              "column": 4
+            }
+          },
+          "moduleName": "kalebr-frontend/templates/users/review-comment.hbs"
+        },
+        isEmpty: false,
+        arity: 0,
+        cachedFragment: null,
+        hasRendered: false,
+        buildFragment: function buildFragment(dom) {
+          var el0 = dom.createDocumentFragment();
+          var el1 = dom.createTextNode("        ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("div");
+          dom.setAttribute(el1, "class", "input-wrapper");
+          var el2 = dom.createTextNode("\n            ");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createElement("div");
+          dom.setAttribute(el2, "class", "input-label");
+          var el3 = dom.createTextNode(" Comment ");
+          dom.appendChild(el2, el3);
+          dom.appendChild(el1, el2);
+          var el2 = dom.createTextNode("\n          ");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createComment("");
+          dom.appendChild(el1, el2);
+          var el2 = dom.createTextNode("\n        ");
+          dom.appendChild(el1, el2);
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n        ");
+          dom.appendChild(el0, el1);
+          var el1 = dom.createElement("div");
+          dom.setAttribute(el1, "class", "button width15rem");
+          var el2 = dom.createTextNode("\n            Submit Comment\n        ");
+          dom.appendChild(el1, el2);
+          dom.appendChild(el0, el1);
+          var el1 = dom.createTextNode("\n");
+          dom.appendChild(el0, el1);
+          return el0;
+        },
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var element0 = dom.childAt(fragment, [3]);
+          var morphs = new Array(2);
+          morphs[0] = dom.createMorphAt(dom.childAt(fragment, [1]), 3, 3);
+          morphs[1] = dom.createElementMorph(element0);
+          return morphs;
+        },
+        statements: [["inline", "textarea", [], ["value", ["subexpr", "@mut", [["get", "comment", ["loc", [null, [25, 27], [25, 34]]], 0, 0, 0, 0]], [], [], 0, 0], "rows", "6"], ["loc", [null, [25, 10], [25, 45]]], 0, 0], ["element", "action", ["submitComment"], [], ["loc", [null, [27, 39], [27, 65]]], 0, 0]],
+        locals: [],
+        templates: []
+      };
+    })();
+    return {
+      meta: {
+        "revision": "Ember@2.8.3",
+        "loc": {
+          "source": null,
+          "start": {
+            "line": 1,
+            "column": 0
+          },
+          "end": {
+            "line": 32,
+            "column": 0
+          }
+        },
+        "moduleName": "kalebr-frontend/templates/users/review-comment.hbs"
+      },
+      isEmpty: false,
+      arity: 0,
+      cachedFragment: null,
+      hasRendered: false,
+      buildFragment: function buildFragment(dom) {
+        var el0 = dom.createDocumentFragment();
+        var el1 = dom.createElement("div");
+        dom.setAttribute(el1, "class", "review questions pad1rem");
+        var el2 = dom.createTextNode("\n    ");
+        dom.appendChild(el1, el2);
+        var el2 = dom.createElement("div");
+        dom.setAttribute(el2, "class", "questions-list users-list");
+        var el3 = dom.createTextNode("\n");
+        dom.appendChild(el2, el3);
+        var el3 = dom.createComment("");
+        dom.appendChild(el2, el3);
+        var el3 = dom.createTextNode("    ");
+        dom.appendChild(el2, el3);
+        dom.appendChild(el1, el2);
+        var el2 = dom.createTextNode("\n");
+        dom.appendChild(el1, el2);
+        var el2 = dom.createComment("");
+        dom.appendChild(el1, el2);
+        dom.appendChild(el0, el1);
+        var el1 = dom.createTextNode("\n");
+        dom.appendChild(el0, el1);
+        return el0;
+      },
+      buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+        var element3 = dom.childAt(fragment, [0]);
+        var morphs = new Array(2);
+        morphs[0] = dom.createMorphAt(dom.childAt(element3, [1]), 1, 1);
+        morphs[1] = dom.createMorphAt(element3, 3, 3);
+        return morphs;
+      },
+      statements: [["block", "each", [["get", "questions", ["loc", [null, [3, 14], [3, 23]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [3, 6], [17, 15]]]], ["block", "if", [["get", "model.feedback", ["loc", [null, [19, 10], [19, 24]]], 0, 0, 0, 0]], [], 1, 2, ["loc", [null, [19, 4], [30, 11]]]]],
       locals: [],
       templates: [child0, child1, child2]
     };
@@ -4426,7 +4987,7 @@ define("kalebr-frontend/templates/users/review", ["exports"], function (exports)
             "column": 0
           },
           "end": {
-            "line": 31,
+            "line": 29,
             "column": 0
           }
         },
@@ -4451,17 +5012,17 @@ define("kalebr-frontend/templates/users/review", ["exports"], function (exports)
         var el3 = dom.createTextNode("    ");
         dom.appendChild(el2, el3);
         dom.appendChild(el1, el2);
-        var el2 = dom.createTextNode("\n\n    ");
+        var el2 = dom.createTextNode("\n    ");
         dom.appendChild(el1, el2);
         var el2 = dom.createElement("div");
         dom.setAttribute(el2, "class", "button width15rem");
-        var el3 = dom.createTextNode("\n      Submit Review\n    ");
+        var el3 = dom.createTextNode("\n        Submit Review\n    ");
         dom.appendChild(el2, el3);
         dom.appendChild(el1, el2);
         var el2 = dom.createTextNode("\n");
         dom.appendChild(el1, el2);
         dom.appendChild(el0, el1);
-        var el1 = dom.createTextNode("\n\n");
+        var el1 = dom.createTextNode("\n");
         dom.appendChild(el0, el1);
         return el0;
       },
@@ -4473,7 +5034,7 @@ define("kalebr-frontend/templates/users/review", ["exports"], function (exports)
         morphs[1] = dom.createElementMorph(element4);
         return morphs;
       },
-      statements: [["block", "each", [["get", "questions", ["loc", [null, [3, 14], [3, 23]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [3, 6], [23, 15]]]], ["element", "action", ["submitReview"], [], ["loc", [null, [26, 35], [26, 60]]], 0, 0]],
+      statements: [["block", "each", [["get", "questions", ["loc", [null, [3, 14], [3, 23]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [3, 6], [23, 15]]]], ["element", "action", ["submitReview"], [], ["loc", [null, [25, 35], [25, 60]]], 0, 0]],
       locals: [],
       templates: [child0]
     };
@@ -4482,6 +5043,48 @@ define("kalebr-frontend/templates/users/review", ["exports"], function (exports)
 define("kalebr-frontend/templates/users/reviews", ["exports"], function (exports) {
   exports["default"] = Ember.HTMLBars.template((function () {
     var child0 = (function () {
+      var child0 = (function () {
+        return {
+          meta: {
+            "revision": "Ember@2.8.3",
+            "loc": {
+              "source": null,
+              "start": {
+                "line": 4,
+                "column": 10
+              },
+              "end": {
+                "line": 8,
+                "column": 10
+              }
+            },
+            "moduleName": "kalebr-frontend/templates/users/reviews.hbs"
+          },
+          isEmpty: false,
+          arity: 0,
+          cachedFragment: null,
+          hasRendered: false,
+          buildFragment: function buildFragment(dom) {
+            var el0 = dom.createDocumentFragment();
+            var el1 = dom.createTextNode("              ");
+            dom.appendChild(el0, el1);
+            var el1 = dom.createElement("div");
+            dom.setAttribute(el1, "class", "button");
+            var el2 = dom.createTextNode("\n                  Assign / Change Reviewers\n              ");
+            dom.appendChild(el1, el2);
+            dom.appendChild(el0, el1);
+            var el1 = dom.createTextNode("\n");
+            dom.appendChild(el0, el1);
+            return el0;
+          },
+          buildRenderNodes: function buildRenderNodes() {
+            return [];
+          },
+          statements: [],
+          locals: [],
+          templates: []
+        };
+      })();
       return {
         meta: {
           "revision": "Ember@2.8.3",
@@ -4489,11 +5092,11 @@ define("kalebr-frontend/templates/users/reviews", ["exports"], function (exports
             "source": null,
             "start": {
               "line": 3,
-              "column": 6
+              "column": 8
             },
             "end": {
-              "line": 7,
-              "column": 6
+              "line": 9,
+              "column": 8
             }
           },
           "moduleName": "kalebr-frontend/templates/users/reviews.hbs"
@@ -4504,23 +5107,20 @@ define("kalebr-frontend/templates/users/reviews", ["exports"], function (exports
         hasRendered: false,
         buildFragment: function buildFragment(dom) {
           var el0 = dom.createDocumentFragment();
-          var el1 = dom.createTextNode("          ");
-          dom.appendChild(el0, el1);
-          var el1 = dom.createElement("div");
-          dom.setAttribute(el1, "class", "button");
-          var el2 = dom.createTextNode("\n              Assign / Change Reviewers\n          ");
-          dom.appendChild(el1, el2);
-          dom.appendChild(el0, el1);
-          var el1 = dom.createTextNode("\n");
+          var el1 = dom.createComment("");
           dom.appendChild(el0, el1);
           return el0;
         },
-        buildRenderNodes: function buildRenderNodes() {
-          return [];
+        buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
+          var morphs = new Array(1);
+          morphs[0] = dom.createMorphAt(fragment, 0, 0, contextualElement);
+          dom.insertBoundary(fragment, 0);
+          dom.insertBoundary(fragment, null);
+          return morphs;
         },
-        statements: [],
+        statements: [["block", "link-to", ["users/performanceReview", ["get", "reviewee.id", ["loc", [null, [4, 47], [4, 58]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [4, 10], [8, 22]]]]],
         locals: [],
-        templates: []
+        templates: [child0]
       };
     })();
     var child1 = (function () {
@@ -4531,12 +5131,12 @@ define("kalebr-frontend/templates/users/reviews", ["exports"], function (exports
             "loc": {
               "source": null,
               "start": {
-                "line": 15,
+                "line": 17,
                 "column": 16
               },
               "end": {
-                "line": 15,
-                "column": 62
+                "line": 17,
+                "column": 95
               }
             },
             "moduleName": "kalebr-frontend/templates/users/reviews.hbs"
@@ -4547,7 +5147,7 @@ define("kalebr-frontend/templates/users/reviews", ["exports"], function (exports
           hasRendered: false,
           buildFragment: function buildFragment(dom) {
             var el0 = dom.createDocumentFragment();
-            var el1 = dom.createTextNode(" Edit");
+            var el1 = dom.createTextNode("View Reviews");
             dom.appendChild(el0, el1);
             return el0;
           },
@@ -4556,132 +5156,6 @@ define("kalebr-frontend/templates/users/reviews", ["exports"], function (exports
           },
           statements: [],
           locals: [],
-          templates: []
-        };
-      })();
-      var child1 = (function () {
-        return {
-          meta: {
-            "revision": "Ember@2.8.3",
-            "loc": {
-              "source": null,
-              "start": {
-                "line": 19,
-                "column": 26
-              },
-              "end": {
-                "line": 19,
-                "column": 62
-              }
-            },
-            "moduleName": "kalebr-frontend/templates/users/reviews.hbs"
-          },
-          isEmpty: false,
-          arity: 0,
-          cachedFragment: null,
-          hasRendered: false,
-          buildFragment: function buildFragment(dom) {
-            var el0 = dom.createDocumentFragment();
-            var el1 = dom.createTextNode("▲ ");
-            dom.appendChild(el0, el1);
-            return el0;
-          },
-          buildRenderNodes: function buildRenderNodes() {
-            return [];
-          },
-          statements: [],
-          locals: [],
-          templates: []
-        };
-      })();
-      var child2 = (function () {
-        return {
-          meta: {
-            "revision": "Ember@2.8.3",
-            "loc": {
-              "source": null,
-              "start": {
-                "line": 19,
-                "column": 62
-              },
-              "end": {
-                "line": 19,
-                "column": 78
-              }
-            },
-            "moduleName": "kalebr-frontend/templates/users/reviews.hbs"
-          },
-          isEmpty: false,
-          arity: 0,
-          cachedFragment: null,
-          hasRendered: false,
-          buildFragment: function buildFragment(dom) {
-            var el0 = dom.createDocumentFragment();
-            var el1 = dom.createTextNode("▼ ");
-            dom.appendChild(el0, el1);
-            return el0;
-          },
-          buildRenderNodes: function buildRenderNodes() {
-            return [];
-          },
-          statements: [],
-          locals: [],
-          templates: []
-        };
-      })();
-      var child3 = (function () {
-        return {
-          meta: {
-            "revision": "Ember@2.8.3",
-            "loc": {
-              "source": null,
-              "start": {
-                "line": 23,
-                "column": 12
-              },
-              "end": {
-                "line": 28,
-                "column": 12
-              }
-            },
-            "moduleName": "kalebr-frontend/templates/users/reviews.hbs"
-          },
-          isEmpty: false,
-          arity: 2,
-          cachedFragment: null,
-          hasRendered: false,
-          buildFragment: function buildFragment(dom) {
-            var el0 = dom.createDocumentFragment();
-            var el1 = dom.createTextNode("                ");
-            dom.appendChild(el0, el1);
-            var el1 = dom.createElement("div");
-            dom.setAttribute(el1, "class", "single-option");
-            var el2 = dom.createTextNode("\n                    ");
-            dom.appendChild(el1, el2);
-            var el2 = dom.createElement("span");
-            var el3 = dom.createComment("");
-            dom.appendChild(el2, el3);
-            dom.appendChild(el1, el2);
-            var el2 = dom.createTextNode(".\n                  ");
-            dom.appendChild(el1, el2);
-            var el2 = dom.createComment("");
-            dom.appendChild(el1, el2);
-            var el2 = dom.createTextNode("\n                ");
-            dom.appendChild(el1, el2);
-            dom.appendChild(el0, el1);
-            var el1 = dom.createTextNode("\n");
-            dom.appendChild(el0, el1);
-            return el0;
-          },
-          buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
-            var element0 = dom.childAt(fragment, [1]);
-            var morphs = new Array(2);
-            morphs[0] = dom.createMorphAt(dom.childAt(element0, [1]), 0, 0);
-            morphs[1] = dom.createMorphAt(element0, 3, 3);
-            return morphs;
-          },
-          statements: [["inline", "adder", [["get", "index", ["loc", [null, [25, 34], [25, 39]]], 0, 0, 0, 0], 1], [], ["loc", [null, [25, 26], [25, 43]]], 0, 0], ["content", "option.statement", ["loc", [null, [26, 18], [26, 38]]], 0, 0, 0, 0]],
-          locals: ["option", "index"],
           templates: []
         };
       })();
@@ -4691,11 +5165,11 @@ define("kalebr-frontend/templates/users/reviews", ["exports"], function (exports
           "loc": {
             "source": null,
             "start": {
-              "line": 10,
+              "line": 12,
               "column": 6
             },
             "end": {
-              "line": 31,
+              "line": 21,
               "column": 6
             }
           },
@@ -4710,44 +5184,26 @@ define("kalebr-frontend/templates/users/reviews", ["exports"], function (exports
           var el1 = dom.createTextNode("          ");
           dom.appendChild(el0, el1);
           var el1 = dom.createElement("div");
-          dom.setAttribute(el1, "class", "flex padtb1rem");
-          var el2 = dom.createTextNode("\n              ");
-          dom.appendChild(el1, el2);
-          var el2 = dom.createElement("div");
-          dom.setAttribute(el2, "class", "width5pc");
-          var el3 = dom.createComment("");
-          dom.appendChild(el2, el3);
-          dom.appendChild(el1, el2);
-          var el2 = dom.createTextNode("\n              ");
-          dom.appendChild(el1, el2);
-          var el2 = dom.createElement("div");
-          dom.setAttribute(el2, "class", "width65pc");
-          var el3 = dom.createComment("");
-          dom.appendChild(el2, el3);
-          dom.appendChild(el1, el2);
+          dom.setAttribute(el1, "class", "single-user-row flex");
           var el2 = dom.createTextNode("\n              ");
           dom.appendChild(el1, el2);
           var el2 = dom.createElement("div");
           dom.setAttribute(el2, "class", "width10pc");
-          var el3 = dom.createTextNode("\n                ");
-          dom.appendChild(el2, el3);
           var el3 = dom.createComment("");
-          dom.appendChild(el2, el3);
-          var el3 = dom.createTextNode("\n              ");
           dom.appendChild(el2, el3);
           dom.appendChild(el1, el2);
           var el2 = dom.createTextNode("\n              ");
           dom.appendChild(el1, el2);
           var el2 = dom.createElement("div");
-          dom.setAttribute(el2, "class", "width10pc");
-          var el3 = dom.createTextNode("Del");
+          dom.setAttribute(el2, "class", "width30pc");
+          var el3 = dom.createComment("");
           dom.appendChild(el2, el3);
           dom.appendChild(el1, el2);
           var el2 = dom.createTextNode("\n              ");
           dom.appendChild(el1, el2);
           var el2 = dom.createElement("div");
           dom.setAttribute(el2, "class", "width20pc");
-          var el3 = dom.createTextNode("\n                  Options ");
+          var el3 = dom.createTextNode("\n                ");
           dom.appendChild(el2, el3);
           var el3 = dom.createComment("");
           dom.appendChild(el2, el3);
@@ -4760,16 +5216,6 @@ define("kalebr-frontend/templates/users/reviews", ["exports"], function (exports
           var el1 = dom.createTextNode("\n          ");
           dom.appendChild(el0, el1);
           var el1 = dom.createElement("div");
-          var el2 = dom.createTextNode("\n");
-          dom.appendChild(el1, el2);
-          var el2 = dom.createComment("");
-          dom.appendChild(el1, el2);
-          var el2 = dom.createTextNode("          ");
-          dom.appendChild(el1, el2);
-          dom.appendChild(el0, el1);
-          var el1 = dom.createTextNode("\n          ");
-          dom.appendChild(el0, el1);
-          var el1 = dom.createElement("div");
           dom.setAttribute(el1, "class", "thick-border");
           dom.appendChild(el0, el1);
           var el1 = dom.createTextNode("\n");
@@ -4777,24 +5223,16 @@ define("kalebr-frontend/templates/users/reviews", ["exports"], function (exports
           return el0;
         },
         buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
-          var element1 = dom.childAt(fragment, [1]);
-          var element2 = dom.childAt(element1, [7]);
-          var element3 = dom.childAt(element1, [9]);
-          var element4 = dom.childAt(fragment, [3]);
-          var morphs = new Array(8);
-          morphs[0] = dom.createMorphAt(dom.childAt(element1, [1]), 0, 0);
-          morphs[1] = dom.createMorphAt(dom.childAt(element1, [3]), 0, 0);
-          morphs[2] = dom.createMorphAt(dom.childAt(element1, [5]), 1, 1);
-          morphs[3] = dom.createElementMorph(element2);
-          morphs[4] = dom.createElementMorph(element3);
-          morphs[5] = dom.createMorphAt(element3, 1, 1);
-          morphs[6] = dom.createAttrMorph(element4, 'class');
-          morphs[7] = dom.createMorphAt(element4, 1, 1);
+          var element0 = dom.childAt(fragment, [1]);
+          var morphs = new Array(3);
+          morphs[0] = dom.createMorphAt(dom.childAt(element0, [1]), 0, 0);
+          morphs[1] = dom.createMorphAt(dom.childAt(element0, [3]), 0, 0);
+          morphs[2] = dom.createMorphAt(dom.childAt(element0, [5]), 1, 1);
           return morphs;
         },
-        statements: [["content", "question.id", ["loc", [null, [12, 36], [12, 51]]], 0, 0, 0, 0], ["content", "question.statement", ["loc", [null, [13, 37], [13, 59]]], 0, 0, 0, 0], ["block", "link-to", ["questions/edit", ["get", "question.id", ["loc", [null, [15, 44], [15, 55]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [15, 16], [15, 74]]]], ["element", "action", ["deleteRecord", ["get", "question", ["loc", [null, [17, 61], [17, 69]]], 0, 0, 0, 0]], [], ["loc", [null, [17, 37], [17, 71]]], 0, 0], ["element", "action", ["toggleOptions", ["get", "question", ["loc", [null, [18, 62], [18, 70]]], 0, 0, 0, 0]], [], ["loc", [null, [18, 37], [18, 72]]], 0, 0], ["block", "if", [["get", "question.showOptions", ["loc", [null, [19, 32], [19, 52]]], 0, 0, 0, 0]], [], 1, 2, ["loc", [null, [19, 26], [19, 85]]]], ["attribute", "class", ["concat", ["flex padtb1rem ", ["subexpr", "unless", [["get", "question.showOptions", ["loc", [null, [22, 46], [22, 66]]], 0, 0, 0, 0], "hide"], [], ["loc", [null, [22, 37], [22, 75]]], 0, 0]], 0, 0, 0, 0, 0], 0, 0, 0, 0], ["block", "each", [["get", "question.options", ["loc", [null, [23, 20], [23, 36]]], 0, 0, 0, 0]], [], 3, null, ["loc", [null, [23, 12], [28, 21]]]]],
-        locals: ["question"],
-        templates: [child0, child1, child2, child3]
+        statements: [["content", "review.id", ["loc", [null, [14, 37], [14, 50]]], 0, 0, 0, 0], ["content", "review.reviewer.fullname", ["loc", [null, [15, 37], [15, 65]]], 0, 0, 0, 0], ["block", "link-to", ["users/reviewComment", ["get", "session.currentUser.id", ["loc", [null, [17, 49], [17, 71]]], 0, 0, 0, 0], ["get", "review.id", ["loc", [null, [17, 72], [17, 81]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [17, 16], [17, 107]]]]],
+        locals: ["review"],
+        templates: [child0]
       };
     })();
     return {
@@ -4807,7 +5245,7 @@ define("kalebr-frontend/templates/users/reviews", ["exports"], function (exports
             "column": 0
           },
           "end": {
-            "line": 34,
+            "line": 24,
             "column": 0
           }
         },
@@ -4851,13 +5289,13 @@ define("kalebr-frontend/templates/users/reviews", ["exports"], function (exports
         return el0;
       },
       buildRenderNodes: function buildRenderNodes(dom, fragment, contextualElement) {
-        var element5 = dom.childAt(fragment, [0]);
+        var element1 = dom.childAt(fragment, [0]);
         var morphs = new Array(2);
-        morphs[0] = dom.createMorphAt(dom.childAt(element5, [1]), 1, 1);
-        morphs[1] = dom.createMorphAt(dom.childAt(element5, [3]), 1, 1);
+        morphs[0] = dom.createMorphAt(dom.childAt(element1, [1]), 1, 1);
+        morphs[1] = dom.createMorphAt(dom.childAt(element1, [3]), 1, 1);
         return morphs;
       },
-      statements: [["block", "link-to", ["users/performanceReview", ["get", "model.id", ["loc", [null, [3, 43], [3, 51]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [3, 6], [7, 18]]]], ["block", "each", [["get", "model", ["loc", [null, [10, 14], [10, 19]]], 0, 0, 0, 0]], [], 1, null, ["loc", [null, [10, 6], [31, 15]]]]],
+      statements: [["block", "if", [["get", "session.currentUser.admin", ["loc", [null, [3, 14], [3, 39]]], 0, 0, 0, 0]], [], 0, null, ["loc", [null, [3, 8], [9, 15]]]], ["block", "each", [["get", "model", ["loc", [null, [12, 14], [12, 19]]], 0, 0, 0, 0]], [], 1, null, ["loc", [null, [12, 6], [21, 15]]]]],
       locals: [],
       templates: [child0, child1]
     };
@@ -4867,8 +5305,8 @@ define('kalebr-frontend/utils/constants', ['exports'], function (exports) {
   var constants;
 
   constants = {
-    HOST: 'http://localhost:3000',
-    NAMESPACE: 'api/v1'
+    HOST: 'https://kaleber-app.herokuapp.com',
+    NAMESPACE: '/api/v1'
   };
 
   constants.USER_SIGN_IN_URL = constants.HOST + '/user_sign_in';
